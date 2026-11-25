@@ -35,7 +35,7 @@ Rules settled while building slice 2:
 - Closing (`resubmit: false`) happens once every blocking finding has an answer: `approved`, or `awaiting_signoff` when the rubric requires a person. If any blocking finding was `accepted` but not re-reviewed, the review gets a note saying so.
 - Resubmitting is allowed from `changes_requested` and `failed`, never from `escalated`, `awaiting_signoff`, `approved` or `canceled`. If the new snapshot is identical to the previous one, the history says so.
 - The next round's prompt lists the previous round's findings with the author's answers. Reviewers check that accepted findings are fixed and do not raise a rejected finding again unless the reason does not hold.
-- Sign-off works from `awaiting_signoff` and from `escalated` (a person deciding after the round cap) and records who, when, and from which state. It is only in `rb signoff`, not an MCP tool: an agent could call a tool with any person's name (found by the self-review, round 2).
+- Sign-off works from `awaiting_signoff` and from `escalated` (a person deciding after the round cap) and records who, when, and from which state. It is only in `rb signoff`, not an MCP tool. Decided by the owner (25 Nov 2026): an agent that can run commands in the owner's terminal may also run `rb signoff`; `rb signoff` asks for no extra confirmation. The sign-off record names whoever was given in `--by`.
 - An author cannot close a round as approved while one of its reviewers failed; the answers are kept, and a resubmit runs the reviewers again (or a person signs off).
 - `review_cancel` kills the running reviewer processes.
 - A round that finishes after a newer round has started (possible after a restart) keeps its results but does not change the review state.
@@ -226,7 +226,7 @@ From review-bus reviewing itself with Codex (4 high-effort passes); open, listed
 - Headless page capture follows redirects from a public page to private addresses.
 - Reviewers in their own process group can outlive a runner that is killed outright.
 - The review id is returned after the snapshot; slow pages can exceed client timeouts.
-- `rb signoff` cannot tell a person from a program running in the person's terminal; an open decision.
+- `rb signoff` cannot tell a person from a program running in the person's terminal. By the owner's decision this is accepted: agents with terminal access may sign off.
 
 ## 11. Done when
 

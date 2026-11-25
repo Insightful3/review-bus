@@ -259,7 +259,7 @@ Found when review-bus reviewed itself with Codex, and not fixed yet:
 - **Page redirects.** A public page you submit can redirect the headless browser to a private page your machine can reach (a local server, an intranet), and that page would be captured.
 - **Crashed runners.** If the process running a review is killed outright, its reviewers can keep running until their own timeout.
 - **Slow pages and the review ID.** `review_submit` returns the review ID only after the snapshot is taken, so a very slow page can take longer than the client waits.
-- **Sign-off.** `rb signoff` records whatever name it is given; anything that can run commands in your terminal can run it.
+- **Sign-off.** `rb signoff` records whatever name it is given, and anything that can run commands in your terminal (an agent included) can run it. This is a deliberate choice for v0.1, not an oversight.
 
 ## Development
 
