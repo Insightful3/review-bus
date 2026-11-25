@@ -17,6 +17,9 @@ export const GitSpec = z.object({
 });
 export type GitSpec = z.infer<typeof GitSpec>;
 
+/** The git change is empty (for example everything is already pushed). */
+export class NoChangesError extends Error {}
+
 export interface ChangedFile {
   path: string;
   status: string; // A, M, D, R..., from --name-status; untracked files are A
@@ -186,7 +189,7 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     patch = gitBuf(root, [...PATCH, baseSha, commitSha]);
     files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "--no-relative", baseSha, commitSha]));
   }
-  if (!patch.toString("latin1").trim()) throw new Error(`No changes to review in ${root} (mode ${spec.mode}).`);
+  if (!patch.toString("latin1").trim()) throw new NoChangesError(`No changes to review in ${root} (mode ${spec.mode}${baseRef ? ` vs ${baseRef}` : ""}).`);
 
   const rdir = path.join(reviewDir, `r${round}`);
   mkdirSync(rdir, { recursive: true });

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { kindOf, toMarkdown } from "./convert.js";
-import { snapshotGit } from "./git.js";
+import { NoChangesError, snapshotGit } from "./git.js";
 import { capturePages, type BrowserConfig } from "./pages.js";
 import type { ArtifactRef, ReviewRequest, Snapshot } from "./types.js";
 
@@ -50,10 +50,16 @@ export async function snapshotRound(
   if (artifact?.path) {
     snap = await snapshotDocument(artifact.path, reviewDir, round);
   } else if (artifact?.git) {
-    const { info, patch, sha256 } = snapshotGit(artifact.git, reviewDir, round);
-    const markdown_file = `r${round}/change.md`;
-    writeFileSync(path.join(reviewDir, markdown_file), changeMarkdown(info, patch));
-    snap = { kind: "git", sha256, markdown_file, warnings: [], git: info };
+    try {
+      const { info, patch, sha256 } = snapshotGit(artifact.git, reviewDir, round);
+      const markdown_file = `r${round}/change.md`;
+      writeFileSync(path.join(reviewDir, markdown_file), changeMarkdown(info, patch));
+      snap = { kind: "git", sha256, markdown_file, warnings: [], git: info };
+    } catch (err) {
+      // Nothing to diff (for example everything is pushed): with pages given, review the pages.
+      if (!(err instanceof NoChangesError) || !pages.length) throw err;
+      snap = { kind: "pages", sha256: "", markdown_file: null, warnings: [`${err.message} Reviewing the pages only.`] };
+    }
   } else {
     snap = { kind: "pages", sha256: "", markdown_file: null, warnings: [] };
   }

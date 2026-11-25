@@ -460,3 +460,24 @@ test("a page whose scripts stall the capture fails with a deadline instead of ha
   assert.match(text, /scrolling to load images did not finish within 5 s/);
   assert.ok(Date.now() - started < 40_000);
 });
+
+test("no git changes but pages given: the pages are reviewed with a warning; wait_seconds 900 is accepted", { skip: !hasChrome && "Google Chrome not installed" }, async (t) => {
+  if (!hasChrome) return t.skip("Google Chrome not installed");
+  const repo = newRepo("site-pushed"); // nothing changed since the base
+  const { json, text } = await call("review_submit", {
+    artifact: { git: { repo, mode: "base", base: "main" } },
+    pages: [`${base}/site-pushed/index.html`],
+    rubric: "webpage",
+    intent: "x",
+    wait_seconds: 900,
+  });
+  assert.ok(json, text);
+  const snap = snapshotOf(json.review_id);
+  assert.equal(snap.kind, "pages");
+  assert.match(snap.warnings[0], /No changes to review in .* \(mode base vs main\)\. Reviewing the pages only\./);
+  assert.match(readFileSync(path.join(reviewDir(json.review_id), "report.md"), "utf8"), /Warning: No changes to review/);
+
+  // Without pages there is nothing to review: still an error.
+  const none = await call("review_submit", { artifact: { git: { repo, mode: "base", base: "main" } }, rubric: "webpage", intent: "x" });
+  assert.match(none.text, /No changes to review/);
+});

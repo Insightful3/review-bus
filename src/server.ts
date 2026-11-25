@@ -267,7 +267,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           ),
         author_vendor: Vendor.optional().describe("Your vendor (anthropic, openai, other). Detected from the MCP client when omitted."),
         stage: z.enum(["draft", "pre-merge", "release"]).default("pre-merge"),
-        wait_seconds: z.number().int().min(0).max(600).default(0),
+        wait_seconds: z.number().int().min(0).max(3600).default(0).describe("Seconds to wait for the result; the server caps it (see the tool description)"),
       },
     },
     async (args, ctx) => {
@@ -340,7 +340,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         "Block until the current round finishes or the time runs out, then return the status. seconds is capped at max_wait_seconds (default 50), " +
         "or at max_wait_with_progress_seconds (default 900) for clients that show progress, like Claude Code; call again while state is in_review. " +
         "Called as an MCP task, it completes when the round finishes, with no cap.",
-      inputSchema: { review_id: z.string(), seconds: z.number().int().min(1).max(600).default(50) },
+      inputSchema: { review_id: z.string(), seconds: z.number().int().min(1).max(3600).default(50) },
     },
     async (args, ctx) => {
       engine.get(args.review_id); // validates the id
@@ -371,7 +371,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           .default([]),
         resubmit: z.boolean().default(false),
         artifact: z.string().optional().describe("Path to the new version; defaults to the originally submitted path"),
-        wait_seconds: z.number().int().min(0).max(600).default(0),
+        wait_seconds: z.number().int().min(0).max(3600).default(0).describe("Seconds to wait for the result; the server caps it (see the tool description)"),
       },
     },
     async (args, ctx) => {
