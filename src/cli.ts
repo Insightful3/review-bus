@@ -27,7 +27,7 @@ Usage:
   rb pending [--reviewer <name>]
   rb claim <review_id> <reviewer> --by <your name>
   rb post <review_id> <reviewer> --token <token> (--file <answer.json> | --decline <reason>) [--model <model>]
-  rb release <review_id> <reviewer> --by <your name>
+  rb release <review_id> <reviewer> --claimed-at <time> --by <your name>
   rb rubrics
   rb rubric-check <folder>
   rb serve [--port 7777] [--host 127.0.0.1]
@@ -138,6 +138,7 @@ async function main() {
       by: { type: "string" },
       note: { type: "string" },
       token: { type: "string" },
+      "claimed-at": { type: "string" },
       file: { type: "string" },
       decline: { type: "string" },
       model: { type: "string" },
@@ -265,7 +266,7 @@ async function main() {
       const work = engine.pending(v.reviewer?.[0]);
       if (!work.length) console.log("No work waiting for pull reviewers.");
       for (const w of work) {
-        console.log(`${w.review_id}  r${w.round}  ${w.reviewer.padEnd(12)}  ${w.status === "claimed" ? `claimed by ${w.claimed_by}` : "waiting"}  ${w.rubric}  due ${w.deadline?.slice(0, 16).replace("T", " ") ?? "?"}`);
+        console.log(`${w.review_id}  r${w.round}  ${w.reviewer.padEnd(12)}  ${w.status === "claimed" ? `claimed by ${w.claimed_by} at ${w.claimed_at}` : "waiting"}  ${w.rubric}  due ${w.deadline?.slice(0, 16).replace("T", " ") ?? "?"}`);
         console.log(`  ${w.artifact}: ${w.intent}`);
       }
       return;
@@ -279,7 +280,8 @@ async function main() {
     }
     case "release": {
       if (!pos[1]) fail("release needs <review_id> <reviewer>");
-      const r = engine.release(id(), pos[1], v.by ?? "rb");
+      if (!v["claimed-at"]) fail("release needs --claimed-at <time> (rb pending shows it): the claim you are giving up");
+      const r = engine.release(id(), pos[1], v.by ?? "rb", v["claimed-at"]);
       console.log(`${r.id}  ${pos[1]} waits for a new claim`);
       return;
     }

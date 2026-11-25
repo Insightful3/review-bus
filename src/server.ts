@@ -22,6 +22,16 @@ import { listRubrics } from "./rubrics.js";
 import { renderSummary } from "./store.js";
 import type { AuthorInfo, Review } from "./types.js";
 
+/** Present when only pull reviewers are left: waiting returns at once, so say what to do instead. */
+function pullHint(review: Review) {
+  if (!onlyPullLeft(review)) return {};
+  const round = review.rounds.at(-1);
+  return {
+    waiting_for_pull: (round?.reviewers ?? []).filter((r) => r.status === "waiting" || r.status === "running").map((r) => r.name),
+    next: "Only pull reviewers are left; they may take hours or days. Do other work and check back later with review_status, not a review_wait loop.",
+  };
+}
+
 function resultPayload(review: Review, includeAdvisory: boolean) {
   const round = review.rounds.at(-1);
   // Challenges to the author's assumptions are always shown, even when advisory (SPEC 6).
@@ -52,6 +62,7 @@ function resultPayload(review: Review, includeAdvisory: boolean) {
       advisory: round?.findings.filter((f) => !f.blocking).length ?? 0,
     },
     findings,
+    ...pullHint(review),
   };
 }
 
@@ -88,14 +99,7 @@ function statusPayload(review: Review) {
     },
     signoff: review.signoff ?? null,
     updated_at: review.updated_at,
-    // Only pull reviewers (a person, an agent elsewhere) are left: waiting returns at once, so do
-    // other work and check back later instead of calling review_wait in a loop.
-    ...(onlyPullLeft(review)
-      ? {
-          waiting_for_pull: (round?.reviewers ?? []).filter((r) => r.status === "waiting" || r.status === "running").map((r) => r.name),
-          next: "Only pull reviewers are left; they may take hours or days. Do other work and check back later with review_status, not a review_wait loop.",
-        }
-      : {}),
+    ...pullHint(review),
   };
 }
 
@@ -173,6 +177,8 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     asTask: boolean;
     /** Waits up to `requested` seconds (capped as above) and returns how long it was allowed to wait. */
     wait: (id: string, requested: number) => Promise<number>;
+    /** Seconds this call may still spend before answering (max_wait_seconds, minus time spent). */
+    budget: () => number;
   }
 
   const progressText = (id: string, startedAt: number) => {
@@ -199,6 +205,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           const progressToken = (extra._meta as { progressToken?: string | number } | undefined)?.progressToken;
           const ctx: CallContext = {
             asTask,
+            budget: () => Math.max(0, engine.config.max_wait_seconds - (Date.now() - callStarted) / 1000),
             wait: async (id, requested) => {
               if (asTask || requested <= 0) return 0;
               if (progressToken === undefined) {
@@ -265,7 +272,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         "Reviewers run read-only on a frozen snapshot. Returns review_id and state; returns the full result if the round finishes within wait_seconds " +
         "(capped at max_wait_seconds, default 50, to stay under client timeouts; clients that show progress, like Claude Code, can wait up to max_wait_with_progress_seconds, default 900: " +
         "pass wait_seconds 900 to get the finished review in one call). Otherwise poll review_wait until state is not in_review. " +
-        "Called as an MCP task, it returns at once and the task completes with the result when the round finishes.",
+        "Called as an MCP task, it returns at once and the task completes with the result when the round finishes, or when only pull reviewers are left (waiting_for_pull: check back later with review_status).",
       inputSchema: {
         artifact: z
           .union([z.string(), z.object({ git: GitSpec })])
@@ -313,6 +320,8 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         },
         detectAuthor(args.author_vendor),
         0,
+        // Page screenshots must not hold back the review id past the client's timeout.
+        { snapshotWaitSeconds: ctx.budget() },
       );
       await ctx.wait(submitted.id, args.wait_seconds);
       const review = engine.get(submitted.id);
@@ -369,7 +378,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     "review_wait",
     {
       description:
-        "Block until the current round finishes or the time runs out, then return the status. seconds is capped at max_wait_seconds (default 50), " +
+        "Block until the current round finishes, only pull reviewers are left (waiting_for_pull: check back later instead of waiting), or the time runs out, then return the status. seconds is capped at max_wait_seconds (default 50), " +
         "or at max_wait_with_progress_seconds (default 900) for clients that show progress, like Claude Code; call again while state is in_review. " +
         "Called as an MCP task, it completes when the round finishes, with no cap.",
       inputSchema: { review_id: z.string(), seconds: z.number().int().min(1).max(3600).default(50) },
@@ -537,11 +546,16 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     "review_release",
     {
       description: "Give up a claim of a pull reviewer's work (you cannot finish it): the work waits for a new claim.",
-      inputSchema: { review_id: z.string(), reviewer: z.string(), by: z.string().describe("Who releases it") },
+      inputSchema: {
+        review_id: z.string(),
+        reviewer: z.string(),
+        by: z.string().describe("Who releases it"),
+        claimed_at: z.string().describe("claimed_at of the claim you give up, from review_claim or review_pending"),
+      },
     },
     async (args) => {
       try {
-        return jsonReply(status(engine.release(args.review_id, args.reviewer, args.by)));
+        return jsonReply(status(engine.release(args.review_id, args.reviewer, args.by, args.claimed_at)));
       } catch (err) {
         return errorReply(err);
       }

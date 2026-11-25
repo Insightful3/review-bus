@@ -170,7 +170,8 @@ test("over HTTP: a pull reviewer claims the work and posts; the last answer fini
   // Nobody else can claim it now, and a wrong token cannot post.
   assert.match((await call("review_claim", { review_id: id, reviewer: "person", by: "Bo" })).text, /already claimed by Ana/);
   // A released claim can be taken again; the old token no longer works.
-  await call("review_release", { review_id: id, reviewer: "person", by: "Ana" });
+  assert.match((await call("review_release", { review_id: id, reviewer: "person", by: "Ana" })).text, /claimed_at/);
+  await call("review_release", { review_id: id, reviewer: "person", by: "Ana", claimed_at: work.claimed_at });
   const again = (await client.callTool({ name: "review_claim", arguments: { review_id: id, reviewer: "person", by: "Ana" } })) as ToolResult;
   const oldToken = work.token;
   Object.assign(work, JSON.parse(again.content[0].text));
@@ -438,7 +439,7 @@ test("the claim page shows a person the brief, the rubric and the work, with lab
   assert.match(html, /<h2>The work<\/h2>/);
   assert.match(html, /Total price: EUR 24,000/);
   for (const f of ["f_claim", "f_failure", "f_evidence", "f_impact", "f_likelihood"]) assert.match(html, new RegExp(`name="${f}" aria-label="`));
-  engine.release(review.id, "person", "test");
+  engine.release(review.id, "person", "test", engine.get(review.id).rounds[0].reviewers[0].claim!.at);
 });
 
 // ---- Fixes from Codex's review of v0.2 ----
@@ -749,4 +750,85 @@ test("the inbox serves a git review's full patch as plain text", async () => {
   assert.equal(patch.status, 200);
   assert.match(patch.headers.get("content-type")!, /^text\/plain/);
   assert.match(await patch.text(), /alert\(1\)/);
+});
+
+// ---- The open advisories from round 3 ----
+
+test("codex-review keeps submodule pointer changes in its scratch repo", async () => {
+  const g = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "protocol.file.allow=always", ...args], { cwd });
+  const lib = path.join(tmp, "sub-lib");
+  const app = path.join(tmp, "sub-app");
+  mkdirSync(lib);
+  mkdirSync(app);
+  writeFileSync(path.join(lib, "a"), "1\n");
+  g(lib, "init", "-q");
+  g(lib, "add", ".");
+  g(lib, "commit", "-q", "-m", "one");
+  writeFileSync(path.join(app, "x"), "x\n");
+  g(app, "init", "-q");
+  g(app, "add", ".");
+  g(app, "submodule", "add", "-q", lib, "lib");
+  g(app, "commit", "-q", "-m", "base");
+  writeFileSync(path.join(app, "lib", "a"), "2\n");
+  g(path.join(app, "lib"), "commit", "-qam", "two");
+  writeFileSync(path.join(app, "x"), "y\n");
+  g(app, "add", "lib", "x");
+  g(app, "commit", "-q", "-m", "bump");
+  const review = await engine.submit(
+    { artifact: { git: { repo: app, mode: "commit" } }, pages: [], rubric: "code", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" },
+    PERSON,
+    30,
+  );
+  await engine.settled(review.id);
+  const run = engine.get(review.id).rounds[0].reviewers[0];
+  assert.equal(run.status, "done", run.error ?? "");
+  const scratch = path.join(tmp, "reviews", review.id, "r1", "native.native");
+  const staged = execFileSync("git", ["diff", "--cached", "--name-only"], { cwd: scratch, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } }).toString().trim().split("\n").sort();
+  assert.deepEqual(staged, ["lib", "x"]);
+});
+
+test("an inbox claim whose page cannot be built is given back", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  // The saved Markdown can no longer be read (a folder where the file was).
+  const md = path.join(tmp, "reviews", review.id, "r1", "artifact.md");
+  execFileSync("rm", [md]);
+  mkdirSync(md);
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  const res = await fetch(`${base}inbox/claim/${review.id}/person/start`, { method: "POST", headers: { cookie }, body: new URLSearchParams({ by: "Ana" }) });
+  assert.equal(res.status, 400);
+  const run = engine.get(review.id).rounds[0].reviewers[0];
+  assert.equal(run.status, "waiting");
+  assert.match(engine.get(review.id).history.at(-1)!.detail!, /released by web inbox \(the page could not be shown\)/);
+});
+
+test("the review id is not held back past the call's budget, whatever snapshot_wait_seconds says", async () => {
+  writeConfig({ snapshot_wait_seconds: 120 });
+  const e = new Engine(loadConfig());
+  const started = Date.now();
+  const review = await e.submit(
+    { artifact: null, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" },
+    PERSON,
+    0,
+    { snapshotWaitSeconds: 0 },
+  );
+  assert.equal(review.state, "submitted");
+  assert.ok(Date.now() - started < 3000);
+  await e.settled(review.id);
+  writeConfig();
+});
+
+test("results of a pull-only round tell the agent to check back later", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }, { name: "person" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  const res = await call("review_result", { review_id: review.id });
+  assert.deepEqual(res.json.waiting_for_pull, ["person"]);
+  assert.match(res.json.next, /check back later/);
 });

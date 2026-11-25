@@ -27,7 +27,7 @@ if (args[1] === "review") {
   const log = execFileSync("git", ["log", "--oneline"], { cwd: process.cwd() }).toString();
   if (!status.trim()) fail("no uncommitted change in the review copy");
   if (log.trim().split("\n").length !== 1) fail("expected exactly one base commit");
-  console.error(`model: ${args[args.indexOf("-m") + 1] ?? "fake-default-model"}\nreasoning effort: medium`);
+  console.error(`model: ${args.includes("-m") ? args[args.indexOf("-m") + 1] : "fake-default-model"}\nreasoning effort: medium`);
   writeFileSync(out, `The change has a problem.\n\nFull review comments:\n\n- [P1] Fake native finding (${status.trim().split("\n").length} changed) — ${process.cwd()}/index.html:1-1\n  Fake explanation.\n`);
   process.exit(0);
 }

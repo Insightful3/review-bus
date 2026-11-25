@@ -215,7 +215,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
         }
         if (req.method === "POST" && parts[2] === "release" && parts[3]) {
           const form = new URLSearchParams(await readBody(req, 64 * 1024));
-          engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`, form.get("claimed_at") ?? undefined);
+          engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`, form.get("claimed_at") ?? "");
           res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent("Claim released.")}`, ...SECURITY_HEADERS });
           res.end();
           return;
@@ -256,7 +256,16 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
         if (req.method === "POST" && parts[3] === "start") {
           const form = new URLSearchParams(await readBody(req, 64 * 1024));
           const work = engine.claim(id, reviewer, { by: form.get("by") ?? "", client: "web-inbox" });
-          send(res, 200, renderClaimPage(engine, work, form.get("by") ?? ""));
+          // The token reaches the person only through this page: if it cannot be built, give the
+          // claim back instead of leaving the work locked by a claim nobody holds.
+          let html: string;
+          try {
+            html = renderClaimPage(engine, work, form.get("by") ?? "");
+          } catch (err) {
+            engine.release(id, reviewer, "web inbox (the page could not be shown)", work.claimed_at);
+            throw err;
+          }
+          send(res, 200, html);
           return;
         }
         if (req.method === "POST" && parts[3] === "post") {

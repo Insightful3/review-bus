@@ -175,6 +175,26 @@ function scratchGit(cwd: string, args: string[], input?: Buffer): void {
   if (r.status !== 0) throw new Error(`git ${args[0]} in the codex-review copy failed: ${r.stderr.toString().trim().split("\n")[0]}`);
 }
 
+/**
+ * Submodule pointers as they are after the change: the "+Subproject commit" side of each gitlink
+ * in the patch. The paths come from the "+++ b/..." lines (simple quoting handled).
+ */
+export function gitlinksAfter(patch: Buffer): { path: string; sha: string }[] {
+  const out: { path: string; sha: string }[] = [];
+  let target: string | null = null;
+  for (const line of patch.toString("latin1").split("\n")) {
+    if (line.startsWith("diff --git ")) target = null;
+    else if (line.startsWith("+++ ")) {
+      const raw = line.slice(4).trim();
+      const unq = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
+      target = unq.startsWith("b/") ? Buffer.from(unq.slice(2), "latin1").toString("utf8") : null;
+    } else if (target && /^\+Subproject commit [0-9a-f]{40,64}$/.test(line)) {
+      out.push({ path: target, sha: line.split(" ").at(-1)! });
+    }
+  }
+  return out;
+}
+
 /** Codex's native review priorities, mapped onto the impact scale. */
 const CONVERT_PROMPT = `You convert a code review into structured findings. Below is the text of a review that Codex's built-in code reviewer wrote about a change.
 
@@ -213,9 +233,12 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
   // encoding conversion, so the scratch repo's diff is exactly the patch. (--attr-source, used for
   // the author's repo, crashes git 2.54 in a repo without commits.)
   writeFileSync(path.join(native, ".git", "info", "attributes"), "* -filter -text -ident -working-tree-encoding\n");
-  if (patch.length) scratchGit(native, ["apply", "-R", "--whitespace=nowarn", "-"], patch);
-  // -f: every file of the copy is tracked in the project, including ones its .gitignore matches.
+  // The index starts as the changed project: every file of the copy (-f: tracked in the project even
+  // where its .gitignore matches), plus the changed submodule pointers, which the copy holds only as
+  // empty folders. Reversing the patch through the index then gives the base, gitlinks included.
   scratchGit(native, ["add", "-A", "-f"]);
+  for (const g of gitlinksAfter(patch)) scratchGit(native, ["update-index", "--add", "--cacheinfo", `160000,${g.sha},${g.path}`]);
+  if (patch.length) scratchGit(native, ["apply", "-R", "--index", "--whitespace=nowarn", "-"], patch);
   scratchGit(native, ["commit", "-q", "--allow-empty", "-m", "base"]);
   // --index: the change is staged too, so new files that .gitignore matches are still part of it.
   if (patch.length) scratchGit(native, ["apply", "--index", "--whitespace=nowarn", "-"], patch);

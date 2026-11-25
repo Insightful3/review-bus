@@ -149,8 +149,8 @@ A careful review can take several minutes, and MCP clients give up on a silent t
 
 - **Clients that show progress (Claude Code does).** They send a progress token with each call. review-bus then sends a progress update every 10 seconds ("Round 1: 1 of 2 reviewer(s) done; still working: codex…"), which keeps the call alive, and waits up to `max_wait_with_progress_seconds` (default 900). So `review_submit` with `wait_seconds: 900` returns the finished review in one call. Checked with Claude Code 2.1.316: one call, a 70 second review, the full result back.
 - **Other clients.** A call waits at most `max_wait_seconds` (default 50) and says so (`wait_capped`); the agent calls `review_wait` again until the state is no longer `in_review`.
-- **Pages.** Rendering pages can take a while. A review with pages is saved first and its pages are rendered in the background; if that takes longer than `snapshot_wait_seconds` (default 10), `review_submit` returns the review id with state `submitted`, and a later capture error shows as a failed review. A page that fails to load within those seconds is still an error on submit.
-- **Pull reviewers.** A wait stops as soon as only pull reviewers are left, since a person may answer tomorrow. The review stays `in_review` until they post.
+- **Pages.** Rendering pages can take a while. A review with pages is saved first and its pages are rendered in the background; if that takes longer than `snapshot_wait_seconds` (default 10, and never longer than the call's own `max_wait_seconds`), `review_submit` returns the review id with state `submitted`, and a later capture error shows as a failed review. A page that fails to load within those seconds is still an error on submit.
+- **Pull reviewers.** A wait (and an MCP task) ends as soon as only pull reviewers are left, since a person may answer tomorrow. The answer then carries `waiting_for_pull` and a hint to check back later with `review_status`. The review stays `in_review` until they post.
 
 The review keeps running on the server either way, and another session (or `rb`) can follow it too.
 
@@ -188,7 +188,7 @@ A reviewer with `type: "pull"` is not started by review-bus. Its work waits unti
 }
 ```
 
-- `review_pending` (or `rb pending`) lists waiting work. `review_claim` returns the prompt (rubric, intent, the work), the files, the answer's JSON Schema and a token; nobody else can claim it after that. `review_post` sends the answer: the same reviewer output JSON the headless reviewers return, or `decline` with a reason. `review_release` gives the work back.
+- `review_pending` (or `rb pending`) lists waiting work. `review_claim` returns the prompt (rubric, intent, the work), the files, the answer's JSON Schema and a token; nobody else can claim it after that. `review_post` sends the answer: the same reviewer output JSON the headless reviewers return, or `decline` with a reason. `review_release` gives the work back; it names the claim by its `claimed_at` (from the claim, or `review_pending`), so a release repeated after someone else claimed the work cannot drop their claim.
 - `timeout_seconds` is the deadline (default 3 days for pull reviewers). A reviewer that misses it counts as failed, and the round finishes without it.
 - `claim_clients` limits who may claim for that reviewer, by MCP client name. Without it any connected client can, including the author's own agent, so name the clients for anything that matters.
 - Approvals apply as for every reviewer: a confidential rubric only goes to pull reviewers listed in `allowed_reviewers`, checked again at claim time.
@@ -339,7 +339,6 @@ Found when review-bus reviewed itself with Codex, and not fixed yet:
 - **A rubric made confidential during a resubmit** is checked with the rules it had when the review started.
 - **Slow pages on resubmit.** A new review returns its id before slow page capture (see Waiting and timeouts), but a resubmit still captures the pages before it returns. Clients that show progress are not affected.
 - **Who may act as a pull reviewer.** Without `claim_clients`, any connected MCP client can claim a pull reviewer's work, the author's own agent included. MCP client names are what the client says it is, so `claim_clients` keeps honest clients apart rather than stopping a determined one.
-- **Submodules and codex-review.** A change to a submodule pointer may fail the native review's scratch repo; the `codex` reviewer still sees it in the patch.
 - **The inbox and the HTTP token.** One token opens everything, the same trust as your terminal: whoever has it can claim work, post answers and sign off. The HTTP server speaks plain HTTP; keep it on this machine or put TLS in front. On `127.0.0.1` or `localhost` (rather than `rb.localhost`), another local service that the browser visits receives the inbox session cookie.
 - **Sign-off.** `rb signoff` and the inbox record whatever name they are given, and anything that can run commands in your terminal (an agent included) can run it. This is a deliberate choice, not an oversight.
 
