@@ -92,7 +92,7 @@ test("full loop: submit a Markdown proposal, fake reviewer finds issues, result 
     json.findings.map((f: { finding_id: string; blocking: boolean }) => [f.finding_id, f.blocking]),
     [["r1.f1", true], ["r1.f2", true], ["r1.f3", false], ["r1.f4", false]],
   );
-  assert.deepEqual(json.counts, { blocking: 2, advisory: 2 });
+  assert.deepEqual(json.counts, { blocking: 2, advisory: 2, over_limit: 0 });
   assert.match(result.markdown, /State: \*\*changes_requested\*\*/);
 
   // Without include_advisory only blocking findings come back.

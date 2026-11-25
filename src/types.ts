@@ -104,6 +104,8 @@ export interface Finding extends ReviewerFinding {
   /** The other reviewers' versions of a merged finding. */
   also_raised_by?: { reviewer: string; claim: string; impact: string; likelihood: string }[];
   response: FindingResponse | null;
+  /** Would block on its own, but the round already has max_blocking blocking findings. */
+  over_limit?: boolean;
 }
 
 export interface Round {

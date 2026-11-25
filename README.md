@@ -59,7 +59,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 | `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`. Without it, only near-identical findings are merged |
 | `max_wait_seconds` | Longest a tool call waits before returning (default 50, under the usual 60 second client timeout) |
 | `max_wait_with_progress_seconds` | Longest a call waits when the client shows progress, like Claude Code (default 900) |
-| `policy` | `max_blocking` findings per round (5) and `max_rounds` (3) |
+| `policy` | `max_blocking` findings per round (5; a rubric can set its own) and `max_rounds` (3) |
 
 ## Connect an author agent
 
@@ -296,7 +296,7 @@ Reviewers rate each finding by impact (`critical`, `high`, `medium`, `low`) and 
 | Medium | block | block | advisory | advisory |
 | Low | advisory | advisory | advisory | advisory |
 
-A finding without a failure scenario is advisory. A finding that challenges one of the author's stated assumptions blocks only if it is high or critical. At most 5 findings block per round, highest risk first. At `stage: draft` only critical findings block.
+A finding without a failure scenario is advisory. A finding that challenges one of the author's stated assumptions blocks only if it is high or critical. At most 5 findings block per round, highest risk first; a rubric can set its own limit with `max_blocking` in its front matter (`contract-b2b` uses 12). Findings that would block but are over the limit are marked "over the limit" and get their own section in the report, so they are not mistaken for minor points. At `stage: draft` only critical findings block.
 
 ## Where results go
 

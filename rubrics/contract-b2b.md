@@ -2,6 +2,7 @@
 require_signoff: true
 high_blocks_always: true
 effort: high
+max_blocking: 12
 confidential: true
 report_notice: "Reviewers are AI agents, not lawyers. This review is not legal advice. A person must sign off before the contract is used."
 ---

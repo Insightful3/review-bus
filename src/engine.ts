@@ -51,6 +51,12 @@ function waitingOnPull(rd: Round): boolean {
   );
 }
 
+/** max_blocking from a rubric's front matter, when it is a positive whole number. */
+function rubricLimit(meta: Record<string, unknown>): { max_blocking?: number } {
+  const v = meta.max_blocking;
+  return typeof v === "number" && Number.isInteger(v) && v > 0 ? { max_blocking: v } : {};
+}
+
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0); // signal 0 only checks that the process exists
@@ -249,7 +255,8 @@ export class Engine {
         started_at: t,
         finished_at: null,
         runner: { pid: process.pid, host: os.hostname(), started_at: dispatched },
-        policy: { ...this.config.policy },
+        // A rubric may set its own limit (contracts carry more must-fix points than a blog post).
+        policy: { ...this.config.policy, ...rubricLimit(r.rubric_meta) },
         snapshot,
         reviewers: runs,
         findings: [],
@@ -759,7 +766,12 @@ export class Engine {
       response: null,
     }));
     const blocking = computeBlocking(findings, policy);
-    findings.forEach((f, i) => (f.blocking = blocking[i]));
+    findings.forEach((f, i) => {
+      f.blocking = blocking[i];
+      // Would block on its own, but the round's limit kept only the riskiest: say so, so it is not
+      // read as a minor point.
+      if (!f.blocking && wouldBlock(f, policy)) f.over_limit = true;
+    });
 
     // Apply the results to the latest stored state, under the lock.
     this.store.update(id, (fresh) => {

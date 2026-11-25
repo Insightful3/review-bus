@@ -144,7 +144,7 @@ export function listRubrics(rubricPaths: string[], packs: RubricPack[] = []): Ru
 }
 
 const FLAGS = ["require_signoff", "high_blocks_always", "confidential"];
-const KNOWN = new Set([...FLAGS, "effort", "models", "report_notice"]);
+const KNOWN = new Set([...FLAGS, "effort", "models", "report_notice", "max_blocking"]);
 
 /**
  * Problems that would make a rubric work badly: missing sections or impact levels, front matter
@@ -169,6 +169,9 @@ export function checkRubric(text: string): string[] {
     problems.push(`models must be JSON, for example {"codex": "gpt-6.2-sol"}`);
   }
   if (meta.report_notice !== undefined && typeof meta.report_notice !== "string") problems.push("report_notice must be text");
+  if (meta.max_blocking !== undefined && !(typeof meta.max_blocking === "number" && Number.isInteger(meta.max_blocking) && meta.max_blocking > 0)) {
+    problems.push("max_blocking must be a whole number above 0");
+  }
   for (const k of Object.keys(meta)) if (!KNOWN.has(k)) problems.push(`unknown front matter key "${k}"`);
   return problems;
 }

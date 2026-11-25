@@ -253,8 +253,14 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
       lines.push(`- Duplicates across reviewers merged by ${round.merge.method === "model" ? `model (${round.merge.by})` : "word-based rules"}${round.merge.error ? `; ${round.merge.error}` : ""}`);
     }
     const blocking = round.findings.filter((f) => f.blocking);
-    const advisory = round.findings.filter((f) => !f.blocking);
-    lines.push(round.finished_at || review.state !== "in_review" ? `- Findings: ${blocking.length} blocking, ${advisory.length} advisory` : "- Findings: not yet, the round is still running");
+    const overLimit = round.findings.filter((f) => !f.blocking && f.over_limit);
+    const advisory = round.findings.filter((f) => !f.blocking && !f.over_limit);
+    const limit = round.policy?.max_blocking;
+    lines.push(
+      round.finished_at || review.state !== "in_review"
+        ? `- Findings: ${blocking.length} blocking, ${overLimit.length + advisory.length} advisory${overLimit.length ? ` (${overLimit.length} of them would block but are over the limit of ${limit ?? blocking.length} blocking per round)` : ""}`
+        : "- Findings: not yet, the round is still running",
+    );
     const unanswered = blocking.filter((f) => !f.response).length;
     if (blocking.length) lines.push(`- Unanswered blocking findings: ${unanswered}`);
     if (review.signoff) lines.push(`- Signed off by ${review.signoff.by} on ${review.signoff.at}${review.signoff.note ? `: ${review.signoff.note}` : ""}`);
@@ -277,6 +283,16 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
     }
     lines.push("", "## Blocking findings", "");
     lines.push(blocking.length ? blocking.map(findingLine).join("\n") : "None.");
+    if (overLimit.length) {
+      lines.push(
+        "",
+        "## Over the limit (would block)",
+        "",
+        `These would block on their own, but a round blocks on at most ${limit ?? blocking.length} findings, the riskiest first. They are not required answers in this round; treat them as serious, and they may block in the next round.`,
+        "",
+        overLimit.map(findingLine).join("\n"),
+      );
+    }
     if (includeAdvisory) {
       lines.push("", "## Advisory findings", "");
       lines.push(advisory.length ? advisory.map(findingLine).join("\n") : "None.");

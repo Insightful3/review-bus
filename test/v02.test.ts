@@ -14,7 +14,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { loadConfig } from "../src/config.js";
 import { Engine } from "../src/engine.js";
 import { startHttp } from "../src/http.js";
-import { checkRubricPath, listRubrics, loadRubric } from "../src/rubrics.js";
+import { checkRubric, checkRubricPath, listRubrics, loadRubric } from "../src/rubrics.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const FIXTURE = path.join(ROOT, "test/fixtures/proposal-bluefin.md");
@@ -831,4 +831,41 @@ test("results of a pull-only round tell the agent to check back later", async ()
   const res = await call("review_result", { review_id: review.id });
   assert.deepEqual(res.json.waiting_for_pull, ["person"]);
   assert.match(res.json.next, /check back later/);
+});
+
+test("findings over the blocking limit are marked and shown; a rubric can set its own limit", async () => {
+  writeConfig({ policy: { max_blocking: 1, max_rounds: 3 } });
+  const e = new Engine(loadConfig());
+  const tight = await e.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  await e.settled(tight.id);
+  const r1 = e.get(tight.id).rounds[0];
+  assert.equal(r1.findings.filter((f) => f.blocking).length, 1);
+  const over = r1.findings.filter((f) => f.over_limit);
+  assert.ok(over.length >= 1);
+  assert.ok(over.every((f) => !f.blocking));
+  const report = readFileSync(path.join(tmp, "reviews", tight.id, "report.md"), "utf8");
+  assert.match(report, new RegExp(`\\(${over.length} of them would block but are over the limit of 1 blocking per round\\)`));
+  assert.match(report, /## Over the limit \(would block\)/);
+  // A rubric with max_blocking: 5 overrides the config's 1 for its reviews.
+  const dir = path.join(tmp, "rubrics-limit");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "roomy.md"), "---\nmax_blocking: 5\n---\n# Roomy\n\n## Purpose\n\nx\n\n## What to check\n\n- x\n\n## Out of scope\n\n- x\n\n## Impact anchors\n\n- critical: x\n- high: x\n- medium: x\n- low: x\n");
+  writeConfig({ policy: { max_blocking: 1, max_rounds: 3 }, rubric_paths: [dir] });
+  const e2 = new Engine(loadConfig());
+  const roomy = await e2.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "roomy", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  await e2.settled(roomy.id);
+  const r2 = e2.get(roomy.id).rounds[0];
+  assert.equal(r2.policy!.max_blocking, 5);
+  assert.equal(r2.findings.filter((f) => f.blocking).length, over.length + 1);
+  assert.ok(!r2.findings.some((f) => f.over_limit));
+  assert.match(checkRubric("---\nmax_blocking: 0\n---\n").join(), /max_blocking must be a whole number above 0/);
+  writeConfig();
 });

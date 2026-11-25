@@ -142,7 +142,7 @@ test("respond, fix, resubmit: round 2 approves and keeps round 1 history", async
   });
   assert.equal(r2.round, 2);
   assert.equal(r2.state, "approved");
-  assert.deepEqual(r2.counts, { blocking: 0, advisory: 2 });
+  assert.deepEqual(r2.counts, { blocking: 0, advisory: 2, over_limit: 0 });
 
   // The round 2 prompt carries round 1 findings and answers; the report keeps round 1.
   const dir = path.join(tmp, "reviews", id);

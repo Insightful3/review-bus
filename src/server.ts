@@ -35,7 +35,8 @@ function pullHint(review: Review) {
 function resultPayload(review: Review, includeAdvisory: boolean) {
   const round = review.rounds.at(-1);
   // Challenges to the author's assumptions are always shown, even when advisory (SPEC 6).
-  const findings = (round?.findings ?? []).filter((f) => includeAdvisory || f.blocking || f.assumption_challenge);
+  // Findings over the blocking limit are shown too: they would block on their own.
+  const findings = (round?.findings ?? []).filter((f) => includeAdvisory || f.blocking || f.over_limit || f.assumption_challenge);
   return {
     review_id: review.id,
     state: review.state,
@@ -60,7 +61,9 @@ function resultPayload(review: Review, includeAdvisory: boolean) {
     counts: {
       blocking: round?.findings.filter((f) => f.blocking).length ?? 0,
       advisory: round?.findings.filter((f) => !f.blocking).length ?? 0,
+      over_limit: round?.findings.filter((f) => f.over_limit).length ?? 0,
     },
+    max_blocking: round?.policy?.max_blocking ?? null,
     findings,
     ...pullHint(review),
   };
