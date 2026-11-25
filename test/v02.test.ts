@@ -584,3 +584,90 @@ test("codex-review: inherited GIT_* variables, ignored tracked files and relativ
   assert.ok(readFileSync(path.join(other, ".git", "index")).equals(otherIndex), "the other repo's index is untouched");
   assert.ok(readFileSync(path.join(other, ".git", "config")).equals(otherConfig), "the other repo's config is untouched");
 });
+
+// ---- Fixes from Codex's second review round ----
+
+test("the inbox serves only recorded snapshot files, never a symlink to review.json", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  const get = (p: string) => fetch(`${base}inbox/review/${review.id}/file/${p}`, { headers: { cookie } });
+  symlinkSync(path.join(tmp, "reviews", review.id, "review.json"), path.join(tmp, "reviews", review.id, "r1", "meta.md"));
+  assert.equal((await get("r1/meta.md")).status, 404);
+  assert.equal((await get("r1/prompt.md")).status, 404); // exists, but not a recorded snapshot file
+  assert.equal((await get("r1/artifact.md")).status, 200);
+});
+
+test("an inbox post from another port of the same host is refused", async () => {
+  const { port } = new URL(base);
+  const res = await fetch(`${base}inbox/login`, { method: "POST", headers: { origin: `http://127.0.0.1:${Number(port) + 1}` }, body: new URLSearchParams({ token }), redirect: "manual" });
+  assert.equal(res.status, 403);
+  const same = await fetch(`${base}inbox/login`, { method: "POST", headers: { origin: `http://127.0.0.1:${port}` }, body: new URLSearchParams({ token }), redirect: "manual" });
+  assert.equal(same.status, 303);
+});
+
+test("a settled round with a dead runner and no finisher is finished, not failed", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  const file = path.join(tmp, "reviews", review.id, "review.json");
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  Object.assign(saved, { state: "in_review" });
+  Object.assign(saved.rounds[0], { finished_at: null, findings: [], finalizing: null, runner: { pid: 999999, host: os.hostname(), started_at: new Date().toISOString() } });
+  writeFileSync(file, JSON.stringify(saved));
+  const other = new Engine(loadConfig());
+  other.get(review.id);
+  await other.settled(review.id);
+  assert.equal(other.get(review.id).state, "changes_requested");
+});
+
+test("a long page capture is not failed by another process while its process lives", async () => {
+  writeConfig({ snapshot_wait_seconds: 0 });
+  const a = new Engine(loadConfig());
+  const review = await a.submit({ artifact: null, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  await a.settled(review.id);
+  const sleeper = spawn("sleep", ["30"]);
+  try {
+    const file = path.join(tmp, "reviews", review.id, "review.json");
+    const saved = JSON.parse(readFileSync(file, "utf8"));
+    const longAgo = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+    Object.assign(saved, { state: "submitted", preparing: { pid: sleeper.pid, host: os.hostname(), started_at: longAgo } });
+    writeFileSync(file, JSON.stringify(saved));
+    assert.equal(new Engine(loadConfig()).get(review.id).state, "submitted");
+  } finally {
+    sleeper.kill();
+    writeConfig();
+  }
+});
+
+test("an indented front matter line is an error, not a dropped flag", () => {
+  const dir = path.join(tmp, "packs", "indented");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "contract.md"), RUBRIC.replace("confidential: true", "  confidential: true"));
+  assert.match(checkRubricPath(path.join(dir, "contract.md"))[0].problems.join(), /line 2 is not a flat "key: value" line/);
+  assert.throws(() => loadRubric("contract", [dir]), /not a flat "key: value" line/);
+});
+
+test("a release from an old page does not drop a newer claim; pull-only status says to check back later", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const st = (await call("review_status", { review_id: review.id })).json;
+  assert.deepEqual(st.waiting_for_pull, ["person"]);
+  assert.match(st.next, /check back later/);
+  engine.claim(review.id, "person", { by: "Ana", client: null });
+  const oldAt = engine.get(review.id).rounds[0].reviewers[0].claim!.at;
+  engine.release(review.id, "person", "Ana", oldAt);
+  await new Promise((r) => setTimeout(r, 5));
+  engine.claim(review.id, "person", { by: "Bo", client: null });
+  assert.throws(() => engine.release(review.id, "person", "Ana", oldAt), /claimed again since \(by Bo\)/);
+  assert.equal(engine.get(review.id).rounds[0].reviewers[0].claim!.by, "Bo");
+});

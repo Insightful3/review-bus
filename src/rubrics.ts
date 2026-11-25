@@ -27,9 +27,12 @@ function parseFrontMatter(text: string): { meta: Record<string, unknown>; body: 
   if (!m && /^---\r?\n/.test(text)) throw new Error("the front matter has no closing --- line");
   if (!m) return { meta: {}, body: text };
   const meta: Record<string, unknown> = {};
-  for (const line of m[1].split(/\r?\n/)) {
+  for (const [i, line] of m[1].split(/\r?\n/).entries()) {
+    if (!line.trim() || line.trimStart().startsWith("#")) continue;
     const kv = line.match(/^([A-Za-z0-9_]+)\s*:\s*(.*)$/);
-    if (!kv) continue;
+    // Flat key: value lines only. An indented or malformed line is an error, not skipped: skipping
+    // "  confidential: true" would silently drop the flag.
+    if (!kv) throw new Error(`front matter line ${i + 2} is not a flat "key: value" line: ${line.trim().slice(0, 60)}`);
     const v = kv[2].trim();
     try {
       meta[kv[1]] = JSON.parse(v);

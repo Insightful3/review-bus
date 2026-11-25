@@ -51,6 +51,15 @@ function waitingOnPull(rd: Round): boolean {
   );
 }
 
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0 only checks that the process exists
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
   const y = Buffer.from(b);
@@ -516,10 +525,14 @@ export class Engine {
     const review = this.store.load(id);
     const cutOff = (r: Review) => {
       if (this.running.has(id)) return false;
-      if (r.state === "submitted") return !this.runningElsewhere(r.preparing);
+      // Page capture has no reviewer timeout to bound it: only the process itself counts.
+      if (r.state === "submitted") return !this.runningElsewhere(r.preparing, false);
       if (r.state !== "in_review") return false;
       const rd = r.rounds.at(-1);
-      return !rd || (!this.runningElsewhere(rd.runner) && !this.runningElsewhere(rd.finalizing) && !waitingOnPull(rd));
+      if (!rd) return true;
+      // Every reviewer answered: never failed for a dead process; the round is finished instead.
+      if (roundSettled(rd) && !rd.finished_at) return false;
+      return !this.runningElsewhere(rd.runner) && !this.runningElsewhere(rd.finalizing) && !waitingOnPull(rd);
     };
     if (!cutOff(review)) return this.expirePull(review);
     return this.store.update(id, (r) => {
@@ -536,9 +549,10 @@ export class Engine {
    * latest round. A round older than the longest reviewer timeout plus 10 minutes counts as dead,
    * in case the process id was reused.
    */
-  private runningElsewhere(runner: { pid: number; host: string; started_at: string } | null | undefined): boolean {
+  private runningElsewhere(runner: { pid: number; host: string; started_at: string } | null | undefined, ageLimit = true): boolean {
     if (!runner || runner.pid === process.pid) return false;
     if (runner.host !== os.hostname()) return true; // shared storage on another machine: cannot check
+    if (!ageLimit) return processAlive(runner.pid);
     const maxTimeout = Math.max(600, ...Object.values(this.config.adapters).filter((a) => a.type !== "pull").map((a) => a.timeout_seconds));
     if (Date.now() - Date.parse(runner.started_at) > (maxTimeout + 600) * 1000) return false;
     try {
@@ -797,12 +811,19 @@ export class Engine {
     if (adapter.claim_clients.length && !adapter.claim_clients.includes(who.client ?? "")) {
       throw new Error(`Reviewer "${reviewer}" accepts claims only from ${adapter.claim_clients.join(", ")} (this client: ${who.client ?? "unknown"}).`);
     }
-    this.get(id);
+    // Everything the claimant needs is read before the claim is saved: a claim whose payload could
+    // not be built (a rubric renamed meanwhile) would lock the work until someone releases it.
+    const before = this.get(id);
+    if (before.state !== "in_review") throw new Error(`Review ${id} is ${before.state}; there is nothing to claim.`);
+    const expected = before.rounds.at(-1)!.n;
+    const prompt = readFileSync(path.join(this.store.roundDir(id, expected), "prompt.md"), "utf8");
+    const rubricText = loadRubric(before.request.rubric, this.config.rubric_paths, this.config.rubric_packs).body;
     const token = randomBytes(16).toString("hex");
     let n = 0;
     const review = this.store.update(id, (r) => {
       if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; there is nothing to claim.`);
       const round = r.rounds.at(-1)!;
+      if (round.n !== expected) throw new Error(`Review ${id} moved on to round ${round.n} meanwhile; claim again.`);
       const run = round.reviewers.find((x) => x.name === reviewer);
       if (!run || run.adapter !== "pull") throw new Error(`Review ${id} round ${round.n} has no pull reviewer "${reviewer}".`);
       if (run.status !== "waiting") throw new Error(`Reviewer "${reviewer}" of review ${id} is ${run.status === "running" ? `already claimed by ${run.claim?.by}` : run.status}.`);
@@ -830,10 +851,10 @@ export class Engine {
       deadline: round.reviewers.find((x) => x.name === reviewer)!.deadline ?? null,
       round_dir: this.store.roundDir(id, n),
       files: files.map((f) => path.join(dir, f)),
-      prompt: readFileSync(path.join(this.store.roundDir(id, n), "prompt.md"), "utf8"),
+      prompt,
       output_schema: reviewerOutputJsonSchema(),
       rubric: review.request.rubric,
-      rubric_text: loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs).body,
+      rubric_text: rubricText,
       intent: review.request.intent,
       assumptions: review.request.assumptions,
       criteria: review.request.criteria,
@@ -902,12 +923,14 @@ export class Engine {
   }
 
   /** Gives up a claim (an abandoned browser tab, the wrong person): the work waits for a new claim. */
-  release(id: string, reviewer: string, by: string): Review {
+  release(id: string, reviewer: string, by: string, claimedAt?: string): Review {
     this.get(id);
     return this.store.update(id, (r) => {
       if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; there is no claim to release.`);
       const run = r.rounds.at(-1)!.reviewers.find((x) => x.name === reviewer);
       if (!run || run.adapter !== "pull" || run.status !== "running" || !run.claim) throw new Error(`Reviewer "${reviewer}" of review ${id} is not claimed.`);
+      // A release from an old page must not drop a newer claim.
+      if (claimedAt && run.claim.at !== claimedAt) throw new Error(`Reviewer "${reviewer}" was claimed again since (by ${run.claim.by}); nothing was released.`);
       r.history.push({ at: now(), event: "released", detail: `${reviewer}, claimed by ${run.claim.by}, released by ${by.trim() || "someone"}` });
       Object.assign(run, { status: "waiting", claim: null, started_at: null });
     });

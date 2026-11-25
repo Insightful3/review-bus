@@ -4,7 +4,7 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -74,12 +74,14 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
     const names = [...LOOPBACK, ...cfg.allowed_hosts].map((h) => h.toLowerCase());
     return names.some((n) => host === `${n}:${port}` || host === `[${n}]:${port}` || host === n);
   };
+  // A browser's Origin must be this very server (host and port): SameSite cookies ignore ports, so a
+  // page on another port of the same host could otherwise post to the inbox with the session.
   const originOk = (req: http.IncomingMessage) => {
     const origin = req.headers.origin;
     if (!origin) return true;
     try {
       const u = new URL(origin);
-      return hostOk({ headers: { host: u.host } } as http.IncomingMessage);
+      return u.protocol === "http:" && u.host.toLowerCase() === (req.headers.host ?? "").toLowerCase();
     } catch {
       return false;
     }
@@ -209,28 +211,33 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
         }
         if (req.method === "POST" && parts[2] === "release" && parts[3]) {
           const form = new URLSearchParams(await readBody(req, 64 * 1024));
-          engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`);
+          engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`, form.get("claimed_at") ?? undefined);
           res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent("Claim released.")}`, ...SECURITY_HEADERS });
           res.end();
           return;
         }
         if (req.method === "GET" && parts[2] === "file") {
-          // Screenshots and Markdown of a round, nothing else (review.json holds claim tokens).
+          // Only files review-bus wrote and recorded in a round's snapshot: the Markdown, related
+          // documents and screenshots. Nothing from the project copy (a reviewed repo can track a
+          // symlink to review.json, which holds claim tokens), and never through a symlink.
           const rel = parts.slice(3).map(decodeURIComponent).join("/");
-          if (!/^r\d+\/[A-Za-z0-9._\/-]+\.(png|md)$/.test(rel) || rel.split("/").includes("..")) {
-            send(res, 404, "Not found", "text/plain");
-            return;
-          }
+          const review = engine.get(id);
+          const recorded = new Set(
+            review.rounds.flatMap((rd) => [
+              rd.snapshot.markdown_file,
+              ...(rd.snapshot.related ?? []).map((x) => x.markdown_file),
+              ...(rd.snapshot.pages ?? []).flatMap((p) => p.screenshots.map((s) => s.file)),
+            ]),
+          );
           const file = path.join(engine.store.dir(id), rel);
-          // A reviewed repo can track a symlink (it lands in r<n>/tree): never follow one out of the review.
-          const inside = (() => {
+          const plain = (() => {
             try {
-              return realpathSync(file).startsWith(realpathSync(engine.store.dir(id)) + path.sep);
+              return lstatSync(file).isFile() && realpathSync(file) === path.join(realpathSync(engine.store.dir(id)), rel);
             } catch {
               return false;
             }
           })();
-          if (!inside || !existsSync(file)) {
+          if (!recorded.has(rel) || !plain) {
             send(res, 404, "Not found", "text/plain");
             return;
           }

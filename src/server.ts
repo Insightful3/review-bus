@@ -88,6 +88,14 @@ function statusPayload(review: Review) {
     },
     signoff: review.signoff ?? null,
     updated_at: review.updated_at,
+    // Only pull reviewers (a person, an agent elsewhere) are left: waiting returns at once, so do
+    // other work and check back later instead of calling review_wait in a loop.
+    ...(onlyPullLeft(review)
+      ? {
+          waiting_for_pull: (round?.reviewers ?? []).filter((r) => r.status === "waiting" || r.status === "running").map((r) => r.name),
+          next: "Only pull reviewers are left; they may take hours or days. Do other work and check back later with review_status, not a review_wait loop.",
+        }
+      : {}),
   };
 }
 
@@ -186,6 +194,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     const handler = {
         createTask: async (args: unknown, extra: CreateTaskRequestHandlerExtra) => {
           const asTask = taskRequests.delete(extra.requestId);
+          const callStarted = Date.now();
           const task = await extra.taskStore.createTask({ ttl: Math.max(extra.taskRequestedTtl ?? 0, TASK_TTL_MS), pollInterval: 2000 });
           const progressToken = (extra._meta as { progressToken?: string | number } | undefined)?.progressToken;
           const ctx: CallContext = {
@@ -193,9 +202,11 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
             wait: async (id, requested) => {
               if (asTask || requested <= 0) return 0;
               if (progressToken === undefined) {
-                const seconds = cap(requested);
-                await engine.waitFor(id, seconds);
-                return seconds;
+                // The whole call stays under max_wait_seconds: time already spent (for example on
+                // page screenshots before the review id existed) counts.
+                const seconds = Math.max(0, cap(requested) - (Date.now() - callStarted) / 1000);
+                if (seconds > 0) await engine.waitFor(id, seconds);
+                return Math.round(seconds);
               }
               const seconds = Math.min(requested, engine.config.max_wait_with_progress_seconds);
               const startedAt = Date.now();
@@ -306,6 +317,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
       await ctx.wait(submitted.id, args.wait_seconds);
       const review = engine.get(submitted.id);
       if (!isActive(review.state)) return { now: reply(review, false) };
+      if (onlyPullLeft(review)) return { now: jsonReply({ ...status(review), review_id: review.id }) };
       const next =
         review.state === "submitted"
           ? "The snapshot (page screenshots) is being taken. Call review_wait with this review_id until state is neither submitted nor in_review, then review_result."

@@ -128,6 +128,7 @@ export function renderReviewPage(engine: Engine, id: string, msg: string | null)
     .map(
       (r) => `<form method="post" action="/inbox/review/${esc(id)}/release/${esc(r.name)}" class="card"><h3>${esc(r.name)} is claimed by ${esc(r.claim!.by)}</h3>
 <p class="muted">Claimed ${esc(fmt(r.claim!.at))}. If that review will not be finished (a closed tab, the wrong person), release the claim so someone else can take it.</p>
+<input type="hidden" name="claimed_at" value="${esc(r.claim!.at)}">
 <label>Your name<input type="text" name="by" aria-label="Your name" required></label><p><button class="secondary">Release the claim</button></p></form>`,
     )
     .join("");
