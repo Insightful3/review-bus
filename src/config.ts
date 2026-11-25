@@ -47,6 +47,14 @@ const Config = z.object({
       tile_height: z.number().int().positive().default(DEFAULT_BROWSER.tile_height),
     })
     .default(DEFAULT_BROWSER),
+  // Optional: a cheap model groups duplicate findings across reviewers. Without it, conservative
+  // word-based rules merge only near-identical findings.
+  merge_with: z
+    .object({ adapter: z.string(), model: z.string().nullable().default(null), effort: Effort.nullable().default(null) })
+    .nullable()
+    .default(null),
+  // Longest a tool call waits before returning. MCP clients usually give up after about 60 s.
+  max_wait_seconds: z.number().int().min(1).max(600).default(50),
   policy: z
     .object({
       max_blocking: z.number().int().positive().default(5),
@@ -65,6 +73,9 @@ export function expandHome(p: string): string {
 }
 
 function findConfigFile(): string | null {
+  // An explicitly named config must exist: falling back silently would use a different config.
+  const explicit = process.env.REVIEW_BUS_CONFIG;
+  if (explicit && !existsSync(explicit)) throw new Error(`REVIEW_BUS_CONFIG points to ${explicit}, which does not exist.`);
   const candidates = [
     process.env.REVIEW_BUS_CONFIG,
     path.join(os.homedir(), ".review-bus", "config.json"),
@@ -90,6 +101,9 @@ export function loadConfig(): Config {
       a.args = a.args.map((x) => (isRel(x) ? resolve(x) : x));
     }
     adapters[name] = { ...a, vendor: a.vendor ?? DEFAULT_VENDOR[a.type] };
+  }
+  if (parsed.merge_with && !adapters[parsed.merge_with.adapter]) {
+    throw new Error(`merge_with.adapter "${parsed.merge_with.adapter}" is not in adapters.`);
   }
   return {
     ...parsed,

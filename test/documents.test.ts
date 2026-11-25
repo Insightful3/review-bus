@@ -118,3 +118,28 @@ test("htmlToMarkdown handles mammoth's lists, tables and entities", () => {
     "## Terms & conditions\n\nPay **EUR 1,000** <net>.\n\n1. First\n2. Second\n\n- Dot\n\n| A\\|B | C |\n| --- | --- |\n| D |  |\n",
   );
 });
+
+test("related documents are converted, put in the prompt for comparison, and part of the snapshot hash", async () => {
+  const PROPOSAL_MD = path.join(ROOT, "test/fixtures/proposal-bluefin.md");
+  const { json, text } = await call("review_submit", {
+    artifact: CONTRACT,
+    related: [PROPOSAL_MD, PDF],
+    rubric: "contract-b2b",
+    intent: "Sign the agreement that matches the accepted proposal.",
+    wait_seconds: 10,
+  });
+  assert.ok(json, text);
+  const dir = path.join(tmp, "reviews", json.review_id);
+  const snap = JSON.parse(readFileSync(path.join(dir, "review.json"), "utf8")).rounds[0].snapshot;
+  assert.deepEqual(snap.related.map((r: { markdown_file: string }) => r.markdown_file), ["r1/related/01-proposal-bluefin.md", "r1/related/02-proposal-bluefin.md"]);
+  const prompt = readFileSync(path.join(dir, "r1/prompt.md"), "utf8");
+  assert.match(prompt, /## Related documents \(for comparison, not under review\)/);
+  assert.match(prompt, /<related name="proposal-bluefin\.md">\n# Proposal: Customer support assistant/);
+  assert.match(prompt, /<related name="proposal-bluefin\.pdf">\n## Page 1/);
+  // The contract itself is still the document under review.
+  assert.match(prompt, /<document>\n# Services Agreement/);
+  assert.match(readFileSync(path.join(dir, "report.md"), "utf8"), /compared with proposal-bluefin\.md, proposal-bluefin\.pdf/);
+
+  const missing = await call("review_submit", { artifact: CONTRACT, related: ["/nope/proposal.md"], rubric: "contract-b2b", intent: "x" });
+  assert.match(missing.text, /Related document not found/);
+});

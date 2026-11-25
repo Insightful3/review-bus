@@ -70,6 +70,7 @@ function findingLine(f: Finding): string {
     f.failure_scenario ? `  - Failure scenario: ${f.failure_scenario}` : null,
     f.suggested_fix ? `  - Suggested fix: ${f.suggested_fix}` : null,
     `  - Reviewer: ${f.reviewer}, confidence ${f.confidence}`,
+    f.agreement > 1 ? `  - Also raised by: ${(f.also_raised_by ?? []).map((r) => `${r.reviewer} [${r.impact}/${r.likelihood}]`).join(", ")} (agreement ${f.agreement})` : null,
     f.response ? `  - Response: ${f.response.status}${f.response.note ? `, ${f.response.note}` : ""}` : null,
   ];
   return "- " + parts.filter(Boolean).join("\n");
@@ -83,7 +84,11 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
   lines.push(`- Rubric: ${review.request.rubric}, stage: ${review.request.stage}`);
   lines.push(`- Artifact: ${describeArtifact(review.request)}`);
   const a = review.author;
-  lines.push(`- Author: ${a.vendor ?? "unknown vendor"}${a.client ? ` (${a.client})` : ""}${a.vendor_source === "declared" ? ", declared" : ""}`);
+  lines.push(
+    a.vendor_source === "person"
+      ? `- Author: a person (${a.client})`
+      : `- Author: ${a.vendor ?? "unknown vendor"}${a.client ? ` (${a.client})` : ""}${a.vendor_source === "declared" ? ", declared" : ""}`,
+  );
   if (round) {
     const snap = round.snapshot;
     lines.push(`- Round ${round.n}, snapshot sha256 ${snap.sha256.slice(0, 12)}${snap.converter && snap.converter !== "none" ? `, converted with ${snap.converter}` : ""}`);
@@ -96,6 +101,9 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
       lines.push(`- Page ${p.url}: HTTP ${p.status ?? "?"}, ${p.screenshots.length} screenshot(s) in ${p.screenshots[0]?.file.split("/").slice(0, 2).join("/") ?? "?"}`);
     }
     for (const w of snap.warnings ?? []) lines.push(`- Warning: ${w}`);
+    if (round.merge && round.merge.method !== "none") {
+      lines.push(`- Duplicates across reviewers merged by ${round.merge.method === "model" ? `model (${round.merge.by})` : "word-based rules"}${round.merge.error ? `; ${round.merge.error}` : ""}`);
+    }
     const blocking = round.findings.filter((f) => f.blocking);
     const advisory = round.findings.filter((f) => !f.blocking);
     lines.push(`- Findings: ${blocking.length} blocking, ${advisory.length} advisory`);

@@ -39,6 +39,7 @@ export async function snapshotRound(
   reviewDir: string,
   round: number,
   browser: BrowserConfig,
+  related: string[] = [],
 ): Promise<Snapshot> {
   if (!artifact?.path && !artifact?.git && !pages.length) throw new Error("Nothing to review: give a document path, a git change or pages.");
   if (artifact?.path && artifact.git) throw new Error("Give either a document path or a git change, not both.");
@@ -54,6 +55,28 @@ export async function snapshotRound(
     snap = { kind: "git", sha256, markdown_file, warnings: [], git: info };
   } else {
     snap = { kind: "pages", sha256: "", markdown_file: null, warnings: [] };
+  }
+
+  if (related.length) {
+    const dirRel = `r${round}/related`;
+    mkdirSync(path.join(reviewDir, dirRel), { recursive: true });
+    const hash = createHash("sha256").update(snap.sha256);
+    snap.related = [];
+    for (const [i, src] of related.entries()) {
+      const abs = path.resolve(src);
+      if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`Related document not found: ${abs}`);
+      const kind = kindOf(path.extname(abs).toLowerCase());
+      if (!kind) throw new Error(`Unsupported related document type: ${abs}. Supported: .md, .markdown, .txt, .docx, .pdf.`);
+      const data = readFileSync(abs);
+      const converted = await toMarkdown(abs, kind);
+      const markdown_file = `${dirRel}/${String(i + 1).padStart(2, "0")}-${path.basename(abs, path.extname(abs)).replace(/[^a-z0-9]+/gi, "-").slice(0, 40)}.md`;
+      writeFileSync(path.join(reviewDir, markdown_file), converted.markdown);
+      const sha256 = createHash("sha256").update(data).digest("hex");
+      hash.update(sha256);
+      snap.related.push({ source_path: abs, markdown_file, sha256 });
+      for (const w of converted.warnings) snap.warnings.push(`${path.basename(abs)}: ${w}`);
+    }
+    snap.sha256 = hash.digest("hex");
   }
 
   if (pages.length) {
@@ -88,5 +111,6 @@ export function describeArtifact(req: ReviewRequest): string {
     parts.push(`git ${g.repo} (${g.mode}${g.mode === "base" && g.base ? ` vs ${g.base}` : ""}${g.mode === "commit" && g.commit ? ` ${g.commit}` : ""})`);
   }
   if (req.pages.length) parts.push(`${req.pages.length} page(s): ${req.pages.join(", ")}`);
+  if (req.related?.length) parts.push(`compared with ${req.related.map((r) => path.basename(r)).join(", ")}`);
   return parts.join(" + ");
 }

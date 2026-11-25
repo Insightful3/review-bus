@@ -16,6 +16,17 @@ export interface ReviewJob {
   signal?: AbortSignal;
   /** Screenshots (absolute paths, inside cwd). Codex gets them attached; Claude opens them with Read. */
   images?: string[];
+  /** JSON Schema for the answer; defaults to the reviewer output schema. */
+  schema?: Record<string, unknown>;
+  /** Claude only: "read" (Read, Grep, Glob) for reviews, "none" for tasks that need no files. */
+  tools?: "read" | "none";
+}
+
+/** The CLI's JSON answer before validation, plus what it reported about itself. */
+export interface RawResult {
+  json: unknown;
+  reportedModel: string | null;
+  reportedEffort: string | null;
 }
 
 export interface AdapterResult {
@@ -25,13 +36,15 @@ export interface AdapterResult {
   reportedEffort: string | null;
 }
 
-function parseOutput(text: string, source: string): ReviewerOutput {
-  let json: unknown;
+function parseJson(text: string, source: string): unknown {
   try {
-    json = JSON.parse(text);
+    return JSON.parse(text);
   } catch {
     throw new Error(`${source} did not return valid JSON`);
   }
+}
+
+function validateOutput(json: unknown, source: string): ReviewerOutput {
   const parsed = ReviewerOutput.safeParse(json);
   if (!parsed.success) {
     throw new Error(`${source} output does not match the reviewer schema: ${parsed.error.issues.slice(0, 3).map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
@@ -43,7 +56,7 @@ function parseOutput(text: string, source: string): ReviewerOutput {
  * Generic command: prompt on stdin, reviewer output JSON on stdout.
  * {model} and {effort} in args are substituted (empty string when unset); also passed as env vars.
  */
-async function runCommand(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResult> {
+async function runCommand(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
   const args = cfg.args.map((a) => a.replaceAll("{model}", job.model ?? "").replaceAll("{effort}", job.effort ?? ""));
   const r = await runProcess(cfg.command, args, {
     cwd: job.cwd,
@@ -59,7 +72,7 @@ async function runCommand(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterRe
   });
   writeFileSync(path.join(job.outDir, `${job.reviewerName}.raw.txt`), r.stdout);
   if (r.code !== 0 || r.timedOut) throw new Error(describeFailure(cfg.command, r));
-  return { output: parseOutput(r.stdout, cfg.command), reportedModel: null, reportedEffort: null };
+  return { json: parseJson(r.stdout, cfg.command), reportedModel: null, reportedEffort: null };
 }
 
 /**
@@ -67,10 +80,10 @@ async function runCommand(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterRe
  * Flags checked against `codex exec --help` on codex-cli 0.172.0.
  * --ephemeral keeps reviewer sessions (which contain the document) off disk.
  */
-async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResult> {
+async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
   const schemaFile = path.join(job.outDir, `${job.reviewerName}.schema.json`);
   const outFile = path.join(job.outDir, `${job.reviewerName}.out.json`);
-  writeFileSync(schemaFile, JSON.stringify(reviewerOutputJsonSchema(), null, 2));
+  writeFileSync(schemaFile, JSON.stringify(job.schema ?? reviewerOutputJsonSchema(), null, 2));
   const args = [
     "exec",
     "--sandbox",
@@ -104,7 +117,7 @@ async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResu
   // Codex prints its session header ("model: ...", "reasoning effort: ...") in its log output.
   const log = `${r.stderr}\n${r.stdout}`;
   return {
-    output: parseOutput(readFileSync(outFile, "utf8"), "codex exec"),
+    json: parseJson(readFileSync(outFile, "utf8"), "codex exec"),
     reportedModel: log.match(/^model:\s*(\S+)/m)?.[1] ?? null,
     reportedEffort: log.match(/^reasoning effort:\s*(\S+)/m)?.[1] ?? null,
   };
@@ -118,15 +131,15 @@ async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResu
  * The answer is in `structured_output`; the model that ran is the key of `modelUsage`.
  * Claude does not report effort, so the requested effort is recorded.
  */
-async function runClaude(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResult> {
+async function runClaude(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
   const args = [
     "-p",
     "--output-format",
     "json",
     "--json-schema",
-    JSON.stringify(reviewerOutputJsonSchema()),
+    JSON.stringify(job.schema ?? reviewerOutputJsonSchema()),
     "--tools",
-    "Read,Grep,Glob",
+    job.tools === "none" ? "" : "Read,Grep,Glob",
     "--permission-prompts",
     "none",
     "--restricted",
@@ -155,14 +168,14 @@ async function runClaude(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterRes
   if (envelope.structured_output == null) throw new Error("claude -p returned no structured_output");
   const models = Object.keys(envelope.modelUsage ?? {});
   return {
-    output: parseOutput(JSON.stringify(envelope.structured_output), "claude -p"),
+    json: envelope.structured_output,
     // Several keys can appear if Claude used a helper model; the job's model, if set, wins.
     reportedModel: (job.model && models.find((m) => m.includes(job.model!))) || models[0] || null,
     reportedEffort: null,
   };
 }
 
-export async function runAdapter(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResult> {
+function runRaw(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
   switch (cfg.type) {
     case "command":
       return runCommand(cfg, job);
@@ -171,4 +184,15 @@ export async function runAdapter(cfg: AdapterConfig, job: ReviewJob): Promise<Ad
     case "claude":
       return runClaude(cfg, job);
   }
+}
+
+/** Runs a reviewer and validates its answer against the reviewer output schema. */
+export async function runAdapter(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResult> {
+  const r = await runRaw(cfg, job);
+  return { output: validateOutput(r.json, cfg.type === "command" ? cfg.command : `${cfg.type} adapter`), reportedModel: r.reportedModel, reportedEffort: r.reportedEffort };
+}
+
+/** Runs an adapter for a task with its own JSON Schema (for example merging findings). The caller validates. */
+export function runStructured(cfg: AdapterConfig, job: ReviewJob & { schema: Record<string, unknown> }): Promise<RawResult> {
+  return runRaw(cfg, job);
 }

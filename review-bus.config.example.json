@@ -20,6 +20,12 @@
       "claude"
     ]
   },
+  "merge_with": {
+    "adapter": "claude",
+    "model": "haiku",
+    "effort": "low"
+  },
+  "max_wait_seconds": 50,
   "adapters": {
     "codex": {
       "type": "codex",

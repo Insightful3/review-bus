@@ -68,3 +68,13 @@ test("client names map to vendors by default", () => {
   assert.equal(cfg.author_vendors["claude-code"], "anthropic");
   assert.equal(cfg.author_vendors["codex-mcp-client"], "openai");
 });
+
+test("an explicitly named config that does not exist is an error, not a silent fallback", () => {
+  const before = process.env.REVIEW_BUS_CONFIG;
+  process.env.REVIEW_BUS_CONFIG = "/nope/review-bus.json";
+  try {
+    assert.throws(() => loadConfig(), /REVIEW_BUS_CONFIG points to \/nope\/review-bus\.json, which does not exist/);
+  } finally {
+    process.env.REVIEW_BUS_CONFIG = before;
+  }
+});

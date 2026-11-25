@@ -25,6 +25,8 @@ export interface ReviewRequest {
   artifact: ArtifactRef | null;
   /** URLs to render and screenshot (webpage review). */
   pages: string[];
+  /** Documents given for comparison, not under review (for example the accepted proposal for a contract). */
+  related?: string[];
   rubric: string;
   intent: string;
   assumptions: string[];
@@ -36,7 +38,7 @@ export interface ReviewRequest {
 export interface AuthorInfo {
   client: string | null; // MCP clientInfo.name
   vendor: Vendor | null;
-  vendor_source: "declared" | "client" | "unknown";
+  vendor_source: "declared" | "client" | "unknown" | "person";
 }
 
 export interface Snapshot {
@@ -54,6 +56,8 @@ export interface Snapshot {
   git?: GitInfo;
   // Pages
   pages?: PageInfo[];
+  // Related documents (for comparison)
+  related?: { source_path: string; markdown_file: string; sha256: string }[];
 }
 
 export interface ReviewerRun {
@@ -90,17 +94,24 @@ export interface Finding extends ReviewerFinding {
   round: number;
   blocking: boolean;
   severity: "blocker" | "major" | "minor" | "info";
+  /** How many reviewers raised it (SPEC 6). */
   agreement: number;
+  /** The other reviewers' versions of a merged finding. */
+  also_raised_by?: { reviewer: string; claim: string; impact: string; likelihood: string }[];
   response: FindingResponse | null;
 }
 
 export interface Round {
   n: number;
+  /** The server process running this round; other processes leave it alone while it is alive. */
+  runner?: { pid: number; host: string; started_at: string };
   started_at: string;
   finished_at: string | null;
   snapshot: Snapshot;
   reviewers: ReviewerRun[];
   findings: Finding[];
+  /** How duplicates across reviewers were merged. */
+  merge?: { method: "none" | "rules" | "model"; by: string | null; error: string | null };
 }
 
 export interface HistoryEntry {

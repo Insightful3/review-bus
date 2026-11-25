@@ -84,6 +84,8 @@ function errorReply(err: unknown) {
 export function createServer(engine: Engine): McpServer {
   const server = new McpServer({ name: "review-bus", version: "0.1.0" });
 
+  const cap = (seconds: number) => Math.min(seconds, engine.config.max_wait_seconds);
+
   // SPEC 8a: the author's vendor comes from the MCP client name unless declared.
   const detectAuthor = (declared?: Vendor): AuthorInfo => {
     const client = server.server.getClientVersion()?.name ?? null;
@@ -98,7 +100,8 @@ export function createServer(engine: Engine): McpServer {
       description:
         "Submit work for review by other agents: a document (.md, .txt, .docx, .pdf), a git change ({git: {repo, mode}}), " +
         "and/or web pages to render and screenshot (pages: URLs, for example a local dev server). " +
-        "Reviewers run read-only on a frozen snapshot. Returns review_id and state; returns the full result if the round finishes within wait_seconds.",
+        "Reviewers run read-only on a frozen snapshot. Returns review_id and state; returns the full result if the round finishes within wait_seconds " +
+        "(capped at the server's max_wait_seconds, default 50, to stay under client timeouts). Reviews often take minutes: poll review_wait until state is not in_review.",
       inputSchema: {
         artifact: z
           .union([z.string(), z.object({ git: GitSpec })])
@@ -106,6 +109,11 @@ export function createServer(engine: Engine): McpServer {
           .describe(
             'Absolute path to a document, or {"git": {"repo": "/path", "mode": "uncommitted" | "base" | "commit", "base"?: "main", "commit"?: "sha"}}. Optional when pages are given.',
           ),
+        related: z
+          .array(z.string())
+          .max(3)
+          .default([])
+          .describe("Paths to documents to compare against, not under review (for example the accepted proposal when reviewing a contract)"),
         pages: z
           .array(z.string())
           .max(10)
@@ -132,6 +140,7 @@ export function createServer(engine: Engine): McpServer {
           {
             artifact: args.artifact === undefined ? null : typeof args.artifact === "string" ? { path: args.artifact } : { git: args.artifact.git },
             pages: args.pages,
+            related: args.related,
             rubric: args.rubric,
             intent: args.intent,
             assumptions: args.assumptions,
@@ -140,10 +149,11 @@ export function createServer(engine: Engine): McpServer {
             stage: args.stage,
           },
           detectAuthor(args.author_vendor),
-          args.wait_seconds,
+          cap(args.wait_seconds),
         );
         if (review.state === "in_review") {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ review_id: review.id, state: review.state }) }] };
+          const next = "Reviewers are working. Call review_wait with this review_id until state is not in_review, then review_result.";
+          return { content: [{ type: "text" as const, text: JSON.stringify({ review_id: review.id, state: review.state, next }) }] };
         }
         return reply(review, false);
       } catch (err) {
@@ -191,14 +201,16 @@ export function createServer(engine: Engine): McpServer {
   server.registerTool(
     "review_wait",
     {
-      description: "Block until the current round finishes or the time runs out, then return the status.",
-      inputSchema: { review_id: z.string(), seconds: z.number().int().min(1).max(600).default(120) },
+      description:
+        "Block until the current round finishes or the time runs out, then return the status. seconds is capped at the server's max_wait_seconds (default 50); call again while state is in_review.",
+      inputSchema: { review_id: z.string(), seconds: z.number().int().min(1).max(600).default(50) },
     },
     async (args) => {
       try {
         engine.get(args.review_id); // validates the id
-        await engine.waitFor(args.review_id, args.seconds);
-        return jsonReply(status(engine.get(args.review_id)));
+        const waited = cap(args.seconds);
+        await engine.waitFor(args.review_id, waited);
+        return jsonReply({ ...status(engine.get(args.review_id)), waited_seconds: waited, ...(waited < args.seconds ? { wait_capped: true } : {}) });
       } catch (err) {
         return errorReply(err);
       }
@@ -233,7 +245,7 @@ export function createServer(engine: Engine): McpServer {
         const { review, unanswered } = await engine.respond(args.review_id, args.responses, {
           resubmit: args.resubmit,
           artifact: args.artifact,
-          waitSeconds: args.wait_seconds,
+          waitSeconds: cap(args.wait_seconds),
         });
         if (review.state === "in_review") return jsonReply({ ...status(review), unanswered });
         const r = reply(review, false);

@@ -29,19 +29,26 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] Mark running rounds `failed` after a restart; late results from an old round do not change state
 - [x] `report.md` keeps earlier rounds with the author's answers
 
-## Slice 3: widen (in progress)
+## Slice 3: widen (done, one decision open)
 
 - [x] Claude adapter (`claude -p ... --restricted`), fake `claude` in tests; real run with Codex as the author over MCP and Claude reviewing (SPEC 11.3)
 - [x] Git snapshots: uncommitted, base, commit; patch + `git archive` copy (nothing written to the author's repo)
 - [x] Page review: headless Chrome screenshots (desktop, mobile, tiled), page facts, broken links; images to Codex (`--image`), Claude (Read) and command reviewers
 - [x] `webpage` rubric
 - [x] DOCX (mammoth) and PDF (pdftotext, else unpdf) to Markdown; fictional DOCX and PDF fixtures from `scripts/make-fixtures.mjs`
-- [ ] Duplicate finding merge across reviewers (`agreement`)
+- [x] Duplicate finding merge across reviewers (`agreement`): word-based rules for near-identical findings, optional `merge_with` model for the rest, validated, with fallback
 - [x] `contract-b2b` rubric: sign-off, not-legal-advice notice, `effort: high`, `confidential: true`
 - [x] Per-rubric `allowed_reviewers`
-- [ ] Client timeouts: MCP clients give up after about 60 s by default (SDK, Codex `tool_timeout_sec`), and a high-effort review takes longer. Cap waits below that (config `max_wait_seconds`, default 50) and have authors poll `review_wait`; document it in the README
+- [x] Client timeouts: waits capped at `max_wait_seconds` (default 50), `review_submit` tells the agent to poll `review_wait`
+- [x] Several server processes share storage: rounds record their runner; others leave a live runner's review alone
 - [ ] Policy: a high-impact finding marked `assumption_challenge` never blocks (real run: missing governing law was advisory). Decide whether high and critical assumption challenges should block
-- [ ] `related` artifact for contracts (the accepted proposal), compared for price, scope and timeline
-- [ ] Rubrics: `code` (with git snapshots), then `client-email`, `linkedin-post`, `sop`, `plan`
-- [ ] CLI `rb`: submit, status, show, list, respond, signoff
-- [ ] Tests from SPEC section 11, README, LICENSE
+- [x] `related` documents (for example the accepted proposal for a contract), compared for price, scope and timeline
+- [x] Rubrics: `code`, `client-email`, `linkedin-post`, `sop`, `plan`
+- [x] CLI `rb`: submit, status, show, list, respond, signoff, cancel
+- [x] Tests from SPEC section 11, README, LICENSE
+
+## Later
+
+- [ ] Optional `codex exec review` native pass (SPEC 8)
+- [ ] MCP Tasks so Claude Code is woken when a result lands (v0.2)
+- [ ] HTTP transport, web inbox, pull-mode reviewers (v0.2+)

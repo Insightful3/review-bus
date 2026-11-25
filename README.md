@@ -53,6 +53,8 @@ The config is looked up in this order: the path in `REVIEW_BUS_CONFIG`, then `~/
 | `storage.documents` | Where reviews are stored (default `~/.review-bus/reviews`) |
 | `author_vendors` | Maps MCP client names to vendors. `claude-code` and `codex-mcp-client` are built in |
 | `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px) |
+| `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`. Without it, only near-identical findings are merged |
+| `max_wait_seconds` | Longest a tool call waits before returning (default 50, under the usual 60 second client timeout) |
 | `policy` | `max_blocking` findings per round (5) and `max_rounds` (3) |
 
 ## Connect an author agent
@@ -114,10 +116,10 @@ The loop the agent runs:
 
 ### What to submit
 
-A document:
+A document, compared with the accepted proposal (`related` documents are not reviewed themselves; differences in price, scope or dates become findings):
 
 ```json
-{ "artifact": "/path/to/contract.docx", "rubric": "contract-b2b", "intent": "Sign the services agreement." }
+{ "artifact": "/path/to/contract.docx", "related": ["/path/to/accepted-proposal.pdf"], "rubric": "contract-b2b", "intent": "Sign the services agreement." }
 ```
 
 A branch against its base, plus the rendered pages from a running dev server:
@@ -135,7 +137,7 @@ Git modes: `uncommitted` (working tree against HEAD, including new files), `base
 
 ### Waiting and timeouts
 
-MCP clients usually give up on a tool call after about 60 seconds, and a careful review can take several minutes. Keep `wait_seconds` at 50 or less, and call `review_wait` with `seconds` of 50 or less in a loop until the state is no longer `in_review`. The review keeps running on the server either way.
+MCP clients usually give up on a tool call after about 60 seconds, and a careful review can take several minutes. So the server never waits longer than `max_wait_seconds` (default 50) in one call, and says so in the reply (`wait_capped`). The agent calls `review_wait` in a loop until the state is no longer `in_review`; `review_submit` tells it to. The review keeps running on the server either way, and another session (or `rb`) can follow it too.
 
 ### Reviewers, model and effort
 
@@ -148,9 +150,29 @@ Each reviewer runs with a model and an effort level (`low`, `medium`, `high`, `x
 
 The model and effort that actually ran are recorded on every finding as `reviewer:model:effort`, for example `codex:gpt-6.1-sol:high`.
 
+### Several reviewers
+
+With more than one reviewer, the same problem usually comes back from each of them in different words. review-bus merges these: the highest-risk version is kept, `agreement` counts how many reviewers raised it, and `also_raised_by` lists the others' versions. Set `merge_with` to let a cheap model do the grouping (in a test on a real proposal, Claude Haiku grouped all five shared findings correctly in 5 seconds for a fraction of a cent). Without it, only near-identical findings are merged, because word-based matching cannot tell "the launch date is unconditional" and "the go-live date is stated as fixed" are the same problem without also merging unrelated findings. The merge model sees the findings and their quotes, so for a rubric with `allowed_reviewers` it is only used if it is on that list.
+
+## Use it from the command line
+
+`rb` does the same for people, without an agent. Link it once with `npm link` in this folder, or run `node dist/src/cli.js`.
+
+```bash
+rb submit proposal.docx --rubric proposal --intent "Win the project at a fixed price."
+rb submit --git . --mode base --base origin/main --page http://localhost:4321/ --rubric webpage --intent "Publish the new home page."
+rb submit contract.docx --related proposal.pdf --rubric contract-b2b --intent "Sign the agreement." --reviewer codex::high
+rb list
+rb show <review_id>
+rb respond <review_id> r1.f1=accepted r1.f2=rejected:"Intentional, agreed with the client" --resubmit
+rb signoff <review_id> --by "Your Name"
+```
+
+`submit` and `respond --resubmit` wait for the reviewers and print the report; Ctrl-C cancels the review. Exit codes: 0 approved or awaiting sign-off, 2 changes requested, escalated or failed, 1 error. A person is the author, so no reviewer is skipped for being the same vendor. Run `rb --help` for all options.
+
 ## Rubrics
 
-Rubrics are Markdown files in `rubrics/` (or any folder in `rubric_paths`). This repo ships `proposal`, `contract-b2b` and `webpage`. Keep client-specific rubrics in a private folder and add it to `rubric_paths`.
+Rubrics are Markdown files in `rubrics/` (or any folder in `rubric_paths`). This repo ships `proposal`, `contract-b2b`, `webpage`, `code`, `client-email`, `linkedin-post`, `sop` and `plan`. Keep client-specific rubrics in a private folder and add it to `rubric_paths`.
 
 A rubric has optional front matter and four sections:
 
@@ -225,6 +247,7 @@ rv_<id>/
 - review-bus does not write to the reviewed repo: the reviewers' copy is made with `git archive` and `git apply` inside the review folder.
 - Whatever you submit is sent to the reviewer's vendor (OpenAI for Codex, Anthropic for Claude). Mark rubrics for confidential material with `confidential: true` and list approved reviewers in `allowed_reviewers`.
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.
+- Every agent session starts its own review-bus server. A review records which process runs it, so other sessions leave a running review alone and only mark it failed once that process is gone.
 
 ## Development
 

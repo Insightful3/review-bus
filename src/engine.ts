@@ -1,8 +1,11 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { runAdapter } from "./adapters/index.js";
 import type { Config } from "./config.js";
 import { buildPrompt, screenshotFiles } from "./prompt.js";
+import { applyGroups, MERGE_SCHEMA, mergeFindings, mergePrompt, type Merged, type Raised } from "./merge.js";
+import { runStructured } from "./adapters/index.js";
 import { computeBlocking, severityOf } from "./policy.js";
 import { loadRubric } from "./rubrics.js";
 import { describeArtifact, snapshotRound } from "./snapshot.js";
@@ -62,12 +65,27 @@ export class Engine {
   private async startRound(review: Review, runs: ReviewerRun[]): Promise<void> {
     const n = review.rounds.length + 1;
     const t = now();
-    const snapshot = await snapshotRound(review.request.artifact, review.request.pages, this.store.dir(review.id), n, this.config.browser);
+    const snapshot = await snapshotRound(
+      review.request.artifact,
+      review.request.pages,
+      this.store.dir(review.id),
+      n,
+      this.config.browser,
+      review.request.related ?? [],
+    );
     const prev = review.rounds.at(-1);
     if (prev && prev.snapshot.sha256 === snapshot.sha256) {
       review.history.push({ at: t, event: "note", detail: `round ${n} document is unchanged since round ${prev.n}` });
     }
-    review.rounds.push({ n, started_at: t, finished_at: null, snapshot, reviewers: runs, findings: [] });
+    review.rounds.push({
+      n,
+      started_at: t,
+      finished_at: null,
+      runner: { pid: process.pid, host: os.hostname(), started_at: t },
+      snapshot,
+      reviewers: runs,
+      findings: [],
+    });
     review.state = "in_review";
     review.history.push({ at: t, event: "round_started", detail: `round ${n}` });
     this.store.save(review);
@@ -215,7 +233,7 @@ export class Engine {
     const check = (name: string) => {
       if (!this.config.adapters[name]) throw new Error(`Unknown reviewer "${name}". Configured: ${known.join(", ") || "(none)"}`);
     };
-    if (!author.vendor) notes.push(`Author vendor unknown${author.client ? ` (MCP client "${author.client}")` : ""}.`);
+    if (!author.vendor && author.vendor_source !== "person") notes.push(`Author vendor unknown${author.client ? ` (MCP client "${author.client}")` : ""}.`);
 
     if (requested.length) {
       requested.forEach((s) => check(s.name));
@@ -271,7 +289,12 @@ export class Engine {
 
   async waitFor(id: string, seconds: number): Promise<void> {
     const job = this.running.get(id);
-    if (!job) return;
+    if (!job) {
+      // Running in another process: poll the stored state.
+      const until = Date.now() + seconds * 1000;
+      while (Date.now() < until && this.get(id).state === "in_review") await new Promise((r) => setTimeout(r, 500));
+      return;
+    }
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([job, new Promise<void>((r) => (timer = setTimeout(r, seconds * 1000)))]);
     clearTimeout(timer);
@@ -280,12 +303,32 @@ export class Engine {
   /** Loads a review. A round left in_review with no job in this process was cut off by a restart. */
   get(id: string): Review {
     const review = this.store.load(id);
-    if (review.state === "in_review" && !this.running.has(id)) {
+    if (review.state === "in_review" && !this.running.has(id) && !this.runningElsewhere(review)) {
       review.state = "failed";
       review.history.push({ at: now(), event: "failed", detail: "round was running when the server stopped" });
       this.store.save(review);
     }
     return review;
+  }
+
+  /**
+   * True when another live server process (another agent session, or the rb CLI) is running the
+   * latest round. A round older than the longest reviewer timeout plus 10 minutes counts as dead,
+   * in case the process id was reused.
+   */
+  private runningElsewhere(review: Review): boolean {
+    const round = review.rounds.at(-1);
+    const runner = round?.runner;
+    if (!round || !runner || runner.pid === process.pid) return false;
+    if (runner.host !== os.hostname()) return true; // shared storage on another machine: cannot check
+    const maxTimeout = Math.max(600, ...Object.values(this.config.adapters).map((a) => a.timeout_seconds));
+    if (Date.now() - Date.parse(runner.started_at) > (maxTimeout + 600) * 1000) return false;
+    try {
+      process.kill(runner.pid, 0); // signal 0 only checks that the process exists
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
   }
 
   /** Saves one reviewer's live status so review_status can show progress. Sync, so no interleaving. */
@@ -307,7 +350,8 @@ export class Engine {
     const text = snap.markdown_file ? readFileSync(path.join(reviewDir, snap.markdown_file), "utf8") : null;
     const images = screenshotFiles(snap).map((f) => path.join(reviewDir, f));
     const previous = review.rounds.find((r) => r.n === n - 1) ?? null;
-    const prompt = buildPrompt(review.request, rubric, snap, text, snap.markdown_file ? path.basename(snap.markdown_file) : "", previous);
+    const related = (snap.related ?? []).map((r) => ({ name: path.basename(r.source_path), text: readFileSync(path.join(reviewDir, r.markdown_file), "utf8") }));
+    const prompt = buildPrompt(review.request, rubric, snap, text, snap.markdown_file ? path.basename(snap.markdown_file) : "", previous, related);
     writeFileSync(path.join(roundDir, "prompt.md"), prompt);
 
     const results = await Promise.all(
@@ -349,23 +393,20 @@ export class Engine {
     // Reload state written meanwhile (e.g. cancel), then apply results.
     const fresh = this.store.load(id);
     const freshRound = fresh.rounds.find((r) => r.n === n)!;
-    const findings: Finding[] = [];
-    for (const { run, output } of results) {
-      if (output) {
-        for (const f of output.findings) {
-          findings.push({
-            ...f,
-            finding_id: `r${n}.f${findings.length + 1}`,
-            reviewer: run.label,
-            round: n,
-            blocking: false,
-            severity: severityOf(f),
-            agreement: 1,
-            response: null,
-          });
-        }
-      }
-    }
+    // Merge the same finding from several reviewers before the policy decides what blocks.
+    const raised = results.flatMap(({ run, output }) => (output ? output.findings.map((finding) => ({ finding, reviewer: run.label })) : []));
+    const { merged, merge } = await this.merge(raised, review.request.rubric, roundDir, signal);
+    const findings: Finding[] = merged.map((m, i) => ({
+      ...m.finding,
+      finding_id: `r${n}.f${i + 1}`,
+      reviewer: m.reviewer,
+      round: n,
+      blocking: false,
+      severity: severityOf(m.finding),
+      agreement: m.agreement,
+      also_raised_by: m.also_raised_by,
+      response: null,
+    }));
     const blocking = computeBlocking(findings, {
       stage: fresh.request.stage,
       max_blocking: this.config.policy.max_blocking,
@@ -374,6 +415,7 @@ export class Engine {
     findings.forEach((f, i) => (f.blocking = blocking[i]));
     freshRound.reviewers = round.reviewers;
     freshRound.findings = findings;
+    freshRound.merge = merge;
     freshRound.finished_at = now();
     // Canceled meanwhile, or a newer round started (after a restart marked this one failed):
     // keep this round's results but leave the review state alone.
@@ -386,6 +428,39 @@ export class Engine {
       detail: `round ${n}: ${findings.filter((f) => f.blocking).length} blocking, ${findings.filter((f) => !f.blocking).length} advisory, state ${fresh.state}`,
     });
     this.store.save(fresh);
+  }
+
+  /**
+   * Merges duplicates across reviewers: with the configured model when there is one (and it may see
+   * this rubric's content), else with conservative word-based rules.
+   */
+  private async merge(raised: Raised[], rubricName: string, roundDir: string, signal: AbortSignal): Promise<{ merged: Merged[]; merge: NonNullable<Round["merge"]> }> {
+    const reviewers = new Set(raised.map((r) => r.reviewer));
+    if (reviewers.size < 2) return { merged: mergeFindings(raised), merge: { method: "none", by: null, error: null } };
+    const mw = this.config.merge_with;
+    const allowed = this.config.allowed_reviewers[rubricName];
+    if (!mw || (allowed && !allowed.includes(mw.adapter))) {
+      return { merged: mergeFindings(raised), merge: { method: "rules", by: null, error: mw ? `${mw.adapter} is not approved for ${rubricName}` : null } };
+    }
+    const label = reviewerLabel(mw.adapter, mw.model, mw.effort);
+    try {
+      const res = await runStructured(this.config.adapters[mw.adapter], {
+        reviewerName: "merge",
+        prompt: mergePrompt(raised),
+        cwd: roundDir,
+        outDir: roundDir,
+        model: mw.model,
+        effort: mw.effort,
+        signal,
+        schema: MERGE_SCHEMA as unknown as Record<string, unknown>,
+        tools: "none",
+      });
+      const merged = applyGroups(raised, (res.json as { groups?: unknown } | null)?.groups);
+      if (!merged) throw new Error("the grouping put a finding in two groups");
+      return { merged, merge: { method: "model", by: reviewerLabel(mw.adapter, res.reportedModel ?? mw.model, res.reportedEffort ?? mw.effort), error: null } };
+    } catch (err) {
+      return { merged: mergeFindings(raised), merge: { method: "rules", by: label, error: `model merge failed, used rules: ${(err as Error).message}` } };
+    }
   }
 
   private stateAfterRound(review: Review, round: Round): ReviewState {

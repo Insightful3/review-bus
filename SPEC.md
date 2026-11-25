@@ -13,7 +13,9 @@ In v0.1:
 - Lifecycle with rounds (max 3), author responses, human sign-off where policy requires it
 - Risk policy that computes which findings block
 - Storage under `.reviews/` (one folder per review, JSON state + `report.md`)
-- CLI `rb` for humans: `submit`, `status`, `show`, `list`, `respond`, `signoff`
+- CLI `rb` for humans: `submit`, `status`, `show`, `list`, `respond`, `signoff`, `cancel`. `submit` and `respond --resubmit` run the round in the CLI process and wait for it (Ctrl-C cancels). Exit codes: 0 approved or awaiting sign-off, 2 changes requested, escalated or failed, 1 error. The author is a person (`vendor_source: "person"`), so no reviewer is skipped for vendor.
+- `related` documents (up to 3) on `review_submit`: converted like documents, given to reviewers for comparison only (for example the accepted proposal for a contract), and part of the snapshot hash.
+- Tool calls wait at most `max_wait_seconds` (default 50): MCP clients usually time out after 60 seconds.
 
 Not in v0.1: hosted mode, web inbox, pull-mode reviewers (`list_pending`/`claim`/`post`), Gemini adapter, MCP Tasks, channels, GitHub sync, verification pass.
 
@@ -104,7 +106,7 @@ Rules:
 - `assumption_challenge: true` findings are always shown, never blocking on their own.
 - Max blocking findings per round: 5 (highest risk first; the rest become advisory).
 - `stage: draft` uses a lighter matrix (only critical blocks).
-- Duplicate findings across reviewers (same location, similar claim) are merged; `agreement` counts the reviewers.
+- Duplicate findings across reviewers (same location, similar claim) are merged; `agreement` counts the reviewers and `also_raised_by` keeps the other versions. The highest-risk version is kept. Word-based matching only merges near-identical findings: on real Codex and Claude reviews of the same proposal it caught 1 of 5 shared problems, and lowering its thresholds would merge unrelated findings. So `merge_with` in config names a cheap model (for example Claude Haiku, low effort) that groups findings by meaning; its answer is validated (every id at most once, never two findings from one reviewer in a group) and on any failure the word-based rules are used and the round records why. For a rubric with `allowed_reviewers`, the merge model runs only if it is on that list, because it sees the quotes. Merging happens before the policy decides what blocks.
 - Policy lives in `review-bus.config.json` and each rubric can override it.
 
 Contract rubric overrides (`contract-b2b`):
@@ -200,11 +202,15 @@ The rubric wins over the stage, so `contract-b2b` ships with `effort: high` in i
 
 Location: `~/.review-bus/reviews/` for everything in v0.1 (configurable as `storage.documents`). The first draft put code reviews in `.reviews/` inside the reviewed repo; that would mean writing to the author's repo and its `.gitignore`, so it is left for later as an opt-in. Each git round holds a full copy of the project in `r<n>/tree/`, so large repos use more disk. Review results never go into the review-bus repo itself. Start with JSON files; add a SQLite index only when listing gets slow.
 
-## 10a. Config
+## 10a. Several server processes
 
-`review-bus.config.json` is looked up in this order: path in `REVIEW_BUS_CONFIG`, then `~/.review-bus/config.json`, then the current folder. It holds `rubric_paths`, `storage`, adapters (each with `vendor`, `model`, `effort`), default reviewers, `author_vendors`, the risk policy and per-rubric `allowed_reviewers`. Ship an example as `review-bus.config.example.json`; the real one lives in the private repo or `~/.review-bus/`.
+Each agent session starts its own server process over stdio, and `rb` runs reviews in its own process, all sharing the same storage. Each round records its runner (`pid`, host, start time). A process that finds a review `in_review` that it is not running leaves it alone while the runner is alive, and marks it `failed` only when the runner is gone (or the round is older than the longest reviewer timeout plus 10 minutes, in case the pid was reused). `review_wait` on a review running elsewhere polls the stored state.
 
-## 10b. Repo hygiene
+## 10b. Config
+
+`review-bus.config.json` is looked up in this order: path in `REVIEW_BUS_CONFIG` (an error if that file does not exist, never a silent fallback), then `~/.review-bus/config.json`, then the current folder. It holds `rubric_paths`, `storage`, adapters (each with `vendor`, `model`, `effort`), default reviewers, `author_vendors`, the risk policy and per-rubric `allowed_reviewers`. Ship an example as `review-bus.config.example.json`; the real one lives in the private repo or `~/.review-bus/`.
+
+## 10c. Repo hygiene
 
 - `test/fixtures/` holds made-up documents only (a fictional contract between two fictional companies, a fictional proposal, a small sample code change).
 - `.gitignore` covers `.reviews/`, `review-bus.config.json`, `*.docx`/`*.pdf` outside `test/fixtures/`, and `.env`.

@@ -8,7 +8,8 @@
     "node": ">=22"
   },
   "bin": {
-    "review-bus": "dist/src/server.js"
+    "review-bus": "dist/src/server.js",
+    "rb": "dist/src/cli.js"
   },
   "scripts": {
     "build": "tsc -p . && node dist/src/spec/gen-schema.js",
