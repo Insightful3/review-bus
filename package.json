@@ -1,7 +1,18 @@
 {
   "name": "review-bus",
   "version": "0.2.0",
-  "description": "Cross-agent review layer: agents submit work, other agents or people review it, the verdict comes back as structured state.",
+  "description": "Cross-agent review: an agent submits work (documents, code changes, web pages), other agents or people review it, and the author must answer every blocking finding. MCP server, rb CLI and web inbox.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "code-review",
+    "document-review",
+    "ai-agents",
+    "claude",
+    "codex",
+    "review"
+  ],
+  "author": "Insightful3",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -11,11 +22,21 @@
     "review-bus": "dist/src/server.js",
     "rb": "dist/src/cli.js"
   },
+  "files": [
+    "dist/src",
+    "rubrics",
+    "spec",
+    "review-bus.config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p . && node dist/src/spec/gen-schema.js",
     "test": "npm run build && node --test dist/test/",
     "start": "node dist/src/server.js",
-    "check:isolation": "npm run build && node scripts/check-isolation.mjs"
+    "check:isolation": "npm run build && node scripts/check-isolation.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

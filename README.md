@@ -23,6 +23,16 @@ Status: v0.2, working name. See `SPEC.md` for the design and `TASKS.md` for what
 
 ## Install
 
+From npm:
+
+```bash
+npm install -g review-bus
+```
+
+This installs two commands: `review-bus` (the MCP server) and `rb` (the command line and `rb serve`).
+
+From source, to change it or run the tests:
+
 ```bash
 git clone <this repo> review-bus
 cd review-bus
@@ -31,7 +41,7 @@ npm run build
 npm test
 ```
 
-The tests use fake reviewers, so they need no model login.
+The tests use fake reviewers, so they need no model login. With a source checkout, use `node /path/to/review-bus/dist/src/server.js` wherever the commands below say `review-bus`.
 
 ## Configure
 
@@ -68,21 +78,20 @@ Point the agent at the built server, `dist/src/server.js`.
 ### Claude Code
 
 ```bash
-claude mcp add review-bus -s user -e REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- node /path/to/review-bus/dist/src/server.js
+claude mcp add review-bus -s user -e REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- review-bus
 ```
 
 ### Codex
 
 ```bash
-codex mcp add review-bus --env REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- node /path/to/review-bus/dist/src/server.js
+codex mcp add review-bus --env REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- review-bus
 ```
 
-Then open `~/.codex/config.toml` and add two lines to the `[mcp_servers.review-bus]` section it created. Put them right after the `args` line, before `[mcp_servers.review-bus.env]`: anything below that header becomes an environment variable instead of a setting.
+Then open `~/.codex/config.toml` and add two lines to the `[mcp_servers.review-bus]` section it created. Put them right after the `command` line (or `args`, from a source checkout), before `[mcp_servers.review-bus.env]`: anything below that header becomes an environment variable instead of a setting.
 
 ```toml
 [mcp_servers.review-bus]
-command = "node"
-args = ["/path/to/review-bus/dist/src/server.js"]
+command = "review-bus"
 default_tools_approval_mode = "approve"
 tool_timeout_sec = 120
 
@@ -210,7 +219,7 @@ Open `http://rb.localhost:7777/inbox` (or `http://127.0.0.1:7777/inbox`) and pas
 
 ## Use it from the command line
 
-`rb` does the same for people, without an agent. Link it once with `npm link` in this folder, or run `node dist/src/cli.js`.
+`rb` does the same for people, without an agent. It comes with the npm package; from a source checkout, link it once with `npm link`, or run `node dist/src/cli.js`.
 
 ```bash
 rb submit proposal.docx --rubric proposal --intent "Win the project at a fixed price."
