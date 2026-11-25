@@ -2,7 +2,7 @@
 // Builds a throwaway git repo with a tiny fictional site and serves it over HTTP.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -256,4 +256,32 @@ test("commit mode, no-change and bad inputs", async () => {
   assert.match(fileUrl.text, /Only http and https pages/);
   const nothing = await call("review_submit", { rubric: "webpage", intent: "x" });
   assert.match(nothing.text, /Nothing to review/);
+});
+
+test("a page server that is not running gives a clear error and leaves no half-made review", { skip: !hasChrome && "Google Chrome not installed" }, async (t) => {
+  if (!hasChrome) return t.skip("Google Chrome not installed");
+  // A port nothing listens on.
+  const probe = http.createServer();
+  await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+  const dead = `http://127.0.0.1:${(probe.address() as AddressInfo).port}/`;
+  await new Promise((r) => probe.close(r));
+
+  const repo = newRepo("site-down");
+  makeChange(repo);
+  const reviews = path.join(tmp, "reviews");
+  const before = existsSync(reviews) ? readdirSync(reviews).sort() : [];
+  const { text } = await call("review_submit", { artifact: { git: { repo, mode: "uncommitted" } }, pages: [dead], rubric: "webpage", intent: "x" });
+  assert.equal(text, `Nothing is answering at ${dead}. Start the site first (for example your dev server with npm run dev), then submit again.`);
+  assert.deepEqual(existsSync(reviews) ? readdirSync(reviews).sort() : [], before);
+
+  // A resubmit that fails the same way keeps the answers and the review, and removes only the new round.
+  const ok = await call("review_submit", { artifact: { git: { repo, mode: "uncommitted" } }, pages: [`${base}/site-down/index.html`], rubric: "webpage", intent: "x", wait_seconds: 60 });
+  assert.ok(ok.json, ok.text);
+  const id = ok.json.review_id;
+  server.close();
+  const failed = await call("review_respond", { review_id: id, responses: [{ finding_id: "r1.f1", status: "accepted", note: "Fixing." }], resubmit: true });
+  assert.match(failed.text, /Nothing is answering at http:\/\/127\.0\.0\.1:\d+\/site-down\/index\.html/);
+  const saved = JSON.parse(readFileSync(path.join(reviewDir(id), "review.json"), "utf8"));
+  assert.deepEqual([saved.state, saved.rounds.length, saved.rounds[0].findings[0].response.status], ["changes_requested", 1, "accepted"]);
+  assert.ok(!existsSync(path.join(reviewDir(id), "r2")));
 });

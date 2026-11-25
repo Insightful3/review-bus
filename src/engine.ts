@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runAdapter } from "./adapters/index.js";
@@ -65,14 +65,22 @@ export class Engine {
   private async startRound(review: Review, runs: ReviewerRun[]): Promise<void> {
     const n = review.rounds.length + 1;
     const t = now();
-    const snapshot = await snapshotRound(
-      review.request.artifact,
-      review.request.pages,
-      this.store.dir(review.id),
-      n,
-      this.config.browser,
-      review.request.related ?? [],
-    );
+    let snapshot;
+    try {
+      snapshot = await snapshotRound(
+        review.request.artifact,
+        review.request.pages,
+        this.store.dir(review.id),
+        n,
+        this.config.browser,
+        review.request.related ?? [],
+      );
+    } catch (err) {
+      // Leave nothing half made: a new review's folder goes, or just this round's folder.
+      const saved = existsSync(path.join(this.store.dir(review.id), "review.json"));
+      rmSync(saved ? this.store.roundDir(review.id, n) : this.store.dir(review.id), { recursive: true, force: true });
+      throw err;
+    }
     const prev = review.rounds.at(-1);
     if (prev && prev.snapshot.sha256 === snapshot.sha256) {
       review.history.push({ at: t, event: "note", detail: `round ${n} document is unchanged since round ${prev.n}` });
@@ -126,6 +134,7 @@ export class Engine {
     }
     if (responses.length) {
       review.history.push({ at: t, event: "responded", detail: responses.map((r) => `${r.finding_id} ${r.status}`).join(", ") });
+      this.store.save(review); // keep the answers even if a resubmit below fails
     }
     const unanswered = round.findings.filter((f) => f.blocking && !f.response).map((f) => f.finding_id);
 

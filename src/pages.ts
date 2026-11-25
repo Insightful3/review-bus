@@ -47,6 +47,17 @@ const slug = (url: string, i: number) => {
   return `${String(i + 1).padStart(2, "0")}-${s || "home"}`;
 };
 
+/** Turns a browser navigation error into one line that says what to do. */
+export function pageLoadError(url: string, err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/ERR_CONNECTION_REFUSED|ECONNREFUSED/.test(msg)) {
+    return `Nothing is answering at ${url}. Start the site first (for example your dev server with npm run dev), then submit again.`;
+  }
+  if (/ERR_NAME_NOT_RESOLVED|ENOTFOUND/.test(msg)) return `The host in ${url} could not be found. Check the address.`;
+  if (/Timeout|timed out/i.test(msg)) return `${url} did not finish loading in time. Check that the site responds, or raise browser.timeout_seconds.`;
+  return `Could not load ${url}: ${msg.split("\n")[0]}`;
+}
+
 export function checkPageUrl(url: string): void {
   let u: URL;
   try {
@@ -107,7 +118,11 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
         try {
           response = await page.goto(url, { waitUntil: "networkidle", timeout });
         } catch {
-          response = await page.goto(url, { waitUntil: "load", timeout });
+          try {
+            response = await page.goto(url, { waitUntil: "load", timeout });
+          } catch (err) {
+            throw new Error(pageLoadError(url, err));
+          }
         }
         // Lazy images: scroll to the bottom and back so they load before the screenshot.
         await page.evaluate(async () => {
