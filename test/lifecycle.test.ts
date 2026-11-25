@@ -443,3 +443,19 @@ test("assumption challenges show in the default result even when advisory", asyn
   assert.ok(payload.findings.some((f: { assumption_challenge: boolean; blocking: boolean }) => f.assumption_challenge && !f.blocking));
   assert.match(res.content[0].text, /## Assumption challenges \(advisory\)/);
 });
+
+test("a reviewer repointed while the MCP server keeps running runs as configured now", async () => {
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  const original = cfg.adapters.fake;
+  try {
+    // Same name, new definition: now it also raises an assumption challenge.
+    cfg.adapters.fake = { ...original, args: [...original.args, "--challenge"] };
+    writeFileSync(configFile, JSON.stringify(cfg));
+    const { json } = await submit(doc(), { reviewers: ["fake"], assumptions: ["Slovenian law"] });
+    const { json: all } = await ok("review_result", { review_id: json.review_id, include_advisory: true });
+    assert.ok(all.findings.some((f: { claim: string }) => f.claim === "The governing law is assumed but not stated."));
+  } finally {
+    cfg.adapters.fake = original;
+    writeFileSync(configFile, JSON.stringify(cfg));
+  }
+});

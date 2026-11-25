@@ -1,9 +1,22 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describeArtifact } from "./snapshot.js";
 import type { Finding, Review } from "./types.js";
+
+function syncDir(dir: string): void {
+  try {
+    const fd = openSync(dir, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    /* not supported on every platform; the file itself is flushed */
+  }
+}
 
 interface LockOwner {
   pid: number;
@@ -91,8 +104,17 @@ export class Store {
     review.updated_at = new Date().toISOString();
     const suffix = `${process.pid}.${randomBytes(4).toString("hex")}`;
     const tmp = path.join(dir, `review.json.${suffix}.tmp`);
-    writeFileSync(tmp, JSON.stringify(review, null, 2));
+    // Flushed to disk before the rename, and the folder after it, so a confirmed save survives a
+    // power cut. (Round files are not flushed one by one; a lost snapshot fails its round.)
+    const fd = openSync(tmp, "w");
+    try {
+      writeSync(fd, JSON.stringify(review, null, 2));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, path.join(dir, "review.json"));
+    syncDir(dir);
     const reportTmp = path.join(dir, `report.md.${suffix}.tmp`);
     try {
       writeFileSync(reportTmp, renderReport(review));

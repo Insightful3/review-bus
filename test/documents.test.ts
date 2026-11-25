@@ -143,3 +143,14 @@ test("related documents are converted, put in the prompt for comparison, and par
   const missing = await call("review_submit", { artifact: CONTRACT, related: ["/nope/proposal.md"], rubric: "contract-b2b", intent: "x" });
   assert.match(missing.text, /Related document not found/);
 });
+
+test("nested lists keep every item, including the ones after a sub-list (real mammoth output)", () => {
+  const html =
+    "<p>Scope</p><ul><li>Assistant on the website<ul><li>German</li><li>English</li></ul></li>" +
+    "<li>Final delivery clause: go-live by 15 March 2027</li></ul><p>After the list</p>" +
+    "<ol><li><p>First</p><ol><li>One a</li></ol></li><li>Second &amp; last</li></ol>";
+  assert.equal(
+    htmlToMarkdown(html),
+    "Scope\n\n- Assistant on the website\n  - German\n  - English\n- Final delivery clause: go-live by 15 March 2027\n\nAfter the list\n\n1. First\n  1. One a\n2. Second & last\n",
+  );
+});

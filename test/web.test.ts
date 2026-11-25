@@ -2,7 +2,7 @@
 // Builds a throwaway git repo with a tiny fictional site and serves it over HTTP.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -396,4 +396,41 @@ test("snapshotting a repo never runs commands named in that repo's git config", 
     assert.ok(json, `${mode}: ${text}`);
   }
   assert.deepEqual(readdirSync(tmp).filter((f) => f.startsWith("trap-ran")), []);
+});
+
+test("a filter switched on in .git/info/attributes is refused; the index is never rewritten; diff.noprefix is harmless", async () => {
+  // info/attributes
+  const trap = newRepo("site-info-attrs");
+  const ran = path.join(tmp, "info-attrs-ran");
+  sh(trap, "checkout", "-q", "-b", "feature");
+  writeFileSync(path.join(trap, "index.html"), "changed\n");
+  sh(trap, "commit", "-q", "-am", "change");
+  mkdirSync(path.join(trap, ".git", "info"), { recursive: true });
+  writeFileSync(path.join(trap, ".git", "info", "attributes"), "* filter=evil\n");
+  sh(trap, "config", "filter.evil.smudge", `touch ${ran}; cat`);
+  const refused = await call("review_submit", { artifact: { git: { repo: trap, mode: "base", base: "main" } }, rubric: "code", intent: "x" });
+  assert.match(refused.text, /info\/attributes switches on a git filter/);
+  assert.equal(existsSync(ran), false);
+
+  // The author's index: same bytes and time after a snapshot, even with stale stat data.
+  const repo = newRepo("site-index");
+  sh(repo, "checkout", "-q", "-b", "feature");
+  writeFileSync(path.join(repo, "index.html"), "changed\n");
+  sh(repo, "commit", "-q", "-am", "change");
+  const about = path.join(repo, "about.html");
+  writeFileSync(about, readFileSync(about)); // same content, new mtime: stale stat data
+  const indexFile = path.join(repo, ".git", "index");
+  const before = { bytes: readFileSync(indexFile), mtime: statSync(indexFile).mtimeMs };
+  const snap = await call("review_submit", { artifact: { git: { repo, mode: "base", base: "main" } }, rubric: "code", intent: "x", wait_seconds: 30 });
+  assert.ok(snap.json, snap.text);
+  assert.ok(readFileSync(indexFile).equals(before.bytes));
+  assert.equal(statSync(indexFile).mtimeMs, before.mtime);
+
+  // diff.noprefix and diff.relative in the author's config do not break the replay.
+  sh(repo, "config", "diff.noprefix", "true");
+  sh(repo, "config", "diff.relative", "true");
+  writeFileSync(path.join(repo, "index.html"), "changed again\n");
+  const noprefix = await call("review_submit", { artifact: { git: { repo, mode: "uncommitted" } }, rubric: "code", intent: "x", wait_seconds: 30 });
+  assert.ok(noprefix.json, noprefix.text);
+  assert.equal(readFileSync(path.join(reviewDir(noprefix.json.review_id), "r1/tree/index.html"), "utf8"), "changed again\n");
 });

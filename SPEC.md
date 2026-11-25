@@ -218,6 +218,16 @@ Each agent session starts its own server process over stdio, and `rb` runs revie
 - `test/fixtures/` holds made-up documents only (a fictional contract between two fictional companies, a fictional proposal, a small sample code change).
 - `.gitignore` covers `.reviews/`, `review-bus.config.json`, `*.docx`/`*.pdf` outside `test/fixtures/`, and `.env`.
 
+## 10d. Known limits (v0.1)
+
+From review-bus reviewing itself with Codex (4 high-effort passes); open, listed in README:
+
+- Codex's read-only sandbox does not restrict reads: a reviewer can read files outside the snapshot.
+- Headless page capture follows redirects from a public page to private addresses.
+- Reviewers in their own process group can outlive a runner that is killed outright.
+- The review id is returned after the snapshot; slow pages can exceed client timeouts.
+- `rb signoff` cannot tell a person from a program running in the person's terminal; an open decision.
+
 ## 11. Done when
 
 1. Tests pass with a fake command reviewer: document review, git review, respond and resubmit, round cap reaching `escalated`, contract needing sign-off, risk matrix cases.

@@ -446,11 +446,21 @@ export class Engine {
     roundDir: string,
     signal: AbortSignal,
   ): Promise<void> {
-    // Last check before anything leaves the machine: approvals as they are on disk right now.
+    // Last check before anything leaves the machine: approvals and reviewer definitions as they
+    // are on disk right now, from the same read (a reviewer repointed to another provider runs as
+    // configured now, not as configured when this server started).
     let dispatchError: (name: string) => string | null;
+    let adapterFor: (name: string) => Config["adapters"][string] | undefined = () => undefined;
     try {
-      const allowed = this.allowedReviewers(review.request.rubric, review.rubric_meta, this.currentConfig());
-      dispatchError = (name) => (allowed && !allowed.includes(name) ? `no longer approved for ${review.request.rubric}; nothing was sent` : null);
+      const current = this.currentConfig();
+      const allowed = this.allowedReviewers(review.request.rubric, review.rubric_meta, current);
+      adapterFor = (name) => current.adapters[name];
+      dispatchError = (name) =>
+        !current.adapters[name]
+          ? "no longer configured; nothing was sent"
+          : allowed && !allowed.includes(name)
+            ? `no longer approved for ${review.request.rubric}; nothing was sent`
+            : null;
     } catch (err) {
       const message = (err as Error).message;
       dispatchError = () => message;
@@ -463,7 +473,7 @@ export class Engine {
         try {
           const refused = dispatchError(run.name);
           if (refused) throw new Error(refused);
-          const res = await runAdapter(this.config.adapters[run.name], {
+          const res = await runAdapter(adapterFor(run.name)!, {
             reviewerName: run.name,
             prompt,
             cwd: roundDir,
@@ -582,12 +592,12 @@ export class Engine {
       return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: (err as Error).message } };
     }
     const mw = current.merge_with;
-    if (!mw || !this.config.adapters[mw.adapter] || (allowed && !allowed.includes(mw.adapter))) {
+    if (!mw || !current.adapters[mw.adapter] || (allowed && !allowed.includes(mw.adapter))) {
       return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: mw ? `${mw.adapter} is not approved for ${rubricName}` : null } };
     }
     const label = reviewerLabel(mw.adapter, mw.model, mw.effort);
     try {
-      const res = await runStructured(this.config.adapters[mw.adapter], {
+      const res = await runStructured(current.adapters[mw.adapter], {
         reviewerName: "merge",
         prompt: mergePrompt(raised),
         cwd: roundDir,

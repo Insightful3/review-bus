@@ -2,7 +2,7 @@
 // reviewers' copy is `git archive <base>` plus the patch, inside the review folder.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { expandHome } from "./config.js";
@@ -48,8 +48,37 @@ const EMPTY_TREE = EMPTY_TREE_ID;
  * names a clean filter, a smudge filter and an fsmonitor command runs none of them during
  * diff, status, read-tree and checkout-index.
  */
-const HARDEN = ["-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "core.hooksPath=/dev/null"];
+const HARDEN = [
+  "--no-optional-locks", // never refresh (rewrite) the author's index while inspecting it
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.autocrlf=false",
+  "-c",
+  "core.hooksPath=/dev/null",
+  "-c",
+  "core.attributesFile=/dev/null",
+];
 const hardened = (cwd: string, args: string[]) => [...HARDEN, `--attr-source=${EMPTY_TREE_ID}`, "-C", cwd, ...args];
+/** Diffs that get replayed with git apply: standard a/ b/ prefixes whatever the user's diff settings. */
+const PATCH = ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/"];
+
+/**
+ * --attr-source replaces the repo's .gitattributes, but git still reads .git/info/attributes, and
+ * a filter switched on there would run its command. Such repos are refused rather than half handled.
+ */
+function refuseInfoAttributes(root: string): void {
+  const file = gitBuf(root, ["rev-parse", "--path-format=absolute", "--git-path", "info/attributes"]).toString().trim();
+  let text = "";
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return; // none
+  }
+  if (/(^|\s)filter(=|\s|$)/m.test(text)) {
+    throw new Error(`${file} switches on a git filter, which would run a command during the snapshot. Remove that line or review a clean clone.`);
+  }
+}
 const runGit = (cwd: string, args: string[], extra: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}) =>
   spawnSync("git", hardened(cwd, args), { maxBuffer: extra.maxBuffer, env: extra.env ? { ...process.env, ...extra.env } : undefined });
 
@@ -106,6 +135,7 @@ function countLines(patch: string): { insertions: number; deletions: number } {
 export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { info: GitInfo; patch: string; sha256: string } {
   const repo = path.resolve(expandHome(spec.repo));
   const root = git(repo, ["rev-parse", "--show-toplevel"]).trim();
+  refuseInfoAttributes(root);
   const headSha = git(root, ["rev-parse", "HEAD"]).trim();
   const branchOut = runGit(root, ["symbolic-ref", "-q", "--short", "HEAD"]);
   const branch = branchOut.status === 0 ? branchOut.stdout.toString().trim() : null;
@@ -118,12 +148,12 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
   if (spec.mode === "uncommitted") {
     baseSha = headSha;
     baseRef = "HEAD";
-    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", "HEAD"]);
-    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "HEAD"]));
+    patch = gitBuf(root, [...PATCH, "HEAD"]);
+    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "--no-relative", "HEAD"]));
     // Untracked files, as "new file" patches, without touching the index.
     const untracked = git(root, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\0").filter(Boolean);
     for (const f of untracked) {
-      patch = Buffer.concat([patch, gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", f], { okCodes: [0, 1] })]);
+      patch = Buffer.concat([patch, gitBuf(root, [...PATCH, "--no-index", "--", "/dev/null", f], { okCodes: [0, 1] })]);
       files.push({ path: f, status: "A" });
     }
   } else if (spec.mode === "base") {
@@ -131,8 +161,8 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     const baseTip = tryRev(root, baseRef);
     if (!baseTip) throw new Error(`Base "${baseRef}" not found in ${root}.`);
     baseSha = git(root, ["merge-base", baseTip, headSha]).trim();
-    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", baseSha, headSha]);
-    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", baseSha, headSha]));
+    patch = gitBuf(root, [...PATCH, baseSha, headSha]);
+    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "--no-relative", baseSha, headSha]));
     const commits = git(root, ["rev-list", "--count", `${baseSha}..${headSha}`]).trim();
     notes.push(`${commits} commit(s) on ${branch ?? "HEAD"} since ${baseRef}.`);
     if (git(root, ["status", "--porcelain"]).trim()) notes.push("The working tree has uncommitted changes; they are not part of this review (mode base reviews commits).");
@@ -140,16 +170,16 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     // The whole project at HEAD, as if every file were new (committed files only).
     baseSha = EMPTY_TREE;
     baseRef = null;
-    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", EMPTY_TREE, headSha]);
-    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", EMPTY_TREE, headSha]));
+    patch = gitBuf(root, [...PATCH, EMPTY_TREE, headSha]);
+    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "--no-relative", EMPTY_TREE, headSha]));
     if (git(root, ["status", "--porcelain"]).trim()) notes.push("The working tree has uncommitted changes; they are not part of this review (mode all reviews HEAD).");
   } else {
     const commitSha = tryRev(root, spec.commit ?? "HEAD");
     if (!commitSha) throw new Error(`Commit "${spec.commit}" not found in ${root}.`);
     baseSha = tryRev(root, `${commitSha}^`) ?? EMPTY_TREE;
     baseRef = `${commitSha.slice(0, 12)}^`;
-    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", baseSha, commitSha]);
-    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", baseSha, commitSha]));
+    patch = gitBuf(root, [...PATCH, baseSha, commitSha]);
+    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "--no-relative", baseSha, commitSha]));
   }
   if (!patch.toString("latin1").trim()) throw new Error(`No changes to review in ${root} (mode ${spec.mode}).`);
 

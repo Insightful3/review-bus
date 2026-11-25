@@ -251,6 +251,16 @@ rv_<id>/
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.
 - Every agent session starts its own review-bus server. A review records which process runs it, so other sessions leave a running review alone and only mark it failed once that process is gone.
 
+## Known limits (v0.1)
+
+Found when review-bus reviewed itself with Codex, and not fixed yet:
+
+- **Reviewers can read your disk.** Codex's read-only sandbox stops writes, not reads, so a reviewer told to by the work it reviews could open other files on your machine (other reviews, for example) and include them in what it sends to its vendor.
+- **Page redirects.** A public page you submit can redirect the headless browser to a private page your machine can reach (a local server, an intranet), and that page would be captured.
+- **Crashed runners.** If the process running a review is killed outright, its reviewers can keep running until their own timeout.
+- **Slow pages and the review ID.** `review_submit` returns the review ID only after the snapshot is taken, so a very slow page can take longer than the client waits.
+- **Sign-off.** `rb signoff` records whatever name it is given; anything that can run commands in your terminal can run it.
+
 ## Development
 
 ```bash

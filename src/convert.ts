@@ -71,47 +71,145 @@ function pagesToMarkdown(pages: string[]): string {
 }
 
 const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'", nbsp: " " };
-const decode = (s: string) => s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (_, e) => ENTITIES[e]);
+const decode = (s: string) =>
+  s.replace(/&(amp|lt|gt|quot|#39|nbsp|#\d+|#x[0-9a-f]+);/gi, (m, e: string) => {
+    if (e[0] === "#") return String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1)));
+    return ENTITIES[e.toLowerCase()] ?? m;
+  });
 
-/** Inline HTML from mammoth (strong, em, a, br, img) to Markdown. */
-function inline(html: string): string {
-  return decode(
-    html
-      .replace(/<br\s*\/?>/g, "  \n")
-      .replace(/<(strong|b)>([\s\S]*?)<\/\1>/g, "**$2**")
-      .replace(/<(em|i)>([\s\S]*?)<\/\1>/g, "_$2_")
-      .replace(/<a [^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g, "[$2]($1)")
-      .replace(/<img[^>]*>/g, "[image]")
-      .replace(/<[^>]+>/g, ""),
-  ).trim();
+interface El {
+  tag: string;
+  attrs: string;
+  children: Node[];
+}
+type Node = El | string;
+
+const VOID = new Set(["br", "img", "hr"]);
+
+/** Parses the small, well-formed HTML mammoth produces into a tree. Unknown tags keep their children. */
+function parse(html: string): El {
+  const root: El = { tag: "root", attrs: "", children: [] };
+  const stack: El[] = [root];
+  for (const m of html.matchAll(/<(\/?)([a-zA-Z0-9]+)([^>]*)>|([^<]+)/g)) {
+    const top = stack.at(-1)!;
+    if (m[4] !== undefined) {
+      top.children.push(decode(m[4]));
+      continue;
+    }
+    const tag = m[2].toLowerCase();
+    if (m[1]) {
+      // Close the nearest open element with this tag (and anything left open inside it).
+      const at = stack.map((e) => e.tag).lastIndexOf(tag);
+      if (at > 0) stack.length = at;
+      continue;
+    }
+    const el: El = { tag, attrs: m[3], children: [] };
+    top.children.push(el);
+    if (!VOID.has(tag) && !m[3].trim().endsWith("/")) stack.push(el);
+  }
+  return root;
 }
 
-/**
- * Converts the small, regular HTML mammoth produces (h1-h6, p, ul/ol/li, table) to Markdown.
- * Not a general HTML converter.
- */
-export function htmlToMarkdown(html: string): string {
+const isEl = (n: Node): n is El => typeof n !== "string";
+const BLOCK = new Set(["h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "table"]);
+
+/** Inline content (strong, em, a, br, img) to Markdown. */
+function inline(nodes: Node[]): string {
+  return nodes
+    .map((n) => {
+      if (!isEl(n)) return n;
+      const inner = inline(n.children);
+      switch (n.tag) {
+        case "strong":
+        case "b":
+          return inner.trim() ? `**${inner}**` : inner;
+        case "em":
+        case "i":
+          return inner.trim() ? `_${inner}_` : inner;
+        case "a": {
+          const href = n.attrs.match(/href="([^"]*)"/)?.[1];
+          return href ? `[${inner}](${decode(href)})` : inner;
+        }
+        case "br":
+          return "  \n";
+        case "img":
+          return "[image]";
+        default:
+          return inner;
+      }
+    })
+    .join("");
+}
+
+/** A list, nested lists included: each item's own text, then its sub-lists indented below it. */
+function list(el: El, depth: number): string[] {
+  const lines: string[] = [];
+  let k = 0;
+  for (const li of el.children) {
+    if (!isEl(li) || li.tag !== "li") continue;
+    k++;
+    const own = li.children.filter((c) => !isEl(c) || (c.tag !== "ul" && c.tag !== "ol"));
+    // A paragraph inside an item is just its text.
+    const text = own.map((c) => (isEl(c) && c.tag === "p" ? inline(c.children) + " " : inline([c]))).join("").replace(/\s+/g, " ").trim();
+    lines.push(`${"  ".repeat(depth)}${el.tag === "ol" ? `${k}.` : "-"} ${text}`);
+    for (const sub of li.children) if (isEl(sub) && (sub.tag === "ul" || sub.tag === "ol")) lines.push(...list(sub, depth + 1));
+  }
+  return lines;
+}
+
+function table(el: El): string | null {
+  const rows: string[][] = [];
+  const walk = (n: El) => {
+    for (const c of n.children) {
+      if (!isEl(c)) continue;
+      if (c.tag === "tr") rows.push(c.children.filter(isEl).filter((x) => x.tag === "td" || x.tag === "th").map((x) => blocksText(x).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ").trim()));
+      else walk(c); // thead, tbody
+    }
+  };
+  walk(el);
+  if (!rows.length) return null;
+  const width = Math.max(...rows.map((r) => r.length));
+  const line = (r: string[]) => `| ${[...r, ...Array(width - r.length).fill("")].join(" | ")} |`;
+  return [line(rows[0]), line(Array(width).fill("---")), ...rows.slice(1).map(line)].join("\n");
+}
+
+/** Text of a cell or other container that may hold paragraphs and lists. */
+function blocksText(el: El): string {
+  return blocks(el.children).join(" ");
+}
+
+function blocks(nodes: Node[]): string[] {
   const out: string[] = [];
-  const block = /<(h[1-6]|p|ul|ol|table)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g;
-  for (const m of html.matchAll(block)) {
-    const [, tag, body] = m;
-    if (tag.startsWith("h")) {
-      out.push(`${"#".repeat(Number(tag[1]))} ${inline(body)}`);
-    } else if (tag === "p") {
-      const text = inline(body);
-      if (text) out.push(text);
-    } else if (tag === "ul" || tag === "ol") {
-      const items = [...body.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((li, i) => `${tag === "ol" ? `${i + 1}.` : "-"} ${inline(li[1])}`);
-      out.push(items.join("\n"));
-    } else {
-      const rows = [...body.matchAll(/<tr>([\s\S]*?)<\/tr>/g)].map((tr) =>
-        [...tr[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/g)].map((c) => inline(c[1]).replace(/\|/g, "\\|").replace(/\n/g, " ")),
-      );
-      if (!rows.length) continue;
-      const width = Math.max(...rows.map((r) => r.length));
-      const line = (r: string[]) => `| ${[...r, ...Array(width - r.length).fill("")].join(" | ")} |`;
-      out.push([line(rows[0]), line(Array(width).fill("---")), ...rows.slice(1).map(line)].join("\n"));
+  let loose: Node[] = [];
+  const flush = () => {
+    const t = inline(loose).trim();
+    if (t) out.push(t);
+    loose = [];
+  };
+  for (const n of nodes) {
+    if (!isEl(n) || !BLOCK.has(n.tag)) {
+      if (isEl(n) && !["strong", "b", "em", "i", "a", "br", "img"].includes(n.tag) && n.children.some((c) => isEl(c) && BLOCK.has(c.tag))) {
+        flush();
+        out.push(...blocks(n.children)); // a wrapper (div, li outside a list) around blocks
+      } else loose.push(n);
+      continue;
+    }
+    flush();
+    if (n.tag[0] === "h" && n.tag.length === 2) out.push(`${"#".repeat(Number(n.tag[1]))} ${inline(n.children).trim()}`);
+    else if (n.tag === "p") {
+      const t = inline(n.children).trim();
+      if (t) out.push(t);
+    } else if (n.tag === "ul" || n.tag === "ol") out.push(list(n, 0).join("\n"));
+    else {
+      const t = table(n);
+      if (t) out.push(t);
     }
   }
-  return out.join("\n\n") + "\n";
+  flush();
+  return out;
+}
+
+/** Converts mammoth's HTML (headings, paragraphs, nested lists, tables) to Markdown. */
+export function htmlToMarkdown(html: string): string {
+  return blocks(parse(html).children).join("\n\n") + "\n";
 }
