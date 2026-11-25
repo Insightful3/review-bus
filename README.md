@@ -265,6 +265,7 @@ Front matter keys:
 | `models` | Model per reviewer, for example `{"codex": "gpt-6.1-sol"}` |
 | `require_signoff` | A person must sign off; reviewers alone cannot approve |
 | `high_blocks_always` | High and critical findings block at any likelihood |
+| `max_blocking` | How many findings may block per round for this rubric (default 5 from config) |
 | `confidential` | Refuses to run until `allowed_reviewers` in config lists the reviewers for this rubric |
 | `report_notice` | A notice shown at the top of every result and report |
 
