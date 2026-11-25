@@ -220,7 +220,7 @@ export class Engine {
    * mode "new": the review is saved here for the first time; "prepared": it was saved already (state
    * submitted, snapshot taken in the background); "resubmit": the next round of an answered review.
    */
-  private async startRound(review: Review, runs: ReviewerRun[], mode: "new" | "prepared" | "resubmit"): Promise<void> {
+  private async startRound(review: Review, runs: ReviewerRun[], mode: "new" | "prepared" | "resubmit", rubricMeta: Record<string, unknown> = review.rubric_meta): Promise<void> {
     const isNew = mode === "new";
     const n = review.rounds.length + 1;
     const t = now();
@@ -260,7 +260,7 @@ export class Engine {
         finished_at: null,
         runner: { pid: process.pid, host: os.hostname(), started_at: dispatched },
         // A rubric may set its own limit (contracts carry more must-fix points than a blog post).
-        policy: { ...this.config.policy, ...rubricLimit(r.rubric_meta) },
+        policy: { ...this.config.policy, ...rubricLimit(rubricMeta) },
         snapshot,
         reviewers: runs,
         findings: [],
@@ -381,7 +381,8 @@ export class Engine {
       if (!review.request.artifact?.path) throw new Error("artifact can only be changed for document reviews; git changes and pages are captured again on resubmit.");
       review.request.artifact = { path: opts.artifact };
     }
-    await this.startRound(review, runs, "resubmit");
+    // The new round's blocking limit comes from the rubric as it is now (max_blocking may have changed).
+    await this.startRound(review, runs, "resubmit", rubric.meta);
     if (opts.waitSeconds) await this.waitFor(id, opts.waitSeconds);
     return { review: this.get(id), unanswered: [] };
   }
@@ -757,7 +758,8 @@ export class Engine {
       max_blocking: (round.policy ?? this.config.policy).max_blocking,
       high_blocks_always: review.rubric_meta.high_blocks_always === true,
     };
-    const { merged, merge } = await this.merge(raised, review.request.rubric, review.rubric_meta, roundDir, signal, (f) => wouldBlock(f, policy));
+    // The merge model sees quotes: approvals as the rubric is now (confidential if it became so).
+    const { merged, merge } = await this.merge(raised, review.request.rubric, this.metaNow(review), roundDir, signal, (f) => wouldBlock(f, policy));
     const findings: Finding[] = merged.map((m, i) => ({
       ...m.finding,
       finding_id: `r${n}.f${i + 1}`,
@@ -934,6 +936,8 @@ export class Engine {
     reviewer: string,
     token: string,
     answer: { output?: unknown; decline?: string; model?: string | null },
+    /** How long to wait for the round to finish after saving the last answer (merge model). The answer is saved either way. */
+    opts: { waitSeconds?: number } = {},
   ): Promise<Review> {
     let output: ReviewerOutput | null = null;
     if (!answer.decline) {
@@ -981,21 +985,28 @@ export class Engine {
     if (finish) {
       // Tracked like a round, so this process does not mistake its own finishing for a cut-off round.
       this.finalizeInBackground(id, n);
-      await this.running.get(id);
+      const job = this.running.get(id);
+      const seconds = opts.waitSeconds ?? Infinity;
+      if (job && Number.isFinite(seconds)) {
+        let timer: NodeJS.Timeout | undefined;
+        await Promise.race([job, new Promise<void>((r) => (timer = setTimeout(r, Math.max(0, seconds) * 1000)))]);
+        clearTimeout(timer);
+      } else await job;
     }
     return this.get(id);
   }
 
   /**
    * The rubric settings that decide where work may go: as saved with the review, but confidential
-   * if the rubric is confidential now. A rubric that cannot be loaded now keeps the saved settings.
+   * if the rubric is confidential now. A rubric that cannot be loaded now (renamed, broken) counts as
+   * confidential: when in doubt, nothing goes to a reviewer or model without an approval.
    */
   private metaNow(review: Review): Record<string, unknown> {
     try {
       const now = loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs).meta;
       return { ...review.rubric_meta, confidential: review.rubric_meta.confidential === true || now.confidential === true };
     } catch {
-      return review.rubric_meta;
+      return { ...review.rubric_meta, confidential: true };
     }
   }
 

@@ -1176,3 +1176,140 @@ test("a slow pdftotext does not block the server", async () => {
     process.env.PATH = oldPath;
   }
 });
+
+// ---- Round 3 of the fresh review ----
+
+const finding = (claim: string) => ({
+  claim,
+  failure_scenario: "The client relies on it and loses money.",
+  evidence: "Seen in the document.",
+  location: { path: null, line_start: null, line_end: null, section: "Summary", quote: "Total price: EUR 24,000 excluding VAT." },
+  likelihood: "likely",
+  impact: "high",
+  suggested_fix: null,
+  assumption_challenge: false,
+  confidence: 0.8,
+});
+
+function mergeConfig(rubricDir: string, sleep = 0) {
+  writeConfig({
+    rubric_paths: [rubricDir],
+    merge_with: { adapter: "merger" },
+    adapters: {
+      fake: { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs")], timeout_seconds: 30 },
+      merger: { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-merger.mjs"), ...(sleep ? [`--sleep=${sleep}`] : [])], timeout_seconds: 30 },
+      person: { type: "pull" },
+      person2: { type: "pull" },
+    },
+  });
+}
+
+test("findings from a rubric made confidential after the claims never reach the merge model", async () => {
+  const dir = path.join(tmp, "rubrics-merge-flip");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "flip2.md"), RUBRIC.replace("confidential: true\n", ""));
+  mergeConfig(dir);
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "flip2", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }, { name: "person2" }], stage: "pre-merge" }, PERSON, 5);
+  const a = e.claim(review.id, "person", { by: "Ana", client: null });
+  const b = e.claim(review.id, "person2", { by: "Bo", client: null });
+  writeFileSync(path.join(dir, "flip2.md"), RUBRIC); // now confidential, with no approvals for it
+  await e.post(review.id, "person", a.token, { output: { verdict: "changes_requested", summary: "a", findings: [finding("Price is 70% off.")] } });
+  const done = await e.post(review.id, "person2", b.token, { output: { verdict: "changes_requested", summary: "b", findings: [finding("Price is 70% wrong.")] } });
+  assert.equal(done.rounds[0].merge!.method, "rules");
+  assert.match(done.rounds[0].merge!.error!, /confidential/);
+  writeConfig();
+});
+
+test("the last pull answer is acknowledged within the wait, while a slow merge finishes the round", async () => {
+  const dir = path.join(tmp, "rubrics-slow-merge");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "open.md"), RUBRIC.replace("confidential: true\n", ""));
+  mergeConfig(dir, 3000);
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "open", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }, { name: "person2" }], stage: "pre-merge" }, PERSON, 5);
+  const a = e.claim(review.id, "person", { by: "Ana", client: null });
+  const b = e.claim(review.id, "person2", { by: "Bo", client: null });
+  await e.post(review.id, "person", a.token, { output: { verdict: "changes_requested", summary: "a", findings: [finding("Price is 70% off.")] } });
+  const started = Date.now();
+  const acked = await e.post(review.id, "person2", b.token, { output: { verdict: "changes_requested", summary: "b", findings: [finding("Price is 70% wrong.")] } }, { waitSeconds: 0.5 });
+  assert.ok(Date.now() - started < 2000);
+  assert.equal(acked.state, "in_review"); // saved, still being finished
+  await e.settled(review.id);
+  const done = e.get(review.id);
+  assert.equal(done.state, "changes_requested");
+  assert.equal(done.rounds[0].merge!.method, "model");
+  assert.ok(done.rounds[0].finished_at);
+  writeConfig();
+});
+
+test("a resubmitted round takes max_blocking from the rubric as it is now", async () => {
+  const dir = path.join(tmp, "rubrics-limit-change");
+  mkdirSync(dir, { recursive: true });
+  const rubric = (n: number) => RUBRIC.replace("confidential: true\n", `max_blocking: ${n}\n`).replace("require_signoff: true\n", "");
+  writeFileSync(path.join(dir, "lim.md"), rubric(1));
+  writeConfig({ rubric_paths: [dir] });
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "lim", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, PERSON, 10);
+  await e.settled(review.id);
+  const r1 = e.get(review.id).rounds[0];
+  assert.equal(r1.policy!.max_blocking, 1);
+  writeFileSync(path.join(dir, "lim.md"), rubric(5));
+  const answers = r1.findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+  await e.respond(review.id, answers, { resubmit: true });
+  await e.settled(review.id);
+  assert.equal(e.get(review.id).rounds[1].policy!.max_blocking, 5);
+  writeConfig();
+});
+
+test("a kept inbox form is unwrapped even when another tab already renewed the session", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const work = engine.claim(review.id, "person", { by: "Ana", client: null });
+  const payload = new URLSearchParams({ claim_token: work.token, verdict: "approve", summary: "Second tab.", decline: "", f_claim: "" }).toString();
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  const res = await fetch(`${base}inbox/claim/${review.id}/person/post`, { method: "POST", headers: { cookie }, body: new URLSearchParams({ _payload: payload, _reauth_token: token }), redirect: "manual" });
+  assert.equal(res.status, 303);
+  assert.equal(engine.get(review.id).state, "approved");
+});
+
+test("at the session cap, the oldest idle session makes room for a new client", async () => {
+  process.env.REVIEW_BUS_MAX_SESSIONS = "1";
+  const s = await startHttp(engine, { port: 0, host: "127.0.0.1" });
+  delete process.env.REVIEW_BUS_MAX_SESSIONS;
+  const opts = { requestInit: { headers: { authorization: `Bearer ${token}` } } };
+  try {
+    const a = new Client({ name: "a", version: "0" });
+    await a.connect(new StreamableHTTPClientTransport(new URL(`${s.url}mcp`), opts));
+    await a.close(); // gone without ending its session: idle, not expired yet
+    await new Promise((r) => setTimeout(r, 100));
+    const b = new Client({ name: "b", version: "0" });
+    await b.connect(new StreamableHTTPClientTransport(new URL(`${s.url}mcp`), opts));
+    assert.ok((await b.listTools()).tools.length > 0);
+    await b.close();
+  } finally {
+    await s.close();
+  }
+});
+
+test("a codex-review stopped during preparation leaves no scratch copy", async () => {
+  writeConfig({ adapters: { native: { type: "codex-review", command: path.join(ROOT, "test/fake-codex.mjs"), timeout_seconds: 3 } } });
+  const e = new Engine(loadConfig());
+  const repo = path.join(tmp, "repo-cleanup");
+  mkdirSync(repo);
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd: repo });
+  writeFileSync(path.join(repo, "a.txt"), "a\n");
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-q", "-m", "a");
+  writeFileSync(path.join(repo, "a.txt"), "b\n");
+  const review = await e.submit({ artifact: { git: { repo, mode: "uncommitted" } }, pages: [], rubric: "code", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" }, PERSON, 10);
+  await e.settled(review.id);
+  assert.match(e.get(review.id).rounds[0].reviewers[0].error!, /Codex was not started/);
+  assert.ok(!existsSync(path.join(tmp, "reviews", review.id, "r1", "native.native")));
+  writeConfig();
+});

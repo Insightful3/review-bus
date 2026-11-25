@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { copyFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import { kindOf, toMarkdown } from "./convert.js";
 import { NoChangesError, snapshotGitAsync } from "./git.js";
@@ -24,8 +25,9 @@ export async function snapshotDocument(sourcePath: string, reviewDir: string, ro
   const file = `r${round}/original${ext}`;
   // Copy first, then hash and convert the copy: the source may be saved again meanwhile, and the
   // hash must describe exactly what reviewers get.
-  copyFileSync(abs, path.join(reviewDir, file));
-  const sha256 = createHash("sha256").update(readFileSync(path.join(reviewDir, file))).digest("hex");
+  // Asynchronous: a large file on a slow volume must not hold up the server or the review id.
+  await copyFile(abs, path.join(reviewDir, file));
+  const sha256 = createHash("sha256").update(await readFile(path.join(reviewDir, file))).digest("hex");
   const converted = await toMarkdown(path.join(reviewDir, file), kind);
   if (!converted.markdown.trim()) throw new Error(`No text could be read from ${abs}.`);
   const markdown_file = `r${round}/artifact.md`;
@@ -76,8 +78,8 @@ export async function snapshotRound(
       if (!kind) throw new Error(`Unsupported related document type: ${abs}. Supported: .md, .markdown, .txt, .docx, .pdf.`);
       const base = `${dirRel}/${String(i + 1).padStart(2, "0")}-${path.basename(abs, path.extname(abs)).replace(/[^a-z0-9]+/gi, "-").slice(0, 40)}`;
       const copy = path.join(reviewDir, `${base}.original${path.extname(abs).toLowerCase()}`);
-      copyFileSync(abs, copy); // hash and convert the same bytes, as for the main document
-      const data = readFileSync(copy);
+      await copyFile(abs, copy); // hash and convert the same bytes, as for the main document
+      const data = await readFile(copy);
       const converted = await toMarkdown(copy, kind);
       const markdown_file = `${base}.md`;
       writeFileSync(path.join(reviewDir, markdown_file), converted.markdown);

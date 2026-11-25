@@ -604,7 +604,15 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     async (args) => {
       try {
         if (!args.output === !args.decline) throw new Error("Give either output or decline.");
-        const review = await engine.post(args.review_id, args.reviewer, args.token, { output: args.output, decline: args.decline, model: args.model });
+        // The answer is saved at once; finishing the round (a merge model) may take longer than the
+        // client waits, so the reply comes within max_wait_seconds and the round finishes regardless.
+        const review = await engine.post(
+          args.review_id,
+          args.reviewer,
+          args.token,
+          { output: args.output, decline: args.decline, model: args.model },
+          { waitSeconds: engine.config.max_wait_seconds - 5 },
+        );
         return jsonReply(status(review));
       } catch (err) {
         return errorReply(err);

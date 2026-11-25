@@ -168,18 +168,31 @@ function codexIsolation(): string[] {
  * preparing a large copy never blocks the server, and bounded by the reviewer's deadline.
  */
 function scratchGit(cwd: string, args: string[], deadline: number, input?: Buffer, signal?: AbortSignal): Promise<void> {
+  return bounded(
+    "git",
+    [
+      "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false",
+      "-c", "user.name=review-bus", "-c", "user.email=review-bus@localhost", "-c", "init.defaultBranch=main",
+      ...args,
+    ],
+    cwd,
+    deadline,
+    `git ${args[0]}`,
+    input,
+    signal,
+  );
+}
+
+/**
+ * Runs a command for the codex-review preparation: killed when the reviewer's deadline passes or the
+ * review is canceled, so preparing a large copy never outlives the reviewer.
+ */
+function bounded(command: string, args: string[], cwd: string, deadline: number, label: string, input?: Buffer, signal?: AbortSignal): Promise<void> {
   const left = deadline - Date.now();
+  if (signal?.aborted) return Promise.reject(new Error("canceled"));
   if (left <= 0) return Promise.reject(new Error("codex-review ran out of time preparing its scratch repo (timeout_seconds)."));
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      "git",
-      [
-        "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false",
-        "-c", "user.name=review-bus", "-c", "user.email=review-bus@localhost", "-c", "init.defaultBranch=main",
-        ...args,
-      ],
-      { cwd, env: { ...envWithoutGit(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, stdio: ["pipe", "ignore", "pipe"] },
-    );
+    const child = spawn(command, args, { cwd, env: { ...envWithoutGit(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, stdio: ["pipe", "ignore", "pipe"] });
     let stderr = "";
     let expired = false;
     const stop = () => child.kill("SIGKILL");
@@ -198,10 +211,10 @@ function scratchGit(cwd: string, args: string[], deadline: number, input?: Buffe
       signal?.removeEventListener("abort", stop);
       if (expired) reject(new Error("codex-review ran out of time preparing its scratch repo (timeout_seconds)."));
       else if (signal?.aborted) reject(new Error("canceled"));
-      else if (code !== 0) reject(new Error(`git ${args[0]} in the codex-review copy failed: ${stderr.trim().split("\n")[0]}`));
+      else if (code !== 0) reject(new Error(`${label} in the codex-review copy failed: ${stderr.trim().split("\n")[0]}`));
       else resolve();
     });
-    child.stdin!.on("error", () => {}); // git may exit before reading all input
+    child.stdin!.on("error", () => {}); // the command may exit before reading all input
     child.stdin!.end(input ?? "");
   });
 }
@@ -282,23 +295,13 @@ Rules:
 `;
 
 /**
- * Codex's native code review (\`codex exec review --uncommitted\`), off by default (SPEC 8). It needs
- * a git repo, so the adapter builds one inside the round folder: a copy of the reviewers' tree with
- * the base committed and the change left uncommitted. Nothing touches the author's repo. Its answer
- * is text (it ignores --output-schema and takes no prompt together with --uncommitted, checked on
- * codex-cli 0.172.0), so a second, ordinary codex exec pass converts it into findings.
+ * The scratch repo for codex-review: a copy of the reviewers' tree (by cp, a subprocess bounded by
+ * the deadline; -P keeps symlinks as they are, so a relative link still matches the patch), the base
+ * committed and the change staged.
  */
-async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
-  if (!job.git) throw new Error("codex-review reviews git changes only; use the codex reviewer for documents and pages.");
-  // One deadline for everything (scratch repo, review, conversion): the reviewer's timeout_seconds,
-  // so the round never runs longer than other processes allow for it.
-  const deadline = Date.now() + cfg.timeout_seconds * 1000;
-  const native = path.join(job.outDir, `${job.reviewerName}.native`);
-  await rm(native, { recursive: true, force: true });
-  // verbatimSymlinks: a relative link must stay relative, or the reverse patch no longer matches it.
-  await cp(job.git.tree, native, { recursive: true, verbatimSymlinks: true });
-  if (Date.now() > deadline) throw new Error("codex-review ran out of time copying the project (timeout_seconds).");
-  const patch = await readFile(job.git.patch);
+async function prepareScratch(job: ReviewJob, native: string, deadline: number): Promise<void> {
+  await bounded("cp", ["-R", "-P", job.git!.tree, native], path.dirname(native), deadline, "copying the project", undefined, job.signal);
+  const patch = await readFile(job.git!.patch);
   const git = (args: string[], input?: Buffer) => scratchGit(native, args, deadline, input, job.signal);
   await git(["init", "-q"]);
   // The project's .gitattributes came along with the copy. info/attributes wins over it: no filters
@@ -316,8 +319,31 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
   // --index: the change is staged too, so new files that .gitignore matches are still part of it.
   if (patch.length) await git(["apply", "--index", "--whitespace=nowarn", "-"], patch);
   if (deadline - Date.now() < 5000) throw new Error("codex-review ran out of time preparing its scratch repo (timeout_seconds); Codex was not started.");
+}
 
+/**
+ * Codex's native code review (\`codex exec review --uncommitted\`), off by default (SPEC 8). It needs
+ * a git repo, so the adapter builds one inside the round folder: a copy of the reviewers' tree with
+ * the base committed and the change left uncommitted. Nothing touches the author's repo. Its answer
+ * is text (it ignores --output-schema and takes no prompt together with --uncommitted, checked on
+ * codex-cli 0.172.0), so a second, ordinary codex exec pass converts it into findings.
+ */
+async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
+  if (!job.git) throw new Error("codex-review reviews git changes only; use the codex reviewer for documents and pages.");
+  // One deadline for everything (scratch repo, review, conversion): the reviewer's timeout_seconds,
+  // so the round never runs longer than other processes allow for it.
+  const deadline = Date.now() + cfg.timeout_seconds * 1000;
+  const native = path.join(job.outDir, `${job.reviewerName}.native`);
+  await rm(native, { recursive: true, force: true });
+  try {
+    await prepareScratch(job, native, deadline);
+  } catch (err) {
+    // Stopped (deadline, cancel, failure): leave no half-made copy behind.
+    await rm(native, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
   const outFile = path.join(job.outDir, `${job.reviewerName}.native.md`);
+
   const args = ["exec", "review", "--uncommitted", ...codexIsolation(), "--output-last-message", outFile, ...codexModelArgs(job), ...cfg.args];
   const r = await runProcess(cfg.command, args, { cwd: native, stdin: "", timeoutMs: Math.max(1000, deadline - Date.now()), signal: job.signal });
   writeFileSync(path.join(job.outDir, `${job.reviewerName}.log.txt`), `${r.stdout}\n--- stderr ---\n${r.stderr}`);

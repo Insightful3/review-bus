@@ -70,9 +70,10 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
   const sessions = new Map<string, { transport: StreamableHTTPServerTransport; close: () => Promise<void>; lastSeen: number; open: number }>();
   const SESSION_IDLE_MS = Number(process.env.REVIEW_BUS_SESSION_IDLE_MS ?? 60 * 60 * 1000);
   const MAX_SESSIONS = Number(process.env.REVIEW_BUS_MAX_SESSIONS ?? 100);
-  const sweep = () => {
+  /** Closes expired idle sessions; with reserve, also the oldest idle ones until that many slots are free. */
+  const sweep = (reserve = 0) => {
     const idle = [...sessions.entries()].filter(([, s]) => s.open === 0).sort((a, b) => a[1].lastSeen - b[1].lastSeen);
-    let excess = sessions.size - MAX_SESSIONS;
+    let excess = sessions.size + reserve - MAX_SESSIONS;
     for (const [id, s] of idle) {
       if (Date.now() - s.lastSeen > SESSION_IDLE_MS || excess > 0) {
         sessions.delete(id);
@@ -185,8 +186,8 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
       send(res, sessionId ? 404 : 400, JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: sessionId ? "Unknown session" : "Start with an initialize request" }, id: null }), "application/json");
       return;
     }
-    // A slot for the new session: idle ones go first; with every slot in use, ask to retry later.
-    sweep();
+    // A slot for the new session: the oldest idle session gives way; with every slot in use, ask to retry later.
+    sweep(1);
     if (sessions.size >= MAX_SESSIONS) {
       send(res, 503, JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: `All ${MAX_SESSIONS} MCP sessions are in use; try again later.` }, id: null }), "application/json", { "retry-after": "30" });
       return;
@@ -253,6 +254,8 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
         return;
       }
     }
+    // A kept form sent from the re-login page while another tab already renewed the session: unwrap it.
+    if (form.has("_reauth_token") && form.has("_payload")) form = new URLSearchParams(form.get("_payload") ?? "");
     const parts = url.pathname.split("/").filter(Boolean).slice(1); // after "inbox"
     try {
       if (req.method === "GET" && parts.length === 0) {
@@ -311,8 +314,9 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
         if (req.method === "POST" && parts[3] === "post") {
           const claimToken = form.get("claim_token") ?? "";
           const decline = (form.get("decline") ?? "").trim();
-          if (decline) await engine.post(id, reviewer, claimToken, { decline });
-          else await engine.post(id, reviewer, claimToken, { output: answerFromForm(form), model: null });
+          const wait = { waitSeconds: engine.config.max_wait_seconds - 5 };
+          if (decline) await engine.post(id, reviewer, claimToken, { decline }, wait);
+          else await engine.post(id, reviewer, claimToken, { output: answerFromForm(form), model: null }, wait);
           res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent(decline ? "Declined." : "Review sent.")}`, ...SECURITY_HEADERS });
           res.end();
           return;
