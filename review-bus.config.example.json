@@ -3,6 +3,7 @@
     "./rubrics",
     "../review-bus-private/rubrics"
   ],
+  "rubric_packs": [],
   "storage": {
     "documents": "~/.review-bus/reviews"
   },
@@ -26,6 +27,14 @@
     "effort": "low"
   },
   "max_wait_seconds": 50,
+  "snapshot_wait_seconds": 10,
+  "http": {
+    "host": "127.0.0.1",
+    "port": 7777,
+    "token_file": "~/.review-bus/http-token",
+    "allow_remote": false,
+    "allowed_hosts": []
+  },
   "adapters": {
     "codex": {
       "type": "codex",
@@ -55,6 +64,21 @@
       ],
       "vendor": "other",
       "timeout_seconds": 30
+    },
+    "codex-native": {
+      "type": "codex-review",
+      "command": "codex",
+      "vendor": "openai",
+      "model": null,
+      "effort": "medium",
+      "args": [],
+      "timeout_seconds": 900
+    },
+    "person": {
+      "type": "pull",
+      "vendor": "other",
+      "timeout_seconds": 172800,
+      "claim_clients": []
     }
   },
   "policy": {

@@ -53,10 +53,19 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] Public pages cannot reach private addresses (blocked; a redirect into one refuses the capture); reviewers stop when their runner dies (watchdog); Codex image viewer confirmed confined
 - [ ] Residual: DNS rebinding for page capture; the redirected request is still made before the capture stops
 - [x] Decided (25 Nov 2026): agents with terminal access may run `rb signoff`; no extra confirmation.
-- [ ] Return the review_id before slow page capture (self-review round 2, f10). Trade-off: snapshot errors would then arrive as a failed review, not as an error on review_submit.
-- [ ] Optional `model` for Codex in `~/.review-bus/config.json`: reviewers ignore `~/.codex/config.toml` now, so they use Codex's default model.
-- [ ] Optional `codex exec review` native pass (SPEC 8)
+- [x] Return the review_id before slow page capture (self-review round 2, f10): saved first, snapshot in the background; failures within `snapshot_wait_seconds` are still errors on submit
+- [x] Optional `model` for Codex: already supported as `adapters.codex.model`; left unset by the owner's choice (Codex's default model)
+- [x] Optional `codex exec review` native pass (SPEC 8): `type: "codex-review"`, scratch repo in the round folder, second pass to findings; checked with real Codex (gpt-6.2-sol, 45 s)
 - [x] MCP Tasks, 2025-11-25 form (task-capable submit, respond, wait; tested with the SDK client)
 - [x] Claude Code waits for the finished review in one call: progress notifications every 10 s keep the call alive (checked with Claude Code 2.1.316 and a 70 s review)
 - [ ] 2026-07-28 Tasks extension, if Claude Code ever needs it over stdio: the v2 SDK 2.4.0 serves 2026-07-28 over HTTP only
-- [ ] HTTP transport, web inbox, pull-mode reviewers (v0.2+)
+- [ ] Resubmit with pages: return before the capture too
+- [ ] Hosted multi-user mode (accounts instead of one token), Gemini adapter, GitHub sync
+
+## v0.2 (25 Nov 2026)
+
+- [x] Pull reviewers (SPEC 8b): `type: "pull"`, `review_pending`/`claim`/`post`/`release`, `rb pending`/`claim`/`post`/`release`, deadlines, `claim_clients`; the last answer finishes the round from any process
+- [x] MCP over Streamable HTTP (SPEC 8c): `rb serve`, bearer token file, loopback only unless `allow_remote`, Host and Origin checks
+- [x] Web inbox (SPEC 8c): waiting work, decisions, recent reviews, report and screenshots, person reviews with a findings form, release, sign-off; checked in a browser, phone width included
+- [x] Rubric packs (SPEC 7a): `rubric_packs`, `pack/rubric`, approvals fall back to the base name, `rb rubrics`, `rb rubric-check`, `review_rubrics`
+- [x] `server.ts` starts stdio only as the entry point (rb serve imports it)

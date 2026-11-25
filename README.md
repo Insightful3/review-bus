@@ -2,9 +2,9 @@
 
 A review layer for AI agents. An agent submits its work (a document, a code change or web pages), other agents review it, and the verdict comes back as structured state the author has to answer: every blocking finding must be accepted, rejected with a reason or deferred before the review can close or go another round.
 
-It runs as an MCP server, so any MCP client can be the author. Claude Code and Codex are both supported as authors and as reviewers, and by default a review always goes to a model from a different vendor than the author.
+It runs as an MCP server (over stdio, or over HTTP with `rb serve`), so any MCP client can be the author. Claude Code and Codex are both supported as authors and as reviewers, and by default a review always goes to a model from a different vendor than the author. People and agents in other tools can review too: they pick up waiting work and post their answer, from the web inbox, `rb` or MCP.
 
-Status: v0.1, working name. See `SPEC.md` for the design and `TASKS.md` for what is built.
+Status: v0.2, working name. See `SPEC.md` for the design and `TASKS.md` for what is built.
 
 ## What it reviews
 
@@ -46,10 +46,13 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 
 | Key | What it does |
 | --- | --- |
-| `adapters` | The reviewers you can use, each with `type` (`codex`, `claude` or `command`), `command`, `vendor`, `model`, `effort` and `timeout_seconds` |
+| `adapters` | The reviewers you can use, each with `type` (`codex`, `claude`, `codex-review`, `command` or `pull`), `command`, `vendor`, `model`, `effort` and `timeout_seconds`. Pull reviewers have no command; `claim_clients` limits which MCP clients may claim their work |
 | `default_reviewers` | Used when the author names none. Reviewers from the author's own vendor are skipped |
 | `allowed_reviewers` | Per rubric, the reviewers you approve for that kind of content. Required for confidential rubrics such as `contract-b2b` |
 | `rubric_paths` | Extra folders with rubric files. Later folders override earlier ones by rubric name. This repo's `rubrics/` always comes first |
+| `rubric_packs` | Folders of rubrics shared as one unit (for example one client's), named `pack/rubric` |
+| `http` | For `rb serve`: `host` (default `127.0.0.1`), `port` (7777), `token_file` (`~/.review-bus/http-token`), `allow_remote` (false), `allowed_hosts` |
+| `snapshot_wait_seconds` | How long `review_submit` waits for page screenshots before returning the review id (default 10) |
 | `storage.documents` | Where reviews are stored (default `~/.review-bus/reviews`) |
 | `author_vendors` | Maps MCP client names to vendors. `claude-code` and `codex-mcp-client` are built in |
 | `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px), `args` (extra Chrome flags) |
@@ -113,6 +116,11 @@ The loop the agent runs:
 | `review_respond` | Answer findings; close, or resubmit for the next round |
 | `review_list` | Recent reviews, optionally filtered by state |
 | `review_cancel` | Cancel a review and stop its reviewers |
+| `review_rubrics` | The rubrics you can name, with their purpose, including rubric packs |
+| `review_pending` | Work waiting for pull reviewers |
+| `review_claim` | Claim a pull reviewer's work: returns the prompt, the files, the answer schema and a token |
+| `review_post` | Send a pull reviewer's answer (or decline) with the token |
+| `review_release` | Give up a claim so someone else can take it |
 
 ### What to submit
 
@@ -141,6 +149,8 @@ A careful review can take several minutes, and MCP clients give up on a silent t
 
 - **Clients that show progress (Claude Code does).** They send a progress token with each call. review-bus then sends a progress update every 10 seconds ("Round 1: 1 of 2 reviewer(s) done; still working: codex…"), which keeps the call alive, and waits up to `max_wait_with_progress_seconds` (default 900). So `review_submit` with `wait_seconds: 900` returns the finished review in one call. Checked with Claude Code 2.1.316: one call, a 70 second review, the full result back.
 - **Other clients.** A call waits at most `max_wait_seconds` (default 50) and says so (`wait_capped`); the agent calls `review_wait` again until the state is no longer `in_review`.
+- **Pages.** Rendering pages can take a while. A review with pages is saved first and its pages are rendered in the background; if that takes longer than `snapshot_wait_seconds` (default 10), `review_submit` returns the review id with state `submitted`, and a later capture error shows as a failed review. A page that fails to load within those seconds is still an error on submit.
+- **Pull reviewers.** A wait stops as soon as only pull reviewers are left, since a person may answer tomorrow. The review stays `in_review` until they post.
 
 The review keeps running on the server either way, and another session (or `rb`) can follow it too.
 
@@ -163,6 +173,39 @@ The model and effort that actually ran are recorded on every finding as `reviewe
 
 With more than one reviewer, the same problem usually comes back from each of them in different words. review-bus merges these: the highest-risk version is kept, `agreement` counts how many reviewers raised it, and `also_raised_by` lists the others' versions. Set `merge_with` to let a cheap model do the grouping (in a test on a real proposal, Claude Haiku grouped all five shared findings correctly in 5 seconds for a fraction of a cent). Without it, only near-identical findings are merged, because word-based matching cannot tell "the launch date is unconditional" and "the go-live date is stated as fixed" are the same problem without also merging unrelated findings. The merge model sees the findings and their quotes, so for a rubric with `allowed_reviewers` it is only used if it is on that list.
 
+### Codex's native review
+
+`type: "codex-review"` runs Codex's built-in code reviewer (`codex exec review --uncommitted`) instead of a rubric prompt, for git changes only. It needs a git repo, so review-bus builds a scratch one inside the round folder (the base committed, the change uncommitted); the author's repo is not touched. Its answer is text, so a second, ordinary Codex pass turns it into findings (priorities P0 to P3 become critical to low). It runs under the same read-only permission profile as the `codex` reviewer. Add it next to `codex` and name it when you want it, for example `--reviewer codex-native`.
+
+## Pull reviewers: people and agents in other tools
+
+A reviewer with `type: "pull"` is not started by review-bus. Its work waits until someone claims it: a person in the web inbox or with `rb`, or an agent in any MCP client (another tool, another vendor). The round finishes when the last reviewer answers, from whichever process that happens in.
+
+```json
+"adapters": {
+  "ana": { "type": "pull", "vendor": "other", "timeout_seconds": 172800 },
+  "gemini": { "type": "pull", "vendor": "other", "claim_clients": ["gemini-cli"] }
+}
+```
+
+- `review_pending` (or `rb pending`) lists waiting work. `review_claim` returns the prompt (rubric, intent, the work), the files, the answer's JSON Schema and a token; nobody else can claim it after that. `review_post` sends the answer: the same reviewer output JSON the headless reviewers return, or `decline` with a reason. `review_release` gives the work back.
+- `timeout_seconds` is the deadline (default 3 days for pull reviewers). A reviewer that misses it counts as failed, and the round finishes without it.
+- `claim_clients` limits who may claim for that reviewer, by MCP client name. Without it any connected client can, including the author's own agent, so name the clients for anything that matters.
+- Approvals apply as for every reviewer: a confidential rubric only goes to pull reviewers listed in `allowed_reviewers`, checked again at claim time.
+
+## MCP over HTTP and the web inbox
+
+`rb serve` runs one review-bus process with MCP over Streamable HTTP at `/mcp` and a web inbox at `/inbox`, on `127.0.0.1:7777` by default. Every request needs the token in `http.token_file` (created on first start, readable only by you).
+
+```bash
+rb serve
+claude mcp add --transport http review-bus http://127.0.0.1:7777/mcp --header "Authorization: Bearer $(cat ~/.review-bus/http-token)"
+```
+
+Open `http://127.0.0.1:7777/inbox` and paste the token once (it is kept in a cookie for that browser). The inbox shows work waiting for pull reviewers, reviews waiting for your decision and recent reviews. A person can claim a pull reviewer's work there (the page shows the brief, the rubric, the work and the screenshots, then a form for findings), release a claim, and sign off reviews that await sign-off or were escalated. Times are shown in UTC.
+
+`rb serve` only listens on this machine. To listen on another address, set `http.allow_remote: true` and put TLS in front of it, since the token travels with every request. Requests that name another host (DNS rebinding) or come from another site's page are refused.
+
 ## Use it from the command line
 
 `rb` does the same for people, without an agent. Link it once with `npm link` in this folder, or run `node dist/src/cli.js`.
@@ -177,7 +220,9 @@ rb respond <review_id> r1.f1=accepted r1.f2=rejected:"Intentional, agreed with t
 rb signoff <review_id> --by "Your Name"
 ```
 
-`submit` and `respond --resubmit` wait for the reviewers and print the report; Ctrl-C cancels the review. Exit codes: 0 approved or awaiting sign-off, 2 changes requested, escalated or failed, 1 error. A person is the author, so no reviewer is skipped for being the same vendor. Run `rb --help` for all options.
+More commands: `rb rubrics` lists every rubric you can name; `rb rubric-check <file or folder>` checks rubrics before you use them; `rb pending`, `rb claim`, `rb post` and `rb release` are for pull reviewers; `rb serve` starts the HTTP server and inbox.
+
+`submit` and `respond --resubmit` wait for the reviewers and print the report (or stop once only pull reviewers are left); Ctrl-C cancels the review. Exit codes: 0 approved or awaiting sign-off, 2 changes requested, escalated or failed, 1 error. A person is the author, so no reviewer is skipped for being the same vendor. Run `rb --help` for all options.
 
 ## Rubrics
 
@@ -223,6 +268,23 @@ Front matter keys:
 | `confidential` | Refuses to run until `allowed_reviewers` in config lists the reviewers for this rubric |
 | `report_notice` | A notice shown at the top of every result and report |
 
+### Rubric packs
+
+A rubric pack is a folder of rubrics shared as one unit, for example the rubrics a client agreed on with you. Add it to `rubric_packs` and name its rubrics as `pack/rubric`:
+
+```
+acme-rubrics/
+  pack.json         {"name": "acme", "description": "Acme's review rules", "version": "1.0.0"}
+  contract-b2b.md
+  proposal.md
+```
+
+```json
+{ "rubric_packs": ["~/rubric-packs/acme-rubrics"] }
+```
+
+Then submit with `"rubric": "acme/contract-b2b"`. Plain names (`contract-b2b`) keep coming from `rubric_paths`. Approvals look for `acme/contract-b2b` in `allowed_reviewers` first, then for `contract-b2b`. Before sharing a pack, run `rb rubric-check acme-rubrics/`: it reports missing sections or impact levels, front matter values of the wrong type, unknown keys and em dashes.
+
 ## How findings block
 
 Reviewers rate each finding by impact (`critical`, `high`, `medium`, `low`) and likelihood (`certain`, `likely`, `possible`, `remote`), and must describe a concrete failure scenario. The server decides what blocks:
@@ -261,9 +323,12 @@ rv_<id>/
 - Custom `command` reviewers run with your own permissions, like any program you run: review-bus does not sandbox them. Use them for tests and scripts you trust; the Codex and Claude adapters are the read-only ones.
 - Whatever you submit is sent to the reviewer's vendor (OpenAI for Codex, Anthropic for Claude). Mark rubrics for confidential material with `confidential: true` and list approved reviewers in `allowed_reviewers`.
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.
+- `rb serve` listens on `127.0.0.1` only unless `http.allow_remote` is set, needs the token for `/mcp` and the inbox, and refuses requests with another `Host` or `Origin` (DNS rebinding, other sites' pages). The inbox cookie is `HttpOnly` and `SameSite=Strict`, and pages are served with a strict Content Security Policy. The inbox never serves `review.json`, only a round's screenshots and Markdown.
+- Pull reviewer claim tokens are compared in constant time and never appear in results, reports or the inbox's review pages.
+- `codex-review` builds its scratch git repo inside the round folder, with your global and system git config ignored and filters and line-ending conversion switched off.
 - Every agent session starts its own review-bus server. A review records which process runs it, so other sessions leave a running review alone and only mark it failed once that process is gone.
 
-## Known limits (v0.1)
+## Known limits
 
 Found when review-bus reviewed itself with Codex, and not fixed yet:
 
@@ -271,8 +336,10 @@ Found when review-bus reviewed itself with Codex, and not fixed yet:
 - **Private addresses from public pages, what is left.** A public page cannot load anything from a private address (your machine, your network), and a redirect into one stops the capture. But that one redirected request is still made before the capture stops, and a name that resolves differently for Chrome than for review-bus (DNS rebinding) is not caught. Pages you submit from your own dev server are not restricted.
 - **Changing a reviewer's type or vendor while a session is open.** Approvals and the command are read again before each round, but which default reviewer is picked and its model and effort still follow the config the session started with. Start a new session after such a change.
 - **A rubric made confidential during a resubmit** is checked with the rules it had when the review started.
-- **Slow pages and the review ID.** `review_submit` returns the review ID only after the snapshot is taken, so a very slow page can take longer than the client waits.
-- **Sign-off.** `rb signoff` records whatever name it is given, and anything that can run commands in your terminal (an agent included) can run it. This is a deliberate choice for v0.1, not an oversight.
+- **Slow pages on resubmit.** A new review returns its id before slow page capture (see Waiting and timeouts), but a resubmit still captures the pages before it returns. Clients that show progress are not affected.
+- **Who may act as a pull reviewer.** Without `claim_clients`, any connected MCP client can claim a pull reviewer's work, the author's own agent included. MCP client names are what the client says it is, so `claim_clients` keeps honest clients apart rather than stopping a determined one.
+- **The inbox and the HTTP token.** One token opens everything, the same trust as your terminal: whoever has it can claim work, post answers and sign off. The HTTP server speaks plain HTTP; keep it on this machine or put TLS in front.
+- **Sign-off.** `rb signoff` and the inbox record whatever name they are given, and anything that can run commands in your terminal (an agent included) can run it. This is a deliberate choice, not an oversight.
 
 ## Development
 
