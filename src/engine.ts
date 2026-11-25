@@ -353,6 +353,11 @@ export class Engine {
     };
   }
 
+  /** Resolves when every round running in this process has finished. */
+  async idle(): Promise<void> {
+    while (this.running.size) await Promise.allSettled([...this.running.values()]);
+  }
+
   /** Resolves when this process's round for the review has fully finished (reviewers exited). */
   async settled(id: string): Promise<void> {
     await this.running.get(id);

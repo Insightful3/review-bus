@@ -1,6 +1,16 @@
 #!/usr/bin/env node
+import {
+  InMemoryTaskMessageQueue,
+  InMemoryTaskStore,
+  type CreateTaskRequestHandlerExtra,
+  type TaskRequestHandlerExtra,
+  type ToolTaskHandler,
+} from "@modelcontextprotocol/sdk/experimental/tasks/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { appendFileSync } from "node:fs";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { Engine } from "./engine.js";
@@ -82,8 +92,83 @@ function errorReply(err: unknown) {
   return { isError: true, content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }] };
 }
 
-export function createServer(engine: Engine): McpServer {
-  const server = new McpServer({ name: "review-bus", version: "0.1.0" });
+/** What a tool returns now, and (for a task call) what it resolves to once the review is done. */
+interface Outcome {
+  now: CallToolResult;
+  later?: Promise<CallToolResult>;
+}
+
+/** Task results stay available this long; a task's lifetime counts from creation in the SDK store. */
+const TASK_TTL_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * MCP Tasks (SPEC 4): review_submit, review_respond and review_wait accept task-augmented calls.
+ * A task call returns a task at once and completes it when the round finishes; storing the result
+ * sends notifications/tasks/status, which wakes the client instead of it polling review_wait.
+ * Plain calls behave exactly as before (waits capped at max_wait_seconds).
+ *
+ * The SDK gives createTask the same inputs for both kinds of call, so the transport records which
+ * request ids carried params.task: see trackTaskRequests.
+ */
+export function createServer(engine: Engine): { server: McpServer; trackTaskRequests: (transport: Transport) => void; taskStore: InMemoryTaskStore } {
+  const taskStore = new InMemoryTaskStore();
+  const server = new McpServer(
+    { name: "review-bus", version: "0.1.0" },
+    { capabilities: { tasks: { requests: { tools: { call: {} } } } }, taskStore, taskMessageQueue: new InMemoryTaskMessageQueue() },
+  );
+  const taskRequests = new Set<string | number>();
+  const trackTaskRequests = (transport: Transport) => {
+    const deliver = transport.onmessage;
+    transport.onmessage = (message, extra) => {
+      const m = message as { id?: string | number; method?: string; params?: { task?: unknown } };
+      if (m.method === "tools/call" && m.id !== undefined && m.params?.task) taskRequests.add(m.id);
+      // Opt-in diagnostics: which tool calls arrive, and whether as tasks (REVIEW_BUS_LOG=<file>).
+      if (process.env.REVIEW_BUS_LOG && m.method) {
+        const name = (m.params as { name?: string } | undefined)?.name;
+        const detail = m.method === "initialize" || m.method === "server/discover" ? { params: m.params } : {};
+        appendFileSync(process.env.REVIEW_BUS_LOG, JSON.stringify({ at: new Date().toISOString(), method: m.method, tool: name ?? null, task: Boolean(m.params?.task), ...detail }) + "\n");
+      }
+      deliver?.(message, extra);
+    };
+  };
+
+  /** Resolves once the review's current round is over, wherever it runs. */
+  const untilDone = async (id: string) => {
+    while (engine.get(id).state === "in_review") await engine.waitFor(id, 30);
+    return engine.get(id);
+  };
+
+  const registerTaskTool = <Shape extends Record<string, z.ZodTypeAny>>(
+    name: string,
+    config: { description: string; inputSchema: Shape },
+    run: (args: z.infer<z.ZodObject<Shape>>, asTask: boolean) => Promise<Outcome>,
+  ) => {
+    const handler = {
+        createTask: async (args: unknown, extra: CreateTaskRequestHandlerExtra) => {
+          const asTask = taskRequests.delete(extra.requestId);
+          const task = await extra.taskStore.createTask({ ttl: Math.max(extra.taskRequestedTtl ?? 0, TASK_TTL_MS), pollInterval: 2000 });
+          let outcome: Outcome;
+          try {
+            outcome = await run(args as z.infer<z.ZodObject<Shape>>, asTask);
+          } catch (err) {
+            outcome = { now: errorReply(err) };
+          }
+          if (asTask && outcome.later) {
+            void outcome.later
+              .catch((err) => errorReply(err))
+              .then((result) => extra.taskStore.storeTaskResult(task.taskId, "completed", result))
+              .catch((err) => console.error(`review-bus: could not complete task ${task.taskId}: ${(err as Error).message}`));
+            return { task };
+          }
+          // Plain call, or nothing to wait for: complete at once so the caller gets the answer now.
+          await extra.taskStore.storeTaskResult(task.taskId, "completed", outcome.now);
+          return { task: await extra.taskStore.getTask(task.taskId) };
+        },
+        getTask: async (_args: unknown, extra: TaskRequestHandlerExtra) => extra.taskStore.getTask(extra.taskId),
+        getTaskResult: async (_args: unknown, extra: TaskRequestHandlerExtra) => (await extra.taskStore.getTaskResult(extra.taskId)) as CallToolResult,
+    };
+    server.experimental.tasks.registerToolTask(name, { ...config, execution: { taskSupport: "optional" } }, handler as unknown as ToolTaskHandler<Shape>);
+  };
 
   const cap = (seconds: number) => Math.min(seconds, engine.config.max_wait_seconds);
 
@@ -95,14 +180,15 @@ export function createServer(engine: Engine): McpServer {
     return { client, vendor, vendor_source: vendor ? "client" : "unknown" };
   };
 
-  server.registerTool(
+  registerTaskTool(
     "review_submit",
     {
       description:
         "Submit work for review by other agents: a document (.md, .txt, .docx, .pdf), a git change ({git: {repo, mode}}), " +
         "and/or web pages to render and screenshot (pages: URLs, for example a local dev server). " +
         "Reviewers run read-only on a frozen snapshot. Returns review_id and state; returns the full result if the round finishes within wait_seconds " +
-        "(capped at the server's max_wait_seconds, default 50, to stay under client timeouts). Reviews often take minutes: poll review_wait until state is not in_review.",
+        "(capped at the server's max_wait_seconds, default 50, to stay under client timeouts). Reviews often take minutes: poll review_wait until state is not in_review. " +
+        "Called as an MCP task, it returns at once and the task completes with the result when the round finishes.",
       inputSchema: {
         artifact: z
           .union([z.string(), z.object({ git: GitSpec })])
@@ -135,31 +221,28 @@ export function createServer(engine: Engine): McpServer {
         wait_seconds: z.number().int().min(0).max(600).default(0),
       },
     },
-    async (args) => {
-      try {
-        const review = await engine.submit(
-          {
-            artifact: args.artifact === undefined ? null : typeof args.artifact === "string" ? { path: args.artifact } : { git: args.artifact.git },
-            pages: args.pages,
-            related: args.related,
-            rubric: args.rubric,
-            intent: args.intent,
-            assumptions: args.assumptions,
-            criteria: args.criteria,
-            reviewers: args.reviewers.map((r) => (typeof r === "string" ? { name: r } : r)),
-            stage: args.stage,
-          },
-          detectAuthor(args.author_vendor),
-          cap(args.wait_seconds),
-        );
-        if (review.state === "in_review") {
-          const next = "Reviewers are working. Call review_wait with this review_id until state is not in_review, then review_result.";
-          return { content: [{ type: "text" as const, text: JSON.stringify({ review_id: review.id, state: review.state, next }) }] };
-        }
-        return reply(review, false);
-      } catch (err) {
-        return errorReply(err);
-      }
+    async (args, asTask) => {
+      const review = await engine.submit(
+        {
+          artifact: args.artifact === undefined ? null : typeof args.artifact === "string" ? { path: args.artifact } : { git: args.artifact.git },
+          pages: args.pages,
+          related: args.related,
+          rubric: args.rubric,
+          intent: args.intent,
+          assumptions: args.assumptions,
+          criteria: args.criteria,
+          reviewers: args.reviewers.map((r) => (typeof r === "string" ? { name: r } : r)),
+          stage: args.stage,
+        },
+        detectAuthor(args.author_vendor),
+        asTask ? 0 : cap(args.wait_seconds),
+      );
+      if (review.state !== "in_review") return { now: reply(review, false) };
+      const next = "Reviewers are working. Call review_wait with this review_id until state is not in_review, then review_result.";
+      return {
+        now: { content: [{ type: "text" as const, text: JSON.stringify({ review_id: review.id, state: review.state, next }) }] },
+        later: untilDone(review.id).then((r) => reply(r, false)),
+      };
     },
   );
 
@@ -199,32 +282,31 @@ export function createServer(engine: Engine): McpServer {
     },
   );
 
-  server.registerTool(
+  registerTaskTool(
     "review_wait",
     {
       description:
-        "Block until the current round finishes or the time runs out, then return the status. seconds is capped at the server's max_wait_seconds (default 50); call again while state is in_review.",
+        "Block until the current round finishes or the time runs out, then return the status. seconds is capped at the server's max_wait_seconds (default 50); call again while state is in_review. " +
+        "Called as an MCP task, it completes when the round finishes, with no cap.",
       inputSchema: { review_id: z.string(), seconds: z.number().int().min(1).max(600).default(50) },
     },
-    async (args) => {
-      try {
-        engine.get(args.review_id); // validates the id
-        const waited = cap(args.seconds);
-        await engine.waitFor(args.review_id, waited);
-        return jsonReply({ ...status(engine.get(args.review_id)), waited_seconds: waited, ...(waited < args.seconds ? { wait_capped: true } : {}) });
-      } catch (err) {
-        return errorReply(err);
-      }
+    async (args, asTask) => {
+      engine.get(args.review_id); // validates the id
+      if (asTask) return { now: jsonReply(status(engine.get(args.review_id))), later: untilDone(args.review_id).then((r) => jsonReply(status(r))) };
+      const waited = cap(args.seconds);
+      await engine.waitFor(args.review_id, waited);
+      return { now: jsonReply({ ...status(engine.get(args.review_id)), waited_seconds: waited, ...(waited < args.seconds ? { wait_capped: true } : {}) }) };
     },
   );
 
-  server.registerTool(
+  registerTaskTool(
     "review_respond",
     {
       description:
         "Answer findings of the latest round: accepted, rejected (reason required) or deferred. Every blocking finding needs an answer. " +
         "With resubmit=true, starts the next round on a fresh snapshot of the document (or of artifact, if given). " +
-        "With resubmit=false and every blocking finding answered, closes the review (approved, or awaiting_signoff when the rubric requires a person; the person then signs off with rb signoff, not an agent).",
+        "With resubmit=false and every blocking finding answered, closes the review (approved, or awaiting_signoff when the rubric requires a person; the person then signs off with rb signoff). " +
+        "Called as an MCP task with resubmit=true, the task completes with the next round's result.",
       inputSchema: {
         review_id: z.string(),
         responses: z
@@ -241,20 +323,18 @@ export function createServer(engine: Engine): McpServer {
         wait_seconds: z.number().int().min(0).max(600).default(0),
       },
     },
-    async (args) => {
-      try {
-        const { review, unanswered } = await engine.respond(args.review_id, args.responses, {
-          resubmit: args.resubmit,
-          artifact: args.artifact,
-          waitSeconds: cap(args.wait_seconds),
-        });
-        if (review.state === "in_review") return jsonReply({ ...status(review), unanswered });
-        const r = reply(review, false);
-        r.content.push({ type: "text" as const, text: JSON.stringify({ unanswered }) });
-        return r;
-      } catch (err) {
-        return errorReply(err);
+    async (args, asTask) => {
+      const { review, unanswered } = await engine.respond(args.review_id, args.responses, {
+        resubmit: args.resubmit,
+        artifact: args.artifact,
+        waitSeconds: asTask ? 0 : cap(args.wait_seconds),
+      });
+      if (review.state === "in_review") {
+        return { now: jsonReply({ ...status(review), unanswered }), later: untilDone(review.id).then((r) => reply(r, false)) };
       }
+      const r = reply(review, false);
+      r.content.push({ type: "text" as const, text: JSON.stringify({ unanswered }) });
+      return { now: r };
     },
   );
 
@@ -305,13 +385,20 @@ export function createServer(engine: Engine): McpServer {
     },
   );
 
-  return server;
+  return { server, trackTaskRequests, taskStore };
 }
 
 async function main() {
   const engine = new Engine(loadConfig());
-  const server = createServer(engine);
-  await server.connect(new StdioServerTransport());
+  const { server, trackTaskRequests, taskStore } = createServer(engine);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  trackTaskRequests(transport);
+  // When the client disconnects, let running rounds finish (their results are saved), then clear the
+  // task store's timers so the process can exit instead of waiting out task lifetimes.
+  server.server.onclose = () => {
+    void engine.idle().then(() => taskStore.cleanup());
+  };
 }
 
 main().catch((err) => {

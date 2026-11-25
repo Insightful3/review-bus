@@ -149,6 +149,10 @@ Each reviewer runs with a model and an effort level (`low`, `medium`, `high`, `x
 
 The model and effort that actually ran are recorded on every finding as `reviewer:model:effort`, for example `codex:gpt-6.1-sol:high`.
 
+### Tasks
+
+`review_submit`, `review_respond` (with `resubmit`) and `review_wait` can be called as MCP tasks (2025-11-25 form): the call returns at once and the task completes with the result when the round finishes. Clients that do not use tasks are unaffected. Claude Code 2.1.316 does not use this form yet (it expects the 2026-07-28 Tasks extension), so it keeps polling `review_wait`. To see how a client calls review-bus, set `REVIEW_BUS_LOG` to a file path in the server's environment: every request is logged with whether it came as a task.
+
 ### Several reviewers
 
 With more than one reviewer, the same problem usually comes back from each of them in different words. review-bus merges these: the highest-risk version is kept, `agreement` counts how many reviewers raised it, and `also_raised_by` lists the others' versions. Set `merge_with` to let a cheap model do the grouping (in a test on a real proposal, Claude Haiku grouped all five shared findings correctly in 5 seconds for a fraction of a cent). Without it, only near-identical findings are merged, because word-based matching cannot tell "the launch date is unconditional" and "the go-live date is stated as fixed" are the same problem without also merging unrelated findings. The merge model sees the findings and their quotes, so for a rubric with `allowed_reviewers` it is only used if it is on that list.

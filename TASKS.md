@@ -54,5 +54,6 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [ ] Return the review_id before slow page capture (self-review round 2, f10). Trade-off: snapshot errors would then arrive as a failed review, not as an error on review_submit.
 - [ ] Optional `model` for Codex in `~/.review-bus/config.json`: reviewers ignore `~/.codex/config.toml` now, so they use Codex's default model.
 - [ ] Optional `codex exec review` native pass (SPEC 8)
-- [ ] MCP Tasks so Claude Code is woken when a result lands (v0.2)
+- [x] MCP Tasks, 2025-11-25 form (task-capable submit, respond, wait; tested with the SDK client)
+- [ ] MCP Tasks for Claude Code: 2026-07-28 Tasks extension (`io.modelcontextprotocol/tasks`). Needs the v2 SDK (`@modelcontextprotocol/server` 2.x, `server/discover`) and a hand-written server side: `resultType: "task"`, `tasks/get`, `tasks/update`, `tasks/cancel`, optional `notifications/tasks`. Claude Code 2.1.316 declares the extension but uses plain calls with us today.
 - [ ] HTTP transport, web inbox, pull-mode reviewers (v0.2+)

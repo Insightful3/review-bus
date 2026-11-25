@@ -59,7 +59,11 @@ Rules settled while building slice 2:
 | `review_list` | optional state filter | recent reviews |
 | `review_cancel` | `review_id` | `canceled` |
 
-Long rounds run in the background inside the server process. MCP Tasks (protocol 2026-07-28, supported by Claude Code CLI from v2.1.304) come in v0.2 so Claude Code is woken when a result lands.
+Long rounds run in the background inside the server process.
+
+**MCP Tasks.** `review_submit`, `review_respond` and `review_wait` accept task-augmented calls in the 2025-11-25 form (`execution.taskSupport: "optional"`, `tasks/get`, `tasks/result`, `notifications/tasks/status`): a task call returns at once and completes when the round finishes; plain calls behave as before. The SDK gives the tool handler no way to tell the two apart, so the server notes which request ids carried `params.task` at the transport.
+
+Checked on 25 Nov 2026 with `REVIEW_BUS_LOG`: Claude Code 2.1.316 does not use this form. It opens with `server/discover` on protocol 2026-07-28 and declares tasks only as the extension `io.modelcontextprotocol/tasks`, then falls back to 2025-11-25 and calls the tools plainly. In the 2026-07-28 Tasks extension the server decides per request to answer with `resultType: "task"` when the request declares the extension, and implements `tasks/get`, `tasks/update` and `tasks/cancel` (optionally `notifications/tasks` after `subscriptions/listen`). That needs the v2 SDK (`@modelcontextprotocol/server`, which implements 2026-07-28) and a hand-written server side of the extension (`@modelcontextprotocol/ext-tasks` is client-side). Until then Claude Code polls `review_wait`.
 
 ## 5. Data shapes
 
