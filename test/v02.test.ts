@@ -2,7 +2,7 @@
 // before slow page capture, and Codex's native review pass (with a fake codex).
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -288,6 +288,8 @@ test("web inbox: login, list, a person reviews as a pull reviewer, then signs of
   assert.equal((await get(`inbox/review/${review.id}/file/review.json`)).status, 404);
   assert.equal((await get(`inbox/review/${review.id}/file/r1/..%2F..%2Freview.json`)).status, 404);
   assert.equal((await get(`inbox/review/${review.id}/file/r1/artifact.md`)).status, 200);
+  symlinkSync(configFile, path.join(tmp, "reviews", review.id, "r1", "leak.md"));
+  assert.equal((await get(`inbox/review/${review.id}/file/r1/leak.md`)).status, 404);
 
   const signed = await post(`inbox/review/${review.id}/signoff`, new URLSearchParams({ by: "Ana", note: "Checked." }));
   assert.equal(signed.status, 303);

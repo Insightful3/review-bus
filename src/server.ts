@@ -121,7 +121,7 @@ const TASK_TTL_MS = 2 * 60 * 60 * 1000;
 export function createServer(engine: Engine): { server: McpServer; trackTaskRequests: (transport: Transport) => void; taskStore: InMemoryTaskStore } {
   const taskStore = new InMemoryTaskStore();
   const server = new McpServer(
-    { name: "review-bus", version: "0.1.0" },
+    { name: "review-bus", version: "0.2.0" },
     {
       capabilities: { tasks: { requests: { tools: { call: {} } } } },
       taskStore,

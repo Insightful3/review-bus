@@ -4,7 +4,7 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -199,7 +199,15 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
             return;
           }
           const file = path.join(engine.store.dir(id), rel);
-          if (!existsSync(file)) {
+          // A reviewed repo can track a symlink (it lands in r<n>/tree): never follow one out of the review.
+          const inside = (() => {
+            try {
+              return realpathSync(file).startsWith(realpathSync(engine.store.dir(id)) + path.sep);
+            } catch {
+              return false;
+            }
+          })();
+          if (!inside || !existsSync(file)) {
             send(res, 404, "Not found", "text/plain");
             return;
           }

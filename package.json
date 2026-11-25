@@ -1,6 +1,6 @@
 {
   "name": "review-bus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cross-agent review layer: agents submit work, other agents or people review it, the verdict comes back as structured state.",
   "license": "Apache-2.0",
   "type": "module",
