@@ -65,7 +65,35 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
     throw new Error(`rb serve listens on this machine only (127.0.0.1). To listen on ${opts.host}, set http.allow_remote: true and put TLS in front: the token travels with every request.`);
   }
   const token = loadToken(cfg.token_file);
-  const sessions = new Map<string, { transport: StreamableHTTPServerTransport; close: () => Promise<void> }>();
+  // MCP sessions: a client that dies without ending its session would leave it here for good, so
+  // sessions with no request open are closed after SESSION_IDLE_MS, and at most MAX_SESSIONS are kept.
+  const sessions = new Map<string, { transport: StreamableHTTPServerTransport; close: () => Promise<void>; lastSeen: number; open: number }>();
+  const SESSION_IDLE_MS = Number(process.env.REVIEW_BUS_SESSION_IDLE_MS ?? 60 * 60 * 1000);
+  const MAX_SESSIONS = 100;
+  const sweep = () => {
+    const idle = [...sessions.entries()].filter(([, s]) => s.open === 0).sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+    let excess = sessions.size - MAX_SESSIONS;
+    for (const [id, s] of idle) {
+      if (Date.now() - s.lastSeen > SESSION_IDLE_MS || excess > 0) {
+        sessions.delete(id);
+        excess--;
+        void s.close();
+      }
+    }
+  };
+  const sweeper = setInterval(sweep, Math.min(60_000, Math.max(50, SESSION_IDLE_MS / 2)));
+  sweeper.unref();
+  /** Counts a request as open on its session until the response ends (long waits, SSE streams). */
+  const track = (id: string, res: http.ServerResponse) => {
+    const s = sessions.get(id);
+    if (!s) return;
+    s.open++;
+    s.lastSeen = Date.now();
+    res.on("close", () => {
+      s.open--;
+      s.lastSeen = Date.now();
+    });
+  };
   let port = opts.port;
 
   /** Blocks DNS rebinding: a page on another site that resolves its name to 127.0.0.1. */
@@ -79,6 +107,8 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
   // A browser's Origin must be this very server (host and port): SameSite cookies ignore ports, so a
   // page on another port of the same host could otherwise post to the inbox with the session.
   const publicOrigin = cfg.public_origin ? new URL(cfg.public_origin).origin : null;
+  const viaPublicHttps = (req: http.IncomingMessage) =>
+    Boolean(cfg.public_origin) && new URL(cfg.public_origin!).protocol === "https:" && (req.headers.host ?? "").toLowerCase() === new URL(cfg.public_origin!).host.toLowerCase();
   const originOk = (req: http.IncomingMessage) => {
     const origin = req.headers.origin;
     if (!origin) return true;
@@ -136,6 +166,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
     }
     const existing = sessionId ? sessions.get(sessionId) : undefined;
     if (existing) {
+      track(sessionId!, res);
       await existing.transport.handleRequest(req, res, body);
       return;
     }
@@ -152,7 +183,11 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           close: async () => {
             await transport.close().catch(() => {});
           },
+          lastSeen: Date.now(),
+          open: 0,
         });
+        track(id, res);
+        if (sessions.size > MAX_SESSIONS) sweep();
       },
     });
     transport.onclose = () => {
@@ -177,7 +212,8 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           sessionsByCookie.set(session, Date.now() + SESSION_MS);
           res.writeHead(303, {
             location: "/inbox",
-            "set-cookie": `${cookieName()}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}`,
+            // Secure when people come through the HTTPS public origin: the cookie never goes over plain HTTP.
+            "set-cookie": `${cookieName()}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}${viaPublicHttps(req) ? "; Secure" : ""}`,
             ...SECURITY_HEADERS,
           });
           res.end();
@@ -215,7 +251,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
         }
         if (req.method === "POST" && parts[2] === "release" && parts[3]) {
           const form = new URLSearchParams(await readBody(req, 64 * 1024));
-          engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`, form.get("claimed_at") ?? "");
+          engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`, form.get("claim_id") ?? "");
           res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent("Claim released.")}`, ...SECURITY_HEADERS });
           res.end();
           return;
@@ -262,7 +298,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           try {
             html = renderClaimPage(engine, work, form.get("by") ?? "");
           } catch (err) {
-            engine.release(id, reviewer, "web inbox (the page could not be shown)", work.claimed_at);
+            engine.release(id, reviewer, "web inbox (the page could not be shown)", work.claim_id);
             throw err;
           }
           send(res, 200, html);
@@ -321,6 +357,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
     server,
     url: `http://${shownHost}:${port}/`,
     close: async () => {
+      clearInterval(sweeper);
       for (const s of sessions.values()) await s.close();
       const closed = new Promise<void>((r) => server.close(() => r()));
       server.closeAllConnections(); // open SSE streams would keep close() waiting

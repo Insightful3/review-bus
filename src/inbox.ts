@@ -92,7 +92,8 @@ function table(rows: string[], empty: string): string {
 export function renderInbox(engine: Engine): string {
   const reviews = engine.list(undefined, 100);
   const pending = engine.pending();
-  const decide = reviews.filter((r) => r.state === "awaiting_signoff" || r.state === "escalated");
+  // Every review waiting for a decision, however old: not only those among the 100 most recent.
+  const decide = [...engine.list("awaiting_signoff", 100_000), ...engine.list("escalated", 100_000)].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const work = pending.length
     ? `<div class="scroll"><table><thead><tr><th>Review</th><th>Reviewer</th><th>Rubric</th><th>Status</th><th>Due</th></tr></thead><tbody>${pending
         .map(
@@ -128,7 +129,7 @@ export function renderReviewPage(engine: Engine, id: string, msg: string | null)
     .map(
       (r) => `<form method="post" action="/inbox/review/${esc(id)}/release/${esc(r.name)}" class="card"><h3>${esc(r.name)} is claimed by ${esc(r.claim!.by)}</h3>
 <p class="muted">Claimed ${esc(fmt(r.claim!.at))}. If that review will not be finished (a closed tab, the wrong person), release the claim so someone else can take it.</p>
-<input type="hidden" name="claimed_at" value="${esc(r.claim!.at)}">
+<input type="hidden" name="claim_id" value="${esc(r.claim!.id)}">
 <label>Your name<input type="text" name="by" aria-label="Your name" required></label><p><button class="secondary">Release the claim</button></p></form>`,
     )
     .join("");

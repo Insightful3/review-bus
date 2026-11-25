@@ -97,6 +97,8 @@ export function loadRubric(name: string, rubricPaths: string[], packs: RubricPac
   } catch (err) {
     throw new Error(`Rubric "${name}" (${file}): ${(err as Error).message}`);
   }
+  const problems = metaProblems(parsed.meta);
+  if (problems.length) throw new Error(`Rubric "${name}" (${file}) cannot be used: ${problems.join("; ")}. Run rb rubric-check on it.`);
   return { name, file, body: parsed.body.trim(), meta: parsed.meta };
 }
 
@@ -163,6 +165,17 @@ export function checkRubric(text: string): string[] {
   const anchors = body.split("## Impact anchors")[1] ?? "";
   for (const level of ["critical:", "high:", "medium:", "low:"]) if (!anchors.includes(level)) problems.push(`Impact anchors lack "${level}"`);
   if (text.includes("—")) problems.push("contains an em dash");
+  problems.push(...metaProblems(meta));
+  return problems;
+}
+
+/**
+ * Front matter values of the wrong type or with an unknown key. Checked by rb rubric-check and on
+ * every load: a "confidential: \"true\"" (text) or a misspelt key must not quietly turn a
+ * confidential rubric into an ordinary one.
+ */
+export function metaProblems(meta: Record<string, unknown>): string[] {
+  const problems: string[] = [];
   if (meta.effort !== undefined && !Effort.safeParse(meta.effort).success) problems.push(`effort "${String(meta.effort)}" is not one of ${Effort.options.join(", ")}`);
   for (const k of FLAGS) if (meta[k] !== undefined && typeof meta[k] !== "boolean") problems.push(`${k} must be true or false`);
   if (meta.models !== undefined && (typeof meta.models !== "object" || meta.models === null || Object.values(meta.models).some((v) => typeof v !== "string"))) {

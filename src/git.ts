@@ -1,6 +1,7 @@
 // Git snapshots (SPEC 3). Never writes to the author's repo: patches come from `git diff`, and the
 // reviewers' copy is `git archive <base>` plus the patch, inside the review folder.
 import { spawnSync } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -141,6 +142,26 @@ function countLines(patch: string): { insertions: number; deletions: number } {
  * Records the change as base SHA + patch and builds the reviewers' copy at r<n>/tree.
  * Returns the info, the patch text and a hash that identifies this exact change.
  */
+/** snapshotGit in a worker thread (git-worker.ts), so the event loop keeps serving meanwhile. */
+export function snapshotGitAsync(spec: GitSpec, reviewDir: string, round: number): Promise<{ info: GitInfo; patch: string; sha256: string }> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./git-worker.js", import.meta.url), { workerData: { spec, reviewDir, round } });
+    let settled = false;
+    worker.once("message", (m: { ok: boolean; result?: { info: GitInfo; patch: string; sha256: string }; noChanges?: boolean; message?: string }) => {
+      settled = true;
+      if (m.ok) resolve(m.result!);
+      else reject(m.noChanges ? new NoChangesError(m.message) : new Error(m.message));
+    });
+    worker.once("error", (err) => {
+      settled = true;
+      reject(err);
+    });
+    worker.once("exit", (code) => {
+      if (!settled) reject(new Error(`the git snapshot stopped unexpectedly (exit ${code})`));
+    });
+  });
+}
+
 export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { info: GitInfo; patch: string; sha256: string } {
   const repo = path.resolve(expandHome(spec.repo));
   const root = git(repo, ["rev-parse", "--show-toplevel"]).trim();

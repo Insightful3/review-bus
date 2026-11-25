@@ -182,13 +182,24 @@ function scratchGit(cwd: string, args: string[], input?: Buffer): void {
 export function gitlinksAfter(patch: Buffer): { path: string; sha: string }[] {
   const out: { path: string; sha: string }[] = [];
   let target: string | null = null;
+  // Only a file git itself marks as a submodule (mode 160000 in the header, before the first hunk)
+  // counts; a "Subproject commit" line in an ordinary file's content is just text.
+  let gitlink = false;
+  let inHeader = false;
   for (const line of patch.toString("latin1").split("\n")) {
-    if (line.startsWith("diff --git ")) target = null;
-    else if (line.startsWith("+++ ")) {
+    if (line.startsWith("diff --git ")) {
+      target = null;
+      gitlink = false;
+      inHeader = true;
+    } else if (inHeader && line.startsWith("@@")) {
+      inHeader = false;
+    } else if (inHeader && (/^index [0-9a-f]+\.\.[0-9a-f]+ 160000$/.test(line) || /^(new file|new) mode 160000$/.test(line))) {
+      gitlink = true;
+    } else if (inHeader && line.startsWith("+++ ")) {
       const raw = line.slice(4).trim();
       const unq = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
       target = unq.startsWith("b/") ? Buffer.from(unq.slice(2), "latin1").toString("utf8") : null;
-    } else if (target && /^\+Subproject commit [0-9a-f]{40,64}$/.test(line)) {
+    } else if (!inHeader && gitlink && target && /^\+Subproject commit [0-9a-f]{40,64}$/.test(line)) {
       out.push({ path: target, sha: line.split(" ").at(-1)! });
     }
   }
@@ -222,6 +233,9 @@ Rules:
  */
 async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
   if (!job.git) throw new Error("codex-review reviews git changes only; use the codex reviewer for documents and pages.");
+  // One deadline for everything (scratch repo, review, conversion): the reviewer's timeout_seconds,
+  // so the round never runs longer than other processes allow for it.
+  const deadline = Date.now() + cfg.timeout_seconds * 1000;
   const native = path.join(job.outDir, `${job.reviewerName}.native`);
   rmSync(native, { recursive: true, force: true });
   // verbatimSymlinks: a relative link must stay relative, or the reverse patch no longer matches it.
@@ -245,12 +259,14 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
 
   const outFile = path.join(job.outDir, `${job.reviewerName}.native.md`);
   const args = ["exec", "review", "--uncommitted", ...codexIsolation(), "--output-last-message", outFile, ...codexModelArgs(job), ...cfg.args];
-  const r = await runProcess(cfg.command, args, { cwd: native, stdin: "", timeoutMs: cfg.timeout_seconds * 1000, signal: job.signal });
+  const r = await runProcess(cfg.command, args, { cwd: native, stdin: "", timeoutMs: Math.max(1000, deadline - Date.now()), signal: job.signal });
   writeFileSync(path.join(job.outDir, `${job.reviewerName}.log.txt`), `${r.stdout}\n--- stderr ---\n${r.stderr}`);
   if (r.code !== 0 || r.timedOut) throw new Error(describeFailure("codex exec review", r));
   const text = readFileSync(outFile, "utf8").trim();
   if (!text) throw new Error("codex exec review returned no review text");
-  const converted = await runCodex(cfg, { ...job, reviewerName: `${job.reviewerName}.convert`, prompt: `${CONVERT_PROMPT}${text}\n</review>\n`, images: [], git: undefined });
+  const left = Math.floor((deadline - Date.now()) / 1000);
+  if (left < 5) throw new Error(`codex exec review used the reviewer's time (timeout_seconds ${cfg.timeout_seconds}); no time was left to convert its answer.`);
+  const converted = await runCodex({ ...cfg, timeout_seconds: left }, { ...job, reviewerName: `${job.reviewerName}.convert`, prompt: `${CONVERT_PROMPT}${text}\n</review>\n`, images: [], git: undefined });
   // The review itself is what ran; the conversion is bookkeeping.
   return { json: converted.json, ...codexReported(`${r.stderr}\n${r.stdout}`) };
 }

@@ -553,12 +553,12 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         review_id: z.string(),
         reviewer: z.string(),
         by: z.string().describe("Who releases it"),
-        claimed_at: z.string().describe("claimed_at of the claim you give up, from review_claim or review_pending"),
+        claim_id: z.string().describe("claim_id of the claim you give up, from review_claim or review_pending"),
       },
     },
     async (args) => {
       try {
-        return jsonReply(status(engine.release(args.review_id, args.reviewer, args.by, args.claimed_at)));
+        return jsonReply(status(engine.release(args.review_id, args.reviewer, args.by, args.claim_id)));
       } catch (err) {
         return errorReply(err);
       }

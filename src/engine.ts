@@ -81,6 +81,7 @@ export interface PendingWork {
   status: "waiting" | "claimed";
   claimed_by: string | null;
   claimed_at: string | null;
+  claim_id: string | null;
   deadline: string | null;
   rubric: string;
   intent: string;
@@ -95,8 +96,9 @@ export interface ClaimedWork {
   reviewer: string;
   /** Pass it to review_post. */
   token: string;
-  /** Names this claim; pass it to review_release to give the work back. */
   claimed_at: string;
+  /** Names this claim (not secret); pass it to review_release to give the work back. */
+  claim_id: string;
   deadline: string | null;
   round_dir: string;
   /** The work: the document as Markdown or the change, the project copy, screenshots, related documents. */
@@ -829,6 +831,7 @@ export class Engine {
           status: run.status === "waiting" ? "waiting" : "claimed",
           claimed_by: run.claim?.by ?? null,
           claimed_at: run.claim?.at ?? null,
+          claim_id: run.claim?.id ?? null,
           deadline: run.deadline ?? null,
           rubric: r.request.rubric,
           intent: r.request.intent,
@@ -864,6 +867,8 @@ export class Engine {
     const token = randomBytes(16).toString("hex");
     let n = 0;
     let claimedAt = "";
+    // Unique per claim, unlike a timestamp: two claims in the same millisecond stay apart.
+    const claimId = randomBytes(6).toString("hex");
     const review = this.store.update(id, (r) => {
       if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; there is nothing to claim.`);
       const round = r.rounds.at(-1)!;
@@ -877,7 +882,7 @@ export class Engine {
       run.status = "running";
       run.started_at = now();
       claimedAt = now();
-      run.claim = { by: who.by.trim(), client: who.client, at: claimedAt, token_sha256: sha256(token) };
+      run.claim = { id: claimId, by: who.by.trim(), client: who.client, at: claimedAt, token_sha256: sha256(token) };
       r.history.push({ at: now(), event: "claimed", detail: `${reviewer} by ${who.by.trim()}${who.client ? ` (${who.client})` : ""}` });
       n = round.n;
     });
@@ -895,6 +900,7 @@ export class Engine {
       reviewer,
       token,
       claimed_at: claimedAt,
+      claim_id: claimId,
       deadline: round.reviewers.find((x) => x.name === reviewer)!.deadline ?? null,
       round_dir: this.store.roundDir(id, n),
       files: files.map((f) => path.join(dir, f)),
@@ -972,18 +978,18 @@ export class Engine {
 
   /** Gives up a claim (an abandoned browser tab, the wrong person): the work waits for a new claim. */
   /**
-   * claimedAt names the claim being given up (its claimed_at, from the claim or from pending): a
-   * release repeated after someone else claimed the work again must not drop the newer claim.
+   * claimId names the claim being given up (claim_id, from the claim or from pending): a release
+   * repeated after someone else claimed the work again must not drop the newer claim.
    */
-  release(id: string, reviewer: string, by: string, claimedAt: string): Review {
-    if (!claimedAt) throw new Error("Releasing needs claimed_at: the time of the claim you are giving up (review_claim and review_pending show it).");
+  release(id: string, reviewer: string, by: string, claimId: string): Review {
+    if (!claimId) throw new Error("Releasing needs claim_id: the id of the claim you are giving up (review_claim and review_pending show it).");
     this.get(id);
     return this.store.update(id, (r) => {
       if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; there is no claim to release.`);
       const run = r.rounds.at(-1)!.reviewers.find((x) => x.name === reviewer);
       if (!run || run.adapter !== "pull" || run.status !== "running" || !run.claim) throw new Error(`Reviewer "${reviewer}" of review ${id} is not claimed.`);
       // A release from an old page must not drop a newer claim.
-      if (run.claim.at !== claimedAt) throw new Error(`Reviewer "${reviewer}" was claimed again since (by ${run.claim.by}); nothing was released.`);
+      if (run.claim.id !== claimId) throw new Error(`Reviewer "${reviewer}" was claimed again since (by ${run.claim.by}); nothing was released.`);
       r.history.push({ at: now(), event: "released", detail: `${reviewer}, claimed by ${run.claim.by}, released by ${by.trim() || "someone"}` });
       Object.assign(run, { status: "waiting", claim: null, started_at: null });
     });

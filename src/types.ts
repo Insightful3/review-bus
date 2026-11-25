@@ -79,7 +79,7 @@ export interface ReviewerRun {
   /** Pull reviewers: when the answer is due, and who claimed the work (the token authorizes the answer). */
   deadline?: string;
   /** Only a SHA-256 of the claim token is stored; the claimant holds the token. */
-  claim?: { by: string; client: string | null; at: string; token_sha256: string } | null;
+  claim?: { id: string; by: string; client: string | null; at: string; token_sha256: string } | null;
   verdict: string | null;
   summary: string | null;
   error: string | null;

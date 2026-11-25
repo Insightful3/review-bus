@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describeArtifact } from "./snapshot.js";
@@ -100,7 +100,9 @@ export class Store {
    */
   save(review: Review): void {
     const dir = this.dir(review.id);
-    mkdirSync(dir, { recursive: true });
+    // Owner-only: a review folder holds the work, quotes and findings, often confidential.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
     review.updated_at = new Date().toISOString();
     const suffix = `${process.pid}.${randomBytes(4).toString("hex")}`;
     const tmp = path.join(dir, `review.json.${suffix}.tmp`);
@@ -125,7 +127,7 @@ export class Store {
     }
     const reportTmp = path.join(dir, `report.md.${suffix}.tmp`);
     try {
-      writeFileSync(reportTmp, renderReport(review));
+      writeFileSync(reportTmp, renderReport(review), { mode: 0o600 });
       renameSync(reportTmp, path.join(dir, "report.md"));
     } catch (err) {
       rmSync(reportTmp, { force: true });
@@ -143,7 +145,7 @@ export class Store {
    */
   withLock<T>(id: string, fn: () => T): T {
     const dir = this.dir(id);
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     const lock = path.join(dir, ".lock");
     const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
     const deadline = Date.now() + 15_000;

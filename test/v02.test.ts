@@ -14,6 +14,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { loadConfig } from "../src/config.js";
 import { Engine } from "../src/engine.js";
 import { startHttp } from "../src/http.js";
+import { gitlinksAfter } from "../src/adapters/index.js";
 import { checkRubric, checkRubricPath, listRubrics, loadRubric } from "../src/rubrics.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -170,8 +171,8 @@ test("over HTTP: a pull reviewer claims the work and posts; the last answer fini
   // Nobody else can claim it now, and a wrong token cannot post.
   assert.match((await call("review_claim", { review_id: id, reviewer: "person", by: "Bo" })).text, /already claimed by Ana/);
   // A released claim can be taken again; the old token no longer works.
-  assert.match((await call("review_release", { review_id: id, reviewer: "person", by: "Ana" })).text, /claimed_at/);
-  await call("review_release", { review_id: id, reviewer: "person", by: "Ana", claimed_at: work.claimed_at });
+  assert.match((await call("review_release", { review_id: id, reviewer: "person", by: "Ana" })).text, /claim_id/);
+  await call("review_release", { review_id: id, reviewer: "person", by: "Ana", claim_id: work.claim_id });
   const again = (await client.callTool({ name: "review_claim", arguments: { review_id: id, reviewer: "person", by: "Ana" } })) as ToolResult;
   const oldToken = work.token;
   Object.assign(work, JSON.parse(again.content[0].text));
@@ -439,7 +440,7 @@ test("the claim page shows a person the brief, the rubric and the work, with lab
   assert.match(html, /<h2>The work<\/h2>/);
   assert.match(html, /Total price: EUR 24,000/);
   for (const f of ["f_claim", "f_failure", "f_evidence", "f_impact", "f_likelihood"]) assert.match(html, new RegExp(`name="${f}" aria-label="`));
-  engine.release(review.id, "person", "test", engine.get(review.id).rounds[0].reviewers[0].claim!.at);
+  engine.release(review.id, "person", "test", engine.get(review.id).rounds[0].reviewers[0].claim!.id);
 });
 
 // ---- Fixes from Codex's review of v0.2 ----
@@ -665,7 +666,7 @@ test("a release from an old page does not drop a newer claim; pull-only status s
   assert.deepEqual(st.waiting_for_pull, ["person"]);
   assert.match(st.next, /check back later/);
   engine.claim(review.id, "person", { by: "Ana", client: null });
-  const oldAt = engine.get(review.id).rounds[0].reviewers[0].claim!.at;
+  const oldAt = engine.get(review.id).rounds[0].reviewers[0].claim!.id;
   engine.release(review.id, "person", "Ana", oldAt);
   await new Promise((r) => setTimeout(r, 5));
   engine.claim(review.id, "person", { by: "Bo", client: null });
@@ -868,4 +869,163 @@ test("findings over the blocking limit are marked and shown; a rubric can set it
   assert.ok(!r2.findings.some((f) => f.over_limit));
   assert.match(checkRubric("---\nmax_blocking: 0\n---\n").join(), /max_blocking must be a whole number above 0/);
   writeConfig();
+});
+
+// ---- Fixes from the fresh Codex review of all v0.2 (rv_01m8a3f2xe92ssqevzcyxnnwtq) ----
+
+test("a rubric with a wrongly typed confidential flag is refused at submit, not just by rubric-check", async () => {
+  const dir = path.join(tmp, "rubrics-typed");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "loose.md"), RUBRIC.replace("confidential: true", 'confidential: "true"'));
+  writeConfig({ rubric_paths: [dir] });
+  const e = new Engine(loadConfig());
+  await assert.rejects(
+    e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "loose", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, PERSON),
+    /cannot be used: confidential must be true or false/,
+  );
+  writeConfig();
+});
+
+test("review folders and reports are readable by their owner only", async () => {
+  const old = process.umask(0o022);
+  try {
+    const review = await engine.submit(
+      { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+      PERSON,
+      10,
+    );
+    await engine.settled(review.id);
+    const dir = path.join(tmp, "reviews", review.id);
+    assert.equal(statSync(dir).mode & 0o777, 0o700);
+    assert.equal(statSync(path.join(dir, "report.md")).mode & 0o777, 0o600);
+  } finally {
+    process.umask(old);
+  }
+});
+
+test("behind an HTTPS public origin the inbox cookie is Secure", async () => {
+  writeConfig({ http: { port: 0, token_file: path.join(tmp, "http-token"), public_origin: "https://reviews.example.com" } });
+  const e = new Engine(loadConfig());
+  const s = await startHttp(e, { port: 0, host: "127.0.0.1" });
+  try {
+    const { port } = new URL(s.url);
+    const cookie = (host: string, origin: string) =>
+      new Promise<string>((resolve) => {
+        const req = http.request({ host: "127.0.0.1", port, path: "/inbox/login", method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", host, origin } }, (r) =>
+          resolve(String(r.headers["set-cookie"] ?? "")),
+        );
+        req.end(new URLSearchParams({ token }).toString());
+      });
+    assert.match(await cookie("reviews.example.com", "https://reviews.example.com"), /; Secure/);
+    assert.doesNotMatch(await cookie(`127.0.0.1:${port}`, `http://127.0.0.1:${port}`), /Secure/);
+  } finally {
+    await s.close();
+    writeConfig();
+  }
+});
+
+test("idle MCP sessions that were never closed are dropped", async () => {
+  process.env.REVIEW_BUS_SESSION_IDLE_MS = "200";
+  const s = await startHttp(engine, { port: 0, host: "127.0.0.1" });
+  delete process.env.REVIEW_BUS_SESSION_IDLE_MS;
+  try {
+    const c = new Client({ name: "gone", version: "0" });
+    const t = new StreamableHTTPClientTransport(new URL(`${s.url}mcp`), { requestInit: { headers: { authorization: `Bearer ${token}` } } });
+    await c.connect(t);
+    const sid = t.sessionId!;
+    await c.callTool({ name: "review_rubrics", arguments: {} });
+    // The client vanishes without ending its session.
+    await c.close();
+    await new Promise((r) => setTimeout(r, 700));
+    const res = await fetch(`${s.url}mcp`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-session-id": sid },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" }),
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await s.close();
+  }
+});
+
+test("gitlinks come only from git's own headers, not from file text", () => {
+  const patch = Buffer.from(
+    [
+      "diff --git a/NOTES.md b/NOTES.md",
+      "index 1111111..2222222 100644",
+      "--- a/NOTES.md",
+      "+++ b/NOTES.md",
+      "@@ -1 +1,2 @@",
+      " notes",
+      "+Subproject commit 0123456789abcdef0123456789abcdef01234567",
+      "diff --git a/lib b/lib",
+      "index d52916b..f9bfcf5 160000",
+      "--- a/lib",
+      "+++ b/lib",
+      "@@ -1 +1 @@",
+      "-Subproject commit d52916b085bd965b2c7139cac82acd28dd769230",
+      "+Subproject commit f9bfcf5ab551b54f2d3a1d49e6e549a257d663e1",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual(gitlinksAfter(patch), [{ path: "lib", sha: "f9bfcf5ab551b54f2d3a1d49e6e549a257d663e1" }]);
+});
+
+test("each claim has its own id: a stale release never drops a newer claim, even in the same millisecond", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const first = engine.claim(review.id, "person", { by: "Ana", client: null });
+  engine.release(review.id, "person", "Ana", first.claim_id);
+  const second = engine.claim(review.id, "person", { by: "Bo", client: null }); // may share Ana's millisecond
+  assert.notEqual(second.claim_id, first.claim_id);
+  assert.throws(() => engine.release(review.id, "person", "Ana", first.claim_id), /claimed again since \(by Bo\)/);
+  assert.equal(engine.pending().find((w) => w.review_id === review.id)!.claim_id, second.claim_id);
+});
+
+test("the inbox lists every review awaiting a decision, however many newer reviews exist", async () => {
+  const dir = path.join(tmp, "reviews");
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "Old decision", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  // Make it the oldest review and waiting for sign-off.
+  const file = path.join(dir, review.id, "review.json");
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  const oldId = "rv_00000000000000000000000000";
+  saved.id = oldId;
+  saved.state = "awaiting_signoff";
+  mkdirSync(path.join(dir, oldId), { recursive: true });
+  writeFileSync(path.join(dir, oldId, "review.json"), JSON.stringify(saved));
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  const page = await (await fetch(`${base}inbox`, { headers: { cookie } })).text();
+  const decisions = page.split("Waiting for your decision")[1].split("<h2>")[0];
+  assert.match(decisions, new RegExp(oldId));
+});
+
+test("a git snapshot runs off the main thread: the event loop keeps ticking", async () => {
+  const repo = path.join(tmp, "repo-big");
+  mkdirSync(repo);
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd: repo });
+  for (let i = 0; i < 300; i++) writeFileSync(path.join(repo, `f${i}.txt`), `${i}\n`.repeat(200));
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-q", "-m", "base");
+  for (let i = 0; i < 300; i++) writeFileSync(path.join(repo, `f${i}.txt`), `${i} changed\n`.repeat(200));
+  let ticks = 0;
+  const timer = setInterval(() => ticks++, 5);
+  const started = Date.now();
+  const review = await engine.submit(
+    { artifact: { git: { repo, mode: "uncommitted" } }, pages: [], rubric: "code", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+  );
+  const elapsed = Date.now() - started;
+  clearInterval(timer);
+  await engine.settled(review.id);
+  // With the snapshot on the main thread, no timer could fire while git ran.
+  assert.ok(ticks >= Math.floor(elapsed / 5 / 4), `ticks ${ticks} in ${elapsed} ms`);
 });

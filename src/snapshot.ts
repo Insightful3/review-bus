@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { kindOf, toMarkdown } from "./convert.js";
-import { NoChangesError, snapshotGit } from "./git.js";
+import { NoChangesError, snapshotGitAsync } from "./git.js";
 import { capturePages, type BrowserConfig } from "./pages.js";
 import type { ArtifactRef, ReviewRequest, Snapshot } from "./types.js";
 
@@ -51,7 +51,7 @@ export async function snapshotRound(
     snap = await snapshotDocument(artifact.path, reviewDir, round);
   } else if (artifact?.git) {
     try {
-      const { info, patch, sha256 } = snapshotGit(artifact.git, reviewDir, round);
+      const { info, patch, sha256 } = await snapshotGitAsync(artifact.git, reviewDir, round);
       const markdown_file = `r${round}/change.md`;
       writeFileSync(path.join(reviewDir, markdown_file), changeMarkdown(info, patch));
       snap = { kind: "git", sha256, markdown_file, warnings: [], git: info };
