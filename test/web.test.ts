@@ -98,6 +98,7 @@ before(async () => {
       storage: { documents: path.join(tmp, "reviews") },
       default_reviewers: ["fake"],
       adapters: { fake, codex: { type: "codex", command: path.join(ROOT, "test/fake-codex.mjs"), timeout_seconds: 60 } },
+      browser: { timeout_seconds: 5 },
     }),
   );
   client = new Client({ name: "web-author", version: "0.0.0" });
@@ -433,4 +434,29 @@ test("a filter switched on in .git/info/attributes is refused; the index is neve
   const noprefix = await call("review_submit", { artifact: { git: { repo, mode: "uncommitted" } }, rubric: "code", intent: "x", wait_seconds: 30 });
   assert.ok(noprefix.json, noprefix.text);
   assert.equal(readFileSync(path.join(reviewDir(noprefix.json.review_id), "r1/tree/index.html"), "utf8"), "changed again\n");
+});
+
+test("a partial clone's missing object is an error: no fetch, nothing written to .git", async () => {
+  const src = newRepo("site-promisor-src");
+  sh(src, "config", "uploadpack.allowFilter", "true");
+  const clone = path.join(tmp, "site-promisor-clone");
+  execFileSync("git", ["clone", "-q", "--filter=blob:none", "--no-checkout", `file://${src}`, clone]);
+  const objects = () => execFileSync("git", ["-C", clone, "count-objects", "-v"]).toString();
+  const before = objects();
+  const { res, text } = await call("review_submit", { artifact: { git: { repo: clone, mode: "all" } }, rubric: "code", intent: "x" });
+  assert.equal(res.isError, true);
+  assert.match(text, /git diff failed/);
+  assert.equal(objects(), before);
+});
+
+test("a page whose scripts stall the capture fails with a deadline instead of hanging", { skip: !hasChrome && "Google Chrome not installed" }, async (t) => {
+  if (!hasChrome) return t.skip("Google Chrome not installed");
+  const repo = newRepo("site-stall");
+  // Breaks timers, so the capture's scroll step would wait forever.
+  writeFileSync(path.join(repo, "stall.html"), `<!doctype html><html lang="en"><title>Stall</title><body><p>x</p><script>window.setTimeout = () => 0;</script></body></html>`);
+  const started = Date.now();
+  const { res, text } = await call("review_submit", { pages: [`${base}/site-stall/stall.html`], rubric: "webpage", intent: "x" });
+  assert.equal(res.isError, true);
+  assert.match(text, /scrolling to load images did not finish within 5 s/);
+  assert.ok(Date.now() - started < 40_000);
 });

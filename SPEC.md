@@ -226,6 +226,8 @@ From review-bus reviewing itself with Codex (4 high-effort passes); open, listed
 - Headless page capture follows redirects from a public page to private addresses.
 - Reviewers in their own process group can outlive a runner that is killed outright.
 - The review id is returned after the snapshot; slow pages can exceed client timeouts.
+- Reviewer selection, model and effort follow the config the server started with; only approvals and the reviewer's command are re-read before each round.
+- A rubric's confidentiality is taken from when the review started, not re-read on resubmit.
 - `rb signoff` cannot tell a person from a program running in the person's terminal. By the owner's decision this is accepted: agents with terminal access may sign off.
 
 ## 11. Done when

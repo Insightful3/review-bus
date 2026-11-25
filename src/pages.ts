@@ -128,29 +128,44 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
         }
         // Lazy images: scroll down and back so they load before the screenshot. Bounded by the
         // screenshot height, 200 steps and 15 s, so an infinite-scroll page cannot hang the capture.
-        await page.evaluate(async (maxHeight: number) => {
+        // Every in-page step has a deadline: a page's scripts can leave an evaluation pending forever.
+        // On expiry the error propagates and the browser is closed below.
+        const within = async <T,>(work: Promise<T>, what: string): Promise<T> => {
+          let timer: NodeJS.Timeout | undefined;
+          try {
+            return await Promise.race([
+              work,
+              new Promise<T>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${url}: ${what} did not finish within ${cfg.timeout_seconds} s.`)), cfg.timeout_seconds * 1000);
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+        await within(page.evaluate(async (maxHeight: number) => {
           const until = Date.now() + 15_000;
           for (let y = 0, i = 0; y < Math.min(document.body.scrollHeight, maxHeight) && i < 200 && Date.now() < until; y += window.innerHeight, i++) {
             window.scrollTo(0, y);
             await new Promise((r) => setTimeout(r, 50));
           }
           window.scrollTo(0, 0);
-        }, cfg.max_height);
+        }, cfg.max_height), "scrolling to load images");
         await page.waitForTimeout(300);
-        const fullHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+        const fullHeight = await within(page.evaluate(() => document.documentElement.scrollHeight), "measuring the page");
         const height = Math.min(fullHeight, cfg.max_height);
         const shots: PageInfo["screenshots"] = [];
         for (let y = 0, t = 1; y < height; y += cfg.tile_height, t++) {
           const h = Math.min(cfg.tile_height, height - y);
           const file = `${dirRel}/${name}-${vp.name}-${t}.png`;
-          const png = await page.screenshot({ fullPage: true, clip: { x: 0, y, width: vp.width, height: h }, animations: "disabled" });
+          const png = await within(page.screenshot({ fullPage: true, clip: { x: 0, y, width: vp.width, height: h }, animations: "disabled" }), "taking a screenshot");
           writeFileSync(path.join(reviewDir, file), png);
           hash.update(png);
           shots.push({ viewport: vp.name, file, width: vp.width, y, height: h, page_height: fullHeight, truncated: fullHeight > cfg.max_height });
         }
 
         if (!info) {
-          const facts = await page.evaluate(() => {
+          const facts = await within(page.evaluate(() => {
             const meta = (sel: string) => document.querySelector(sel)?.getAttribute("content") ?? null;
             const og: Record<string, string> = {};
             document.querySelectorAll('meta[property^="og:"], meta[name^="twitter:"]').forEach((m) => {
@@ -168,7 +183,7 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
               links: [...new Set([...document.querySelectorAll("a[href]")].map((a) => (a as HTMLAnchorElement).href))],
               text: document.body.innerText,
             };
-          });
+          }), "reading the page facts");
           // Check same-origin links (max 40) without leaving the site.
           const origin = new URL(page.url()).origin;
           // Same origin by parsed URL (a prefix match would let localhost:4321.example.com through).

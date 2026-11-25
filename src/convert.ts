@@ -157,20 +157,41 @@ function list(el: El, depth: number): string[] {
   return lines;
 }
 
+/**
+ * A table on a real grid: a merged cell (rowspan/colspan) fills every position it covers, so each
+ * row keeps its label and every value stays under its own column heading.
+ */
 function table(el: El): string | null {
-  const rows: string[][] = [];
+  const rows: El[] = [];
   const walk = (n: El) => {
     for (const c of n.children) {
       if (!isEl(c)) continue;
-      if (c.tag === "tr") rows.push(c.children.filter(isEl).filter((x) => x.tag === "td" || x.tag === "th").map((x) => blocksText(x).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ").trim()));
+      if (c.tag === "tr") rows.push(c);
       else walk(c); // thead, tbody
     }
   };
   walk(el);
   if (!rows.length) return null;
-  const width = Math.max(...rows.map((r) => r.length));
-  const line = (r: string[]) => `| ${[...r, ...Array(width - r.length).fill("")].join(" | ")} |`;
-  return [line(rows[0]), line(Array(width).fill("---")), ...rows.slice(1).map(line)].join("\n");
+  const span = (cell: El, name: string) => Math.max(1, Math.min(50, Number(cell.attrs.match(new RegExp(`${name}="?(\\d+)`))?.[1] ?? 1)));
+  const grid: string[][] = [];
+  rows.forEach((tr, r) => {
+    grid[r] ??= [];
+    let col = 0;
+    for (const cell of tr.children.filter(isEl).filter((x) => x.tag === "td" || x.tag === "th")) {
+      while (grid[r][col] !== undefined) col++; // skip positions taken by a cell merged from above
+      const text = blocksText(cell).replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ").trim();
+      const rs = span(cell, "rowspan");
+      const cs = span(cell, "colspan");
+      for (let dr = 0; dr < rs && r + dr < rows.length; dr++) {
+        grid[r + dr] ??= [];
+        for (let dc = 0; dc < cs; dc++) grid[r + dr][col + dc] = text;
+      }
+      col += cs;
+    }
+  });
+  const width = Math.max(...grid.map((r) => r.length));
+  const line = (r: string[]) => `| ${Array.from({ length: width }, (_, i) => r[i] ?? "").join(" | ")} |`;
+  return [line(grid[0]), line(Array(width).fill("---")), ...grid.slice(1).map(line)].join("\n");
 }
 
 /** Text of a cell or other container that may hold paragraphs and lists. */

@@ -231,3 +231,9 @@ test("rejects unknown rubric, unknown reviewer and unsupported file type", async
     assert.equal(res.isError, true, JSON.stringify(args));
   }
 });
+
+test("the same reviewer named twice is refused", async () => {
+  const res = (await client.callTool({ name: "review_submit", arguments: { artifact: FIXTURE, rubric: "proposal", intent: "x", reviewers: ["fake", { name: "fake", model: "other" }] } })) as ToolResult;
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /Reviewer "fake" is named twice/);
+});

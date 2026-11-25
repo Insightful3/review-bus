@@ -58,6 +58,8 @@ const HARDEN = [
   "core.hooksPath=/dev/null",
   "-c",
   "core.attributesFile=/dev/null",
+  "-c",
+  "protocol.allow=never",
 ];
 const hardened = (cwd: string, args: string[]) => [...HARDEN, `--attr-source=${EMPTY_TREE_ID}`, "-C", cwd, ...args];
 /** Diffs that get replayed with git apply: standard a/ b/ prefixes whatever the user's diff settings. */
@@ -79,8 +81,11 @@ function refuseInfoAttributes(root: string): void {
     throw new Error(`${file} switches on a git filter, which would run a command during the snapshot. Remove that line or review a clean clone.`);
   }
 }
+// No network and no writes into .git: a partial clone must not fetch missing objects (that contacts
+// a remote and can run a configured transport command). A missing object is an error instead.
+const NO_FETCH_ENV = { GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" };
 const runGit = (cwd: string, args: string[], extra: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}) =>
-  spawnSync("git", hardened(cwd, args), { maxBuffer: extra.maxBuffer, env: extra.env ? { ...process.env, ...extra.env } : undefined });
+  spawnSync("git", hardened(cwd, args), { maxBuffer: extra.maxBuffer, env: { ...process.env, ...NO_FETCH_ENV, ...extra.env } });
 
 /** Runs git and returns raw bytes: patches must not be decoded (a non-UTF-8 file would change). */
 function gitBuf(cwd: string, args: string[], opts: { okCodes?: number[]; env?: NodeJS.ProcessEnv } = {}): Buffer {

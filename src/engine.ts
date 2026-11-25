@@ -299,6 +299,10 @@ export class Engine {
 
     if (requested.length) {
       requested.forEach((s) => check(s.name));
+      // One run per reviewer name: runs share file names and status by name, and two runs of one
+      // adapter would overwrite each other's answer.
+      const dup = requested.map((s) => s.name).find((n, i, all) => all.indexOf(n) !== i);
+      if (dup) throw new Error(`Reviewer "${dup}" is named twice. To compare two models, configure a second adapter (for example "codex-fast") and name both.`);
       const refused = requested.filter((s) => allowed && !allowed.includes(s.name)).map((s) => s.name);
       if (refused.length) throw new Error(`Reviewer(s) ${refused.join(", ")} are not approved for this rubric. Approved: ${allowed!.join(", ")}.`);
       for (const s of requested) {

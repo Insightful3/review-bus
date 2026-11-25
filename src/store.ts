@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describeArtifact } from "./snapshot.js";
@@ -108,13 +108,20 @@ export class Store {
     // power cut. (Round files are not flushed one by one; a lost snapshot fails its round.)
     const fd = openSync(tmp, "w");
     try {
-      writeSync(fd, JSON.stringify(review, null, 2));
+      writeFileSync(fd, JSON.stringify(review, null, 2)); // writes every byte, or throws
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
+    const first = !existsSync(path.join(dir, "review.json"));
     renameSync(tmp, path.join(dir, "review.json"));
     syncDir(dir);
+    // A new review: also flush the folder holding it (and the storage folder's parent), so its
+    // entry survives a power cut right after the id was handed out.
+    if (first) {
+      syncDir(this.root);
+      syncDir(path.dirname(this.root));
+    }
     const reportTmp = path.join(dir, `report.md.${suffix}.tmp`);
     try {
       writeFileSync(reportTmp, renderReport(review));

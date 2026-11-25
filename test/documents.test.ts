@@ -154,3 +154,16 @@ test("nested lists keep every item, including the ones after a sub-list (real ma
     "Scope\n\n- Assistant on the website\n  - German\n  - English\n- Final delivery clause: go-live by 15 March 2027\n\nAfter the list\n\n1. First\n  1. One a\n2. Second & last\n",
   );
 });
+
+test("merged table cells keep every value under its own heading (real mammoth output)", () => {
+  const html =
+    '<table><tr><td><p>Service</p></td><td><p>Standard</p></td><td><p>Premium</p></td></tr>' +
+    '<tr><td rowspan="2"><p>Support assistant</p></td><td><p>EUR 22,500</p></td><td><p>EUR 31,000</p></td></tr>' +
+    "<tr><td><p>EUR 1,200 / month</p></td><td><p>EUR 2,000 / month</p></td></tr>" +
+    '<tr><td colspan="2"><p>Total first year</p></td><td><p>EUR 55,000</p></td></tr></table>';
+  assert.equal(
+    htmlToMarkdown(html),
+    "| Service | Standard | Premium |\n| --- | --- | --- |\n| Support assistant | EUR 22,500 | EUR 31,000 |\n" +
+      "| Support assistant | EUR 1,200 / month | EUR 2,000 / month |\n| Total first year | Total first year | EUR 55,000 |\n",
+  );
+});
