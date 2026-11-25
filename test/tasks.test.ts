@@ -31,7 +31,15 @@ before(async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "review-bus-tasks-"));
   const fake = (extra: string[]) => ({ type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs"), ...extra], timeout_seconds: 30 });
   const configFile = path.join(tmp, "config.json");
-  writeFileSync(configFile, JSON.stringify({ storage: { documents: path.join(tmp, "reviews") }, default_reviewers: ["slowish"], adapters: { slowish: fake(["--sleep=2000"]) } }));
+  writeFileSync(
+    configFile,
+    JSON.stringify({
+      storage: { documents: path.join(tmp, "reviews") },
+      default_reviewers: ["slowish"],
+      adapters: { slowish: fake(["--sleep=2000"]), slower: fake(["--sleep=12000"]) },
+      max_wait_seconds: 3,
+    }),
+  );
   client = new Client({ name: "task-author", version: "0.0.0" }, { capabilities: {} });
   await client.connect(
     new StdioClientTransport({
@@ -95,4 +103,24 @@ test("errors in a task call come back as a tool error, not a hung task", async (
   const result = seen.find((m) => m.type === "result")!;
   assert.ok(result, JSON.stringify(seen));
   assert.match(result.result!.content[0].text, /Artifact not found/);
+});
+
+test("a client that sends a progressToken can wait for the whole round; progress keeps the call alive", async () => {
+  const args = { artifact: FIXTURE, rubric: "proposal", intent: "x", reviewers: ["slower"], wait_seconds: 600 };
+  // Without a progress token: capped at max_wait_seconds (3 s here).
+  const capped = (await client.callTool({ name: "review_submit", arguments: args })) as { content: { text: string }[] };
+  assert.equal(JSON.parse(capped.content[0].text).state, "in_review");
+
+  // With one: progress every 10 s, and the answer is the finished round.
+  const progress: { progress: number; message?: string }[] = [];
+  const started = Date.now();
+  const done = (await client.callTool({ name: "review_submit", arguments: args }, undefined, {
+    onprogress: (p) => progress.push(p),
+    resetTimeoutOnProgress: true,
+    timeout: 60_000,
+  })) as { content: { text: string }[] };
+  assert.equal(lastJson(done).state, "changes_requested");
+  assert.ok(Date.now() - started >= 12_000);
+  assert.ok(progress.length >= 1, "at least one progress notification");
+  assert.match(progress[0].message ?? "", /Round 1: 0 of 1 reviewer\(s\) done; still working: slower:default:default \(1\d s\)/);
 });

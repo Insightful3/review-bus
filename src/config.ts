@@ -55,6 +55,9 @@ const Config = z.object({
     .default(null),
   // Longest a tool call waits before returning. MCP clients usually give up after about 60 s.
   max_wait_seconds: z.number().int().min(1).max(600).default(50),
+  // Longest a call waits when the client sent a progressToken: progress notifications every 10 s
+  // keep it alive, so it can wait for the whole round instead of polling.
+  max_wait_with_progress_seconds: z.number().int().min(1).max(3600).default(900),
   policy: z
     .object({
       max_blocking: z.number().int().positive().default(5),

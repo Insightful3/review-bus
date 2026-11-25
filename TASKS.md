@@ -55,5 +55,6 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [ ] Optional `model` for Codex in `~/.review-bus/config.json`: reviewers ignore `~/.codex/config.toml` now, so they use Codex's default model.
 - [ ] Optional `codex exec review` native pass (SPEC 8)
 - [x] MCP Tasks, 2025-11-25 form (task-capable submit, respond, wait; tested with the SDK client)
-- [ ] MCP Tasks for Claude Code: 2026-07-28 Tasks extension (`io.modelcontextprotocol/tasks`). Needs the v2 SDK (`@modelcontextprotocol/server` 2.x, `server/discover`) and a hand-written server side: `resultType: "task"`, `tasks/get`, `tasks/update`, `tasks/cancel`, optional `notifications/tasks`. Claude Code 2.1.316 declares the extension but uses plain calls with us today.
+- [x] Claude Code waits for the finished review in one call: progress notifications every 10 s keep the call alive (checked with Claude Code 2.1.316 and a 70 s review)
+- [ ] 2026-07-28 Tasks extension, if Claude Code ever needs it over stdio: the v2 SDK 2.4.0 serves 2026-07-28 over HTTP only
 - [ ] HTTP transport, web inbox, pull-mode reviewers (v0.2+)

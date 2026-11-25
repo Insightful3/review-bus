@@ -55,6 +55,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 | `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px) |
 | `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`. Without it, only near-identical findings are merged |
 | `max_wait_seconds` | Longest a tool call waits before returning (default 50, under the usual 60 second client timeout) |
+| `max_wait_with_progress_seconds` | Longest a call waits when the client shows progress, like Claude Code (default 900) |
 | `policy` | `max_blocking` findings per round (5) and `max_rounds` (3) |
 
 ## Connect an author agent
@@ -136,7 +137,12 @@ Git modes: `uncommitted` (working tree against HEAD, including new files), `base
 
 ### Waiting and timeouts
 
-MCP clients usually give up on a tool call after about 60 seconds, and a careful review can take several minutes. So the server never waits longer than `max_wait_seconds` (default 50) in one call, and says so in the reply (`wait_capped`). The agent calls `review_wait` in a loop until the state is no longer `in_review`; `review_submit` tells it to. The review keeps running on the server either way, and another session (or `rb`) can follow it too.
+A careful review can take several minutes, and MCP clients give up on a silent tool call after about 60 seconds. review-bus handles both kinds of client:
+
+- **Clients that show progress (Claude Code does).** They send a progress token with each call. review-bus then sends a progress update every 10 seconds ("Round 1: 1 of 2 reviewer(s) done; still working: codex…"), which keeps the call alive, and waits up to `max_wait_with_progress_seconds` (default 900). So `review_submit` with `wait_seconds: 900` returns the finished review in one call. Checked with Claude Code 2.1.316: one call, a 70 second review, the full result back.
+- **Other clients.** A call waits at most `max_wait_seconds` (default 50) and says so (`wait_capped`); the agent calls `review_wait` again until the state is no longer `in_review`.
+
+The review keeps running on the server either way, and another session (or `rb`) can follow it too.
 
 ### Reviewers, model and effort
 
@@ -151,7 +157,7 @@ The model and effort that actually ran are recorded on every finding as `reviewe
 
 ### Tasks
 
-`review_submit`, `review_respond` (with `resubmit`) and `review_wait` can be called as MCP tasks (2025-11-25 form): the call returns at once and the task completes with the result when the round finishes. Clients that do not use tasks are unaffected. Claude Code 2.1.316 does not use this form yet (it expects the 2026-07-28 Tasks extension), so it keeps polling `review_wait`. To see how a client calls review-bus, set `REVIEW_BUS_LOG` to a file path in the server's environment: every request is logged with whether it came as a task.
+`review_submit`, `review_respond` (with `resubmit`) and `review_wait` can also be called as MCP tasks (2025-11-25 form): the call returns at once and the task completes with the result when the round finishes. Clients that do not use tasks are unaffected. Claude Code 2.1.316 does not use this form (it uses tasks only on 2026-07-28 connections), so it relies on progress updates instead (above). To see how a client calls review-bus, set `REVIEW_BUS_LOG` to a file path in the server's environment: every request is logged with whether it came as a task, and tool calls with their full arguments (paths and intents included), so use it for debugging only.
 
 ### Several reviewers
 

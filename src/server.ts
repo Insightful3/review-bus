@@ -114,7 +114,11 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
   const taskStore = new InMemoryTaskStore();
   const server = new McpServer(
     { name: "review-bus", version: "0.1.0" },
-    { capabilities: { tasks: { requests: { tools: { call: {} } } } }, taskStore, taskMessageQueue: new InMemoryTaskMessageQueue() },
+    {
+      capabilities: { tasks: { requests: { tools: { call: {} } } } },
+      taskStore,
+      taskMessageQueue: new InMemoryTaskMessageQueue(),
+    },
   );
   const taskRequests = new Set<string | number>();
   const trackTaskRequests = (transport: Transport) => {
@@ -125,7 +129,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
       // Opt-in diagnostics: which tool calls arrive, and whether as tasks (REVIEW_BUS_LOG=<file>).
       if (process.env.REVIEW_BUS_LOG && m.method) {
         const name = (m.params as { name?: string } | undefined)?.name;
-        const detail = m.method === "initialize" || m.method === "server/discover" ? { params: m.params } : {};
+        const detail = m.method === "initialize" || m.method === "server/discover" || m.method === "tools/call" || m.method?.startsWith("tasks/") ? { params: m.params } : {};
         appendFileSync(process.env.REVIEW_BUS_LOG, JSON.stringify({ at: new Date().toISOString(), method: m.method, tool: name ?? null, task: Boolean(m.params?.task), ...detail }) + "\n");
       }
       deliver?.(message, extra);
@@ -138,18 +142,62 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     return engine.get(id);
   };
 
+  /**
+   * How a plain call waits for a review. A client that sent a progressToken (Claude Code does) gets
+   * notifications/progress every 10 s, which tells it the call is alive, so it can wait for the
+   * whole round (up to max_wait_with_progress_seconds). Without one, waits stay under the usual
+   * client timeout (max_wait_seconds).
+   */
+  interface CallContext {
+    asTask: boolean;
+    /** Waits up to `requested` seconds (capped as above) and returns how long it was allowed to wait. */
+    wait: (id: string, requested: number) => Promise<number>;
+  }
+
+  const progressText = (id: string, startedAt: number) => {
+    const round = engine.get(id).rounds.at(-1);
+    const runs = round?.reviewers ?? [];
+    const done = runs.filter((r) => r.status === "done" || r.status === "failed").length;
+    const running = runs.filter((r) => r.status === "running").map((r) => r.label);
+    return `Round ${round?.n ?? 0}: ${done} of ${runs.length} reviewer(s) done${running.length ? `; still working: ${running.join(", ")}` : ""} (${Math.round((Date.now() - startedAt) / 1000)} s)`;
+  };
+
   const registerTaskTool = <Shape extends Record<string, z.ZodTypeAny>>(
     name: string,
     config: { description: string; inputSchema: Shape },
-    run: (args: z.infer<z.ZodObject<Shape>>, asTask: boolean) => Promise<Outcome>,
+    run: (args: z.infer<z.ZodObject<Shape>>, ctx: CallContext) => Promise<Outcome>,
   ) => {
     const handler = {
         createTask: async (args: unknown, extra: CreateTaskRequestHandlerExtra) => {
           const asTask = taskRequests.delete(extra.requestId);
           const task = await extra.taskStore.createTask({ ttl: Math.max(extra.taskRequestedTtl ?? 0, TASK_TTL_MS), pollInterval: 2000 });
+          const progressToken = (extra._meta as { progressToken?: string | number } | undefined)?.progressToken;
+          const ctx: CallContext = {
+            asTask,
+            wait: async (id, requested) => {
+              if (asTask || requested <= 0) return 0;
+              if (progressToken === undefined) {
+                const seconds = cap(requested);
+                await engine.waitFor(id, seconds);
+                return seconds;
+              }
+              const seconds = Math.min(requested, engine.config.max_wait_with_progress_seconds);
+              const startedAt = Date.now();
+              const until = startedAt + seconds * 1000;
+              let step = 0;
+              while (Date.now() < until && engine.get(id).state === "in_review") {
+                await engine.waitFor(id, Math.min(10, (until - Date.now()) / 1000));
+                if (engine.get(id).state !== "in_review") break;
+                await extra
+                  .sendNotification({ method: "notifications/progress", params: { progressToken, progress: ++step, message: progressText(id, startedAt) } })
+                  .catch(() => {});
+              }
+              return seconds;
+            },
+          };
           let outcome: Outcome;
           try {
-            outcome = await run(args as z.infer<z.ZodObject<Shape>>, asTask);
+            outcome = await run(args as z.infer<z.ZodObject<Shape>>, ctx);
           } catch (err) {
             outcome = { now: errorReply(err) };
           }
@@ -187,7 +235,8 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         "Submit work for review by other agents: a document (.md, .txt, .docx, .pdf), a git change ({git: {repo, mode}}), " +
         "and/or web pages to render and screenshot (pages: URLs, for example a local dev server). " +
         "Reviewers run read-only on a frozen snapshot. Returns review_id and state; returns the full result if the round finishes within wait_seconds " +
-        "(capped at the server's max_wait_seconds, default 50, to stay under client timeouts). Reviews often take minutes: poll review_wait until state is not in_review. " +
+        "(capped at max_wait_seconds, default 50, to stay under client timeouts; clients that show progress, like Claude Code, can wait up to max_wait_with_progress_seconds, default 900: " +
+        "pass wait_seconds 900 to get the finished review in one call). Otherwise poll review_wait until state is not in_review. " +
         "Called as an MCP task, it returns at once and the task completes with the result when the round finishes.",
       inputSchema: {
         artifact: z
@@ -221,8 +270,8 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         wait_seconds: z.number().int().min(0).max(600).default(0),
       },
     },
-    async (args, asTask) => {
-      const review = await engine.submit(
+    async (args, ctx) => {
+      const submitted = await engine.submit(
         {
           artifact: args.artifact === undefined ? null : typeof args.artifact === "string" ? { path: args.artifact } : { git: args.artifact.git },
           pages: args.pages,
@@ -235,8 +284,10 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           stage: args.stage,
         },
         detectAuthor(args.author_vendor),
-        asTask ? 0 : cap(args.wait_seconds),
+        0,
       );
+      await ctx.wait(submitted.id, args.wait_seconds);
+      const review = engine.get(submitted.id);
       if (review.state !== "in_review") return { now: reply(review, false) };
       const next = "Reviewers are working. Call review_wait with this review_id until state is not in_review, then review_result.";
       return {
@@ -286,15 +337,15 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     "review_wait",
     {
       description:
-        "Block until the current round finishes or the time runs out, then return the status. seconds is capped at the server's max_wait_seconds (default 50); call again while state is in_review. " +
+        "Block until the current round finishes or the time runs out, then return the status. seconds is capped at max_wait_seconds (default 50), " +
+        "or at max_wait_with_progress_seconds (default 900) for clients that show progress, like Claude Code; call again while state is in_review. " +
         "Called as an MCP task, it completes when the round finishes, with no cap.",
       inputSchema: { review_id: z.string(), seconds: z.number().int().min(1).max(600).default(50) },
     },
-    async (args, asTask) => {
+    async (args, ctx) => {
       engine.get(args.review_id); // validates the id
-      if (asTask) return { now: jsonReply(status(engine.get(args.review_id))), later: untilDone(args.review_id).then((r) => jsonReply(status(r))) };
-      const waited = cap(args.seconds);
-      await engine.waitFor(args.review_id, waited);
+      if (ctx.asTask) return { now: jsonReply(status(engine.get(args.review_id))), later: untilDone(args.review_id).then((r) => jsonReply(status(r))) };
+      const waited = await ctx.wait(args.review_id, args.seconds);
       return { now: jsonReply({ ...status(engine.get(args.review_id)), waited_seconds: waited, ...(waited < args.seconds ? { wait_capped: true } : {}) }) };
     },
   );
@@ -323,12 +374,11 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         wait_seconds: z.number().int().min(0).max(600).default(0),
       },
     },
-    async (args, asTask) => {
-      const { review, unanswered } = await engine.respond(args.review_id, args.responses, {
-        resubmit: args.resubmit,
-        artifact: args.artifact,
-        waitSeconds: asTask ? 0 : cap(args.wait_seconds),
-      });
+    async (args, ctx) => {
+      const responded = await engine.respond(args.review_id, args.responses, { resubmit: args.resubmit, artifact: args.artifact });
+      if (args.resubmit) await ctx.wait(args.review_id, args.wait_seconds);
+      const review = args.resubmit ? engine.get(args.review_id) : responded.review;
+      const unanswered = responded.unanswered;
       if (review.state === "in_review") {
         return { now: jsonReply({ ...status(review), unanswered }), later: untilDone(review.id).then((r) => reply(r, false)) };
       }
