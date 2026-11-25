@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { appendFileSync, realpathSync } from "node:fs";
+import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
@@ -539,6 +539,27 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
             { type: "text" as const, text: JSON.stringify(output_schema) },
           ],
         };
+      } catch (err) {
+        return errorReply(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "review_file",
+    {
+      description:
+        "Read a file of the work you claimed (a screenshot as an image, the document or patch as text), for pull reviewers on another machine. " +
+        "path is one of snapshot_files from review_claim. Needs the claim's token.",
+      inputSchema: { review_id: z.string(), reviewer: z.string(), token: z.string(), path: z.string() },
+    },
+    async (args) => {
+      try {
+        const found = engine.claimedFile(args.review_id, args.reviewer, args.token, args.path);
+        const data = readFileSync(found.file);
+        return found.image
+          ? { content: [{ type: "image" as const, data: data.toString("base64"), mimeType: "image/png" }] }
+          : { content: [{ type: "text" as const, text: data.toString("utf8") }] };
       } catch (err) {
         return errorReply(err);
       }

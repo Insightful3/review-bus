@@ -10,7 +10,7 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { Engine } from "./engine.js";
 import { createServer } from "./server.js";
-import { answerFromForm, INBOX_JS, renderClaimPage, renderError, renderInbox, renderLogin, renderReviewPage } from "./inbox.js";
+import { answerFromForm, INBOX_JS, renderClaimPage, renderError, renderInbox, renderLogin, renderReauth, renderReviewPage } from "./inbox.js";
 
 // rb.localhost: browsers resolve *.localhost to this machine, and a cookie set for it is not sent to
 // other services on localhost or 127.0.0.1 (cookies ignore ports, host names do not).
@@ -69,7 +69,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
   // sessions with no request open are closed after SESSION_IDLE_MS, and at most MAX_SESSIONS are kept.
   const sessions = new Map<string, { transport: StreamableHTTPServerTransport; close: () => Promise<void>; lastSeen: number; open: number }>();
   const SESSION_IDLE_MS = Number(process.env.REVIEW_BUS_SESSION_IDLE_MS ?? 60 * 60 * 1000);
-  const MAX_SESSIONS = 100;
+  const MAX_SESSIONS = Number(process.env.REVIEW_BUS_MAX_SESSIONS ?? 100);
   const sweep = () => {
     const idle = [...sessions.entries()].filter(([, s]) => s.open === 0).sort((a, b) => a[1].lastSeen - b[1].lastSeen);
     let excess = sessions.size - MAX_SESSIONS;
@@ -107,8 +107,19 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
   // A browser's Origin must be this very server (host and port): SameSite cookies ignore ports, so a
   // page on another port of the same host could otherwise post to the inbox with the session.
   const publicOrigin = cfg.public_origin ? new URL(cfg.public_origin).origin : null;
-  const viaPublicHttps = (req: http.IncomingMessage) =>
-    Boolean(cfg.public_origin) && new URL(cfg.public_origin!).protocol === "https:" && (req.headers.host ?? "").toLowerCase() === new URL(cfg.public_origin!).host.toLowerCase();
+  // Through the HTTPS public origin: by the Host the proxy passes on, or by the browser's Origin
+  // (a proxy may rewrite Host to the backend address).
+  const viaPublicHttps = (req: http.IncomingMessage) => {
+    if (!cfg.public_origin || new URL(cfg.public_origin).protocol !== "https:") return false;
+    const pub = new URL(cfg.public_origin);
+    return (req.headers.host ?? "").toLowerCase() === pub.host.toLowerCase() || req.headers.origin === pub.origin;
+  };
+  const sessionCookie = (req: http.IncomingMessage) => {
+    const session = randomBytes(32).toString("hex");
+    sessionsByCookie.set(session, Date.now() + SESSION_MS);
+    // Secure when people come through the HTTPS public origin: the cookie never goes over plain HTTP.
+    return `${cookieName()}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}${viaPublicHttps(req) ? "; Secure" : ""}`;
+  };
   const originOk = (req: http.IncomingMessage) => {
     const origin = req.headers.origin;
     if (!origin) return true;
@@ -174,6 +185,12 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
       send(res, sessionId ? 404 : 400, JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: sessionId ? "Unknown session" : "Start with an initialize request" }, id: null }), "application/json");
       return;
     }
+    // A slot for the new session: idle ones go first; with every slot in use, ask to retry later.
+    sweep();
+    if (sessions.size >= MAX_SESSIONS) {
+      send(res, 503, JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: `All ${MAX_SESSIONS} MCP sessions are in use; try again later.` }, id: null }), "application/json", { "retry-after": "30" });
+      return;
+    }
     const { server, trackTaskRequests, taskStore } = createServer(engine);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -208,14 +225,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
       if (req.method === "POST") {
         const form = new URLSearchParams(await readBody(req, 64 * 1024));
         if (same((form.get("token") ?? "").trim(), token)) {
-          const session = randomBytes(32).toString("hex");
-          sessionsByCookie.set(session, Date.now() + SESSION_MS);
-          res.writeHead(303, {
-            location: "/inbox",
-            // Secure when people come through the HTTPS public origin: the cookie never goes over plain HTTP.
-            "set-cookie": `${cookieName()}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}${viaPublicHttps(req) ? "; Secure" : ""}`,
-            ...SECURITY_HEADERS,
-          });
+          res.writeHead(303, { location: "/inbox", "set-cookie": sessionCookie(req), ...SECURITY_HEADERS });
           res.end();
           return;
         }
@@ -225,10 +235,23 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
       send(res, 200, renderLogin(null));
       return;
     }
+    let form = req.method === "POST" ? new URLSearchParams(await readBody(req)) : new URLSearchParams();
     if (!sessionOk(req)) {
-      res.writeHead(303, { location: "/inbox/login", ...SECURITY_HEADERS });
-      res.end();
-      return;
+      // An expired session must not throw away what a person just wrote (a review can take a day):
+      // a post is kept in the page that asks for the token, and sent once it is given.
+      const reauth = form.get("_reauth_token");
+      if (req.method === "POST" && reauth !== null && same(reauth.trim(), token)) {
+        res.setHeader("set-cookie", sessionCookie(req));
+        form = new URLSearchParams(form.get("_payload") ?? "");
+      } else if (req.method === "POST") {
+        const payload = reauth !== null ? (form.get("_payload") ?? "") : form.toString();
+        send(res, 401, renderReauth(url.pathname, payload, reauth !== null));
+        return;
+      } else {
+        res.writeHead(303, { location: "/inbox/login", ...SECURITY_HEADERS });
+        res.end();
+        return;
+      }
     }
     const parts = url.pathname.split("/").filter(Boolean).slice(1); // after "inbox"
     try {
@@ -243,14 +266,12 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           return;
         }
         if (req.method === "POST" && parts[2] === "signoff") {
-          const form = new URLSearchParams(await readBody(req, 64 * 1024));
           engine.signoff(id, form.get("by") ?? "", form.get("note") ?? "");
           res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent("Signed off.")}`, ...SECURITY_HEADERS });
           res.end();
           return;
         }
         if (req.method === "POST" && parts[2] === "release" && parts[3]) {
-          const form = new URLSearchParams(await readBody(req, 64 * 1024));
           engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`, form.get("claim_id") ?? "");
           res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent("Claim released.")}`, ...SECURITY_HEADERS });
           res.end();
@@ -261,36 +282,19 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           // documents and screenshots. Nothing from the project copy (a reviewed repo can track a
           // symlink to review.json, which holds claim tokens), and never through a symlink.
           const rel = parts.slice(3).map(decodeURIComponent).join("/");
-          const review = engine.get(id);
-          const recorded = new Set(
-            review.rounds.flatMap((rd) => [
-              rd.snapshot.markdown_file,
-              rd.snapshot.git?.patch_file,
-              ...(rd.snapshot.related ?? []).map((x) => x.markdown_file),
-              ...(rd.snapshot.pages ?? []).flatMap((p) => p.screenshots.map((s) => s.file)),
-            ]),
-          );
-          const file = path.join(engine.store.dir(id), rel);
-          const plain = (() => {
-            try {
-              return lstatSync(file).isFile() && realpathSync(file) === path.join(realpathSync(engine.store.dir(id)), rel);
-            } catch {
-              return false;
-            }
-          })();
-          if (!recorded.has(rel) || !plain) {
+          const found = engine.snapshotFile(id, rel);
+          if (!found) {
             send(res, 404, "Not found", "text/plain");
             return;
           }
           // Text is served as plain text, never as HTML, whatever it contains.
-          send(res, 200, readFileSync(file) as unknown as string, rel.endsWith(".png") ? "image/png" : "text/plain; charset=utf-8");
+          send(res, 200, readFileSync(found.file) as unknown as string, found.image ? "image/png" : "text/plain; charset=utf-8");
           return;
         }
       }
       if (parts[0] === "claim" && parts[1] && parts[2]) {
         const [, id, reviewer] = parts;
         if (req.method === "POST" && parts[3] === "start") {
-          const form = new URLSearchParams(await readBody(req, 64 * 1024));
           const work = engine.claim(id, reviewer, { by: form.get("by") ?? "", client: "web-inbox" });
           // The token reaches the person only through this page: if it cannot be built, give the
           // claim back instead of leaving the work locked by a claim nobody holds.
@@ -305,7 +309,6 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           return;
         }
         if (req.method === "POST" && parts[3] === "post") {
-          const form = new URLSearchParams(await readBody(req));
           const claimToken = form.get("claim_token") ?? "";
           const decline = (form.get("decline") ?? "").trim();
           if (decline) await engine.post(id, reviewer, claimToken, { decline });

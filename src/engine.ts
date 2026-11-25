@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runAdapter } from "./adapters/index.js";
@@ -103,6 +103,8 @@ export interface ClaimedWork {
   round_dir: string;
   /** The work: the document as Markdown or the change, the project copy, screenshots, related documents. */
   files: string[];
+  /** The same files relative to the review folder, for review_file (reviewers without this machine's disk). */
+  snapshot_files: string[];
   prompt: string;
   output_schema: Record<string, unknown>;
   /** For people: the brief and the rubric on their own (the prompt has them too). */
@@ -656,7 +658,7 @@ export class Engine {
     let adapterFor: (name: string) => Config["adapters"][string] | undefined = () => undefined;
     try {
       const current = this.currentConfig();
-      const allowed = this.allowedReviewers(review.request.rubric, review.rubric_meta, current);
+      const allowed = this.allowedReviewers(review.request.rubric, this.metaNow(review), current);
       adapterFor = (name) => current.adapters[name];
       dispatchError = (name) =>
         !current.adapters[name]
@@ -863,7 +865,8 @@ export class Engine {
     if (before.state !== "in_review") throw new Error(`Review ${id} is ${before.state}; there is nothing to claim.`);
     const expected = before.rounds.at(-1)!.n;
     const prompt = readFileSync(path.join(this.store.roundDir(id, expected), "prompt.md"), "utf8");
-    const rubricText = loadRubric(before.request.rubric, this.config.rubric_paths, this.config.rubric_packs).body;
+    const rubricNow = loadRubric(before.request.rubric, this.config.rubric_paths, this.config.rubric_packs);
+    const rubricText = rubricNow.body;
     const token = randomBytes(16).toString("hex");
     let n = 0;
     let claimedAt = "";
@@ -877,7 +880,8 @@ export class Engine {
       if (!run || run.adapter !== "pull") throw new Error(`Review ${id} round ${round.n} has no pull reviewer "${reviewer}".`);
       if (run.status !== "waiting") throw new Error(`Reviewer "${reviewer}" of review ${id} is ${run.status === "running" ? `already claimed by ${run.claim?.by}` : run.status}.`);
       if (run.deadline && Date.parse(run.deadline) < Date.now()) throw new Error(`Reviewer "${reviewer}" of review ${id} is past its deadline (${run.deadline}).`);
-      const allowed = this.allowedReviewers(r.request.rubric, r.rubric_meta, current);
+      // Confidential if it was when submitted or is now (a rubric marked confidential later).
+      const allowed = this.allowedReviewers(r.request.rubric, { ...r.rubric_meta, confidential: r.rubric_meta.confidential === true || rubricNow.meta.confidential === true }, current);
       if (allowed && !allowed.includes(reviewer)) throw new Error(`Reviewer "${reviewer}" is no longer approved for ${r.request.rubric}. Nothing was sent.`);
       run.status = "running";
       run.started_at = now();
@@ -904,6 +908,12 @@ export class Engine {
       deadline: round.reviewers.find((x) => x.name === reviewer)!.deadline ?? null,
       round_dir: this.store.roundDir(id, n),
       files: files.map((f) => path.join(dir, f)),
+      snapshot_files: [
+        round.snapshot.markdown_file,
+        round.snapshot.git?.patch_file,
+        ...screenshotFiles(round.snapshot),
+        ...(round.snapshot.related ?? []).map((x) => x.markdown_file),
+      ].filter((f): f is string => Boolean(f)),
       prompt,
       output_schema: reviewerOutputJsonSchema(),
       rubric: review.request.rubric,
@@ -974,6 +984,56 @@ export class Engine {
       await this.running.get(id);
     }
     return this.get(id);
+  }
+
+  /**
+   * The rubric settings that decide where work may go: as saved with the review, but confidential
+   * if the rubric is confidential now. A rubric that cannot be loaded now keeps the saved settings.
+   */
+  private metaNow(review: Review): Record<string, unknown> {
+    try {
+      const now = loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs).meta;
+      return { ...review.rubric_meta, confidential: review.rubric_meta.confidential === true || now.confidential === true };
+    } catch {
+      return review.rubric_meta;
+    }
+  }
+
+  /**
+   * A file of a review that review-bus wrote and recorded in a round's snapshot (the Markdown, the
+   * patch, related documents, screenshots), as a regular file reached without a symlink. Never the
+   * project copy or review.json. Null when it is not one.
+   */
+  snapshotFile(id: string, rel: string): { file: string; image: boolean } | null {
+    const review = this.get(id);
+    const recorded = new Set(
+      review.rounds.flatMap((rd) => [
+        rd.snapshot.markdown_file,
+        rd.snapshot.git?.patch_file,
+        ...(rd.snapshot.related ?? []).map((x) => x.markdown_file),
+        ...(rd.snapshot.pages ?? []).flatMap((p) => p.screenshots.map((s) => s.file)),
+      ]),
+    );
+    if (!recorded.has(rel)) return null;
+    const file = path.join(this.store.dir(id), rel);
+    try {
+      if (!lstatSync(file).isFile() || realpathSync(file) !== path.join(realpathSync(this.store.dir(id)), rel)) return null;
+    } catch {
+      return null;
+    }
+    return { file, image: rel.endsWith(".png") };
+  }
+
+  /** A snapshot file for whoever holds a live claim on the review (pull reviewers on another machine). */
+  claimedFile(id: string, reviewer: string, token: string, rel: string): { file: string; image: boolean } {
+    const review = this.get(id);
+    const run = review.rounds.at(-1)?.reviewers.find((x) => x.name === reviewer);
+    if (review.state !== "in_review" || !run || run.status !== "running" || !run.claim || !safeEqual(run.claim.token_sha256, sha256(token))) {
+      throw new Error(`No live claim of "${reviewer}" on review ${id} matches this token.`);
+    }
+    const found = this.snapshotFile(id, rel);
+    if (!found) throw new Error(`${rel} is not a file of this review's snapshot. Use the paths review_claim lists (relative to the review folder).`);
+    return found;
   }
 
   /** Gives up a claim (an abandoned browser tab, the wrong person): the work waits for a new claim. */

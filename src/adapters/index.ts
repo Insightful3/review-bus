@@ -1,5 +1,6 @@
-import { cpSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { cp, readFile, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import type { AdapterConfig } from "../config.js";
 import { ReviewerOutput, reviewerOutputJsonSchema } from "../spec/reviewer-output.js";
@@ -162,17 +163,71 @@ function codexIsolation(): string[] {
 }
 
 /** Git with the user's and system config ignored, for the scratch repo codex-review works in. */
-function scratchGit(cwd: string, args: string[], input?: Buffer): void {
-  const r = spawnSync(
-    "git",
-    [
-      "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false",
-      "-c", "user.name=review-bus", "-c", "user.email=review-bus@localhost", "-c", "init.defaultBranch=main",
-      ...args,
-    ],
-    { cwd, input, env: { ...envWithoutGit(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, maxBuffer: 64 * 1024 * 1024 },
-  );
-  if (r.status !== 0) throw new Error(`git ${args[0]} in the codex-review copy failed: ${r.stderr.toString().trim().split("\n")[0]}`);
+/**
+ * Git in the codex-review scratch repo, with the user's and system config ignored. Asynchronous, so
+ * preparing a large copy never blocks the server, and bounded by the reviewer's deadline.
+ */
+function scratchGit(cwd: string, args: string[], deadline: number, input?: Buffer, signal?: AbortSignal): Promise<void> {
+  const left = deadline - Date.now();
+  if (left <= 0) return Promise.reject(new Error("codex-review ran out of time preparing its scratch repo (timeout_seconds)."));
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "git",
+      [
+        "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false",
+        "-c", "user.name=review-bus", "-c", "user.email=review-bus@localhost", "-c", "init.defaultBranch=main",
+        ...args,
+      ],
+      { cwd, env: { ...envWithoutGit(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, stdio: ["pipe", "ignore", "pipe"] },
+    );
+    let stderr = "";
+    let expired = false;
+    const stop = () => child.kill("SIGKILL");
+    const timer = setTimeout(() => {
+      expired = true;
+      stop();
+    }, left);
+    signal?.addEventListener("abort", stop, { once: true });
+    child.stderr!.on("data", (d) => (stderr += d));
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      if (expired) reject(new Error("codex-review ran out of time preparing its scratch repo (timeout_seconds)."));
+      else if (signal?.aborted) reject(new Error("canceled"));
+      else if (code !== 0) reject(new Error(`git ${args[0]} in the codex-review copy failed: ${stderr.trim().split("\n")[0]}`));
+      else resolve();
+    });
+    child.stdin!.on("error", () => {}); // git may exit before reading all input
+    child.stdin!.end(input ?? "");
+  });
+}
+
+/** Undoes git's C-style path quoting: \\ \" \t \n and the like, and \ooo octal bytes. */
+function cUnquote(s: string): Buffer {
+  const out: number[] = [];
+  const simple: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c !== "\\") {
+      out.push(s.charCodeAt(i) & 0xff);
+      continue;
+    }
+    const n = s[i + 1];
+    if (/[0-7]/.test(n ?? "") && /^[0-7]{3}$/.test(s.slice(i + 1, i + 4))) {
+      out.push(parseInt(s.slice(i + 1, i + 4), 8));
+      i += 3;
+    } else if (n !== undefined && n in simple) {
+      out.push(simple[n]);
+      i += 1;
+    } else {
+      out.push(92);
+    }
+  }
+  return Buffer.from(out);
 }
 
 /**
@@ -196,9 +251,11 @@ export function gitlinksAfter(patch: Buffer): { path: string; sha: string }[] {
     } else if (inHeader && (/^index [0-9a-f]+\.\.[0-9a-f]+ 160000$/.test(line) || /^(new file|new) mode 160000$/.test(line))) {
       gitlink = true;
     } else if (inHeader && line.startsWith("+++ ")) {
-      const raw = line.slice(4).trim();
-      const unq = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
-      target = unq.startsWith("b/") ? Buffer.from(unq.slice(2), "latin1").toString("utf8") : null;
+      // Git C-quotes paths with special or non-ASCII characters ("b/caf\303\251"): decode to bytes.
+      const raw = Buffer.from(line.slice(4), "latin1").toString("latin1").trim();
+      const unq = raw.startsWith('"') && raw.endsWith('"') ? cUnquote(raw.slice(1, -1)) : Buffer.from(raw, "latin1");
+      const text = unq.toString("utf8");
+      target = text.startsWith("b/") ? text.slice(2) : null;
     } else if (!inHeader && gitlink && target && /^\+Subproject commit [0-9a-f]{40,64}$/.test(line)) {
       out.push({ path: target, sha: line.split(" ").at(-1)! });
     }
@@ -237,11 +294,13 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
   // so the round never runs longer than other processes allow for it.
   const deadline = Date.now() + cfg.timeout_seconds * 1000;
   const native = path.join(job.outDir, `${job.reviewerName}.native`);
-  rmSync(native, { recursive: true, force: true });
+  await rm(native, { recursive: true, force: true });
   // verbatimSymlinks: a relative link must stay relative, or the reverse patch no longer matches it.
-  cpSync(job.git.tree, native, { recursive: true, verbatimSymlinks: true });
-  const patch = readFileSync(job.git.patch);
-  scratchGit(native, ["init", "-q"]);
+  await cp(job.git.tree, native, { recursive: true, verbatimSymlinks: true });
+  if (Date.now() > deadline) throw new Error("codex-review ran out of time copying the project (timeout_seconds).");
+  const patch = await readFile(job.git.patch);
+  const git = (args: string[], input?: Buffer) => scratchGit(native, args, deadline, input, job.signal);
+  await git(["init", "-q"]);
   // The project's .gitattributes came along with the copy. info/attributes wins over it: no filters
   // (their commands would come from the user's config when Codex runs git), no line-ending or
   // encoding conversion, so the scratch repo's diff is exactly the patch. (--attr-source, used for
@@ -250,12 +309,13 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
   // The index starts as the changed project: every file of the copy (-f: tracked in the project even
   // where its .gitignore matches), plus the changed submodule pointers, which the copy holds only as
   // empty folders. Reversing the patch through the index then gives the base, gitlinks included.
-  scratchGit(native, ["add", "-A", "-f"]);
-  for (const g of gitlinksAfter(patch)) scratchGit(native, ["update-index", "--add", "--cacheinfo", `160000,${g.sha},${g.path}`]);
-  if (patch.length) scratchGit(native, ["apply", "-R", "--index", "--whitespace=nowarn", "-"], patch);
-  scratchGit(native, ["commit", "-q", "--allow-empty", "-m", "base"]);
+  await git(["add", "-A", "-f"]);
+  for (const g of gitlinksAfter(patch)) await git(["update-index", "--add", "--cacheinfo", `160000,${g.sha},${g.path}`]);
+  if (patch.length) await git(["apply", "-R", "--index", "--whitespace=nowarn", "-"], patch);
+  await git(["commit", "-q", "--allow-empty", "-m", "base"]);
   // --index: the change is staged too, so new files that .gitignore matches are still part of it.
-  if (patch.length) scratchGit(native, ["apply", "--index", "--whitespace=nowarn", "-"], patch);
+  if (patch.length) await git(["apply", "--index", "--whitespace=nowarn", "-"], patch);
+  if (deadline - Date.now() < 5000) throw new Error("codex-review ran out of time preparing its scratch repo (timeout_seconds); Codex was not started.");
 
   const outFile = path.join(job.outDir, `${job.reviewerName}.native.md`);
   const args = ["exec", "review", "--uncommitted", ...codexIsolation(), "--output-last-message", outFile, ...codexModelArgs(job), ...cfg.args];

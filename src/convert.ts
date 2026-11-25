@@ -1,5 +1,5 @@
 // Document to Markdown for reviewers (SPEC 3). DOCX via mammoth, PDF via pdftotext if present, else unpdf.
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import mammoth from "mammoth";
 import { extractText, getDocumentProxy } from "unpdf";
@@ -51,9 +51,14 @@ export async function toMarkdown(file: string, kind: DocumentKind): Promise<Conv
 
 async function pdfToMarkdown(file: string): Promise<Converted> {
   // pdftotext keeps layout better; use it when installed. Pages are split by form feed.
-  const pt = spawnSync("pdftotext", ["-layout", "-enc", "UTF-8", file, "-"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  if (!pt.error && pt.status === 0) {
-    return { markdown: pagesToMarkdown(pt.stdout.split("\f")), converter: "pdftotext", warnings: [] };
+  // Asynchronous: a large PDF must not hold up the server (or the review id) while it converts.
+  const stdout = await new Promise<string | null>((resolve) =>
+    execFile("pdftotext", ["-layout", "-enc", "UTF-8", file, "-"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 300_000 }, (err, out) =>
+      resolve(err ? null : out),
+    ),
+  );
+  if (stdout !== null) {
+    return { markdown: pagesToMarkdown(stdout.split("\f")), converter: "pdftotext", warnings: [] };
   }
   const pdf = await getDocumentProxy(new Uint8Array(readFileSync(file)));
   const { text } = await extractText(pdf, { mergePages: false });

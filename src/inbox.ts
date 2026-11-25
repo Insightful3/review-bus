@@ -71,6 +71,17 @@ ${error ? `<p class="msg err">${esc(error)}</p>` : ""}
   );
 }
 
+/** The session expired while a form was being filled in: ask for the token and send the form as it was. */
+export function renderReauth(action: string, payload: string, wrongToken: boolean): string {
+  return page(
+    "Review inbox",
+    `<h1>Your inbox session expired</h1><p class="muted">What you sent is kept on this page. Paste the token (from http.token_file) to send it.</p>
+${wrongToken ? `<p class="msg err">That token does not match.</p>` : ""}
+<form method="post" action="${esc(action)}" class="card"><input type="hidden" name="_payload" value="${esc(payload)}">
+<label>Token<input name="_reauth_token" type="password" autocomplete="off" aria-label="Token" required></label><p><button>Send it</button></p></form>`,
+  );
+}
+
 export function renderError(message: string): string {
   return page("Review inbox", `<p><a href="/inbox">Inbox</a></p><p class="msg err">${esc(message)}</p>`);
 }

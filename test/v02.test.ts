@@ -1029,3 +1029,150 @@ test("a git snapshot runs off the main thread: the event loop keeps ticking", as
   // With the snapshot on the main thread, no timer could fire while git ran.
   assert.ok(ticks >= Math.floor(elapsed / 5 / 4), `ticks ${ticks} in ${elapsed} ms`);
 });
+
+// ---- Round 2 of the fresh review ----
+
+test("Secure cookie by the HTTPS Origin, even when the proxy rewrites Host to the backend", async () => {
+  writeConfig({ http: { port: 0, token_file: path.join(tmp, "http-token"), public_origin: "https://reviews.example.com" } });
+  const e = new Engine(loadConfig());
+  const s = await startHttp(e, { port: 0, host: "127.0.0.1" });
+  try {
+    const { port } = new URL(s.url);
+    const cookie = await new Promise<string>((resolve) => {
+      const req = http.request(
+        { host: "127.0.0.1", port, path: "/inbox/login", method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", host: `127.0.0.1:${port}`, origin: "https://reviews.example.com" } },
+        (r) => resolve(String(r.headers["set-cookie"] ?? "")),
+      );
+      req.end(new URLSearchParams({ token }).toString());
+    });
+    assert.match(cookie, /; Secure/);
+  } finally {
+    await s.close();
+    writeConfig();
+  }
+});
+
+test("a pull review queued under a public rubric cannot be claimed once the rubric is confidential", async () => {
+  const dir = path.join(tmp, "rubrics-flip");
+  mkdirSync(dir, { recursive: true });
+  const open = RUBRIC.replace("confidential: true\n", "");
+  writeFileSync(path.join(dir, "flip.md"), open);
+  writeConfig({ rubric_paths: [dir] });
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "flip", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" }, PERSON, 5);
+  writeFileSync(path.join(dir, "flip.md"), RUBRIC);
+  assert.throws(() => e.claim(review.id, "person", { by: "Ana", client: null }), /confidential/);
+  writeConfig();
+});
+
+test("codex-review never starts Codex when preparation leaves too little of its time", async () => {
+  writeConfig({ adapters: { native: { type: "codex-review", command: path.join(ROOT, "test/fake-codex.mjs"), timeout_seconds: 3 } } });
+  const e = new Engine(loadConfig());
+  const repo = path.join(tmp, "repo-quick");
+  mkdirSync(repo);
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd: repo });
+  writeFileSync(path.join(repo, "a.txt"), "a\n");
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-q", "-m", "a");
+  writeFileSync(path.join(repo, "a.txt"), "b\n");
+  const review = await e.submit({ artifact: { git: { repo, mode: "uncommitted" } }, pages: [], rubric: "code", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" }, PERSON, 10);
+  await e.settled(review.id);
+  const run = e.get(review.id).rounds[0].reviewers[0];
+  assert.equal(run.status, "failed");
+  assert.match(run.error!, /Codex was not started/);
+  assert.ok(!existsSync(path.join(tmp, "reviews", review.id, "r1", "native.log.txt")));
+  writeConfig();
+});
+
+test("review_file gives a claimed reviewer the snapshot files, and nothing else", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const res = (await client.callTool({ name: "review_claim", arguments: { review_id: review.id, reviewer: "person", by: "Remote" } })) as ToolResult;
+  const work = JSON.parse(res.content[0].text);
+  assert.deepEqual(work.snapshot_files, ["r1/artifact.md"]);
+  const file = (await client.callTool({ name: "review_file", arguments: { review_id: review.id, reviewer: "person", token: work.token, path: "r1/artifact.md" } })) as ToolResult;
+  assert.match(file.content[0].text, /Total price/);
+  const wrong = (await client.callTool({ name: "review_file", arguments: { review_id: review.id, reviewer: "person", token: "x".repeat(32), path: "r1/artifact.md" } })) as ToolResult;
+  assert.equal(wrong.isError, true);
+  const other = (await client.callTool({ name: "review_file", arguments: { review_id: review.id, reviewer: "person", token: work.token, path: "review.json" } })) as ToolResult;
+  assert.match(other.content[0].text, /not a file of this review's snapshot/);
+  engine.release(review.id, "person", "test", work.claim_id);
+});
+
+test("gitlinks under quoted (non-ASCII) paths are decoded", () => {
+  const patch = Buffer.from(
+    ['diff --git "a/caf\\303\\251" "b/caf\\303\\251"', "index d52916b..f9bfcf5 160000", '--- "a/caf\\303\\251"', '+++ "b/caf\\303\\251"', "@@ -1 +1 @@", "-Subproject commit d52916b085bd965b2c7139cac82acd28dd769230", "+Subproject commit f9bfcf5ab551b54f2d3a1d49e6e549a257d663e1", ""].join("\n"),
+    "latin1",
+  );
+  assert.deepEqual(gitlinksAfter(patch), [{ path: "café", sha: "f9bfcf5ab551b54f2d3a1d49e6e549a257d663e1" }]);
+});
+
+test("an answer sent after the inbox session expired is kept and sent once the token is given", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const work = engine.claim(review.id, "person", { by: "Ana", client: null });
+  const answer = new URLSearchParams({ claim_token: work.token, verdict: "approve", summary: "Fine after a night's sleep.", decline: "", f_claim: "" });
+  const url = `${base}inbox/claim/${review.id}/person/post`;
+  const expired = await fetch(url, { method: "POST", headers: { cookie: `rb_session_${new URL(base).port}=expired` }, body: answer, redirect: "manual" });
+  assert.equal(expired.status, 401);
+  const page = await expired.text();
+  const payload = page.match(/name="_payload" value="([^"]*)"/)![1].replaceAll("&amp;", "&");
+  assert.equal(engine.get(review.id).state, "in_review"); // nothing lost, nothing sent yet
+  const resend = await fetch(url, { method: "POST", body: new URLSearchParams({ _payload: payload, _reauth_token: token }), redirect: "manual" });
+  assert.equal(resend.status, 303);
+  assert.match(resend.headers.get("set-cookie")!, /^rb_session_/);
+  assert.equal(engine.get(review.id).state, "approved");
+});
+
+test("with every MCP session slot busy, a new session is refused with a retry", async () => {
+  process.env.REVIEW_BUS_MAX_SESSIONS = "1";
+  const s = await startHttp(engine, { port: 0, host: "127.0.0.1" });
+  delete process.env.REVIEW_BUS_MAX_SESSIONS;
+  const opts = { requestInit: { headers: { authorization: `Bearer ${token}` } } };
+  const a = new Client({ name: "a", version: "0" });
+  try {
+    await a.connect(new StreamableHTTPClientTransport(new URL(`${s.url}mcp`), opts));
+    // a keeps its SSE stream open, so its slot is busy.
+    await new Promise((r) => setTimeout(r, 200));
+    const res = await fetch(`${s.url}mcp`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "b", version: "0" } } }),
+    });
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("retry-after"), "30");
+  } finally {
+    await a.close();
+    await s.close();
+  }
+});
+
+test("a slow pdftotext does not block the server", async () => {
+  const bin = path.join(tmp, "slow-bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(path.join(bin, "pdftotext"), "#!/bin/sh\nsleep 1\necho 'Slow PDF text'\n", { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  let ticks = 0;
+  const timer = setInterval(() => ticks++, 10);
+  try {
+    const review = await engine.submit(
+      { artifact: { path: path.join(ROOT, "test/fixtures/proposal-bluefin.pdf") }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+      PERSON,
+    );
+    clearInterval(timer);
+    assert.ok(ticks >= 50, `only ${ticks} timer ticks during a 1 s conversion`);
+    assert.equal(review.rounds[0].snapshot.converter, "pdftotext");
+    await engine.settled(review.id);
+  } finally {
+    clearInterval(timer);
+    process.env.PATH = oldPath;
+  }
+});

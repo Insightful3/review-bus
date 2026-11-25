@@ -98,6 +98,7 @@ test("the tools are listed; sign-off is not one of them (people use rb signoff)"
   assert.deepEqual(tools.map((t) => t.name).sort(), [
     "review_cancel",
     "review_claim",
+    "review_file",
     "review_list",
     "review_pending",
     "review_post",

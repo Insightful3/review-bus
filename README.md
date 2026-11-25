@@ -121,6 +121,7 @@ The loop the agent runs:
 | `review_claim` | Claim a pull reviewer's work: returns the prompt, the files, the answer schema and a token |
 | `review_post` | Send a pull reviewer's answer (or decline) with the token |
 | `review_release` | Give up a claim so someone else can take it |
+| `review_file` | Read a file of the claimed work (screenshots as images), for pull reviewers on another machine |
 
 ### What to submit
 
@@ -191,7 +192,8 @@ A reviewer with `type: "pull"` is not started by review-bus. Its work waits unti
 - `review_pending` (or `rb pending`) lists waiting work. `review_claim` returns the prompt (rubric, intent, the work), the files, the answer's JSON Schema and a token; nobody else can claim it after that. `review_post` sends the answer: the same reviewer output JSON the headless reviewers return, or `decline` with a reason. `review_release` gives the work back; it names the claim by its `claim_id` (from the claim, or `review_pending`), so a release repeated after someone else claimed the work cannot drop their claim.
 - `timeout_seconds` is the deadline (default 3 days for pull reviewers). A reviewer that misses it counts as failed, and the round finishes without it.
 - `claim_clients` limits who may claim for that reviewer, by MCP client name. Without it any connected client can, including the author's own agent, so name the clients for anything that matters.
-- Approvals apply as for every reviewer: a confidential rubric only goes to pull reviewers listed in `allowed_reviewers`, checked again at claim time.
+- Approvals apply as for every reviewer: a confidential rubric only goes to pull reviewers listed in `allowed_reviewers`, checked again at claim time, also when the rubric was made confidential after the review was submitted.
+- A pull reviewer on another machine gets the files with `review_file` (screenshots as images), using the paths in `snapshot_files` from the claim.
 
 ## MCP over HTTP and the web inbox
 
@@ -204,7 +206,7 @@ claude mcp add --transport http review-bus http://127.0.0.1:7777/mcp --header "A
 
 Open `http://rb.localhost:7777/inbox` (or `http://127.0.0.1:7777/inbox`) and paste the token once. The browser then keeps a session for 12 hours, until `rb serve` restarts. The session cookie is not the token, and on `rb.localhost` it is not sent to other services you run on `localhost` or `127.0.0.1`, which share cookies regardless of port. The inbox shows work waiting for pull reviewers, reviews waiting for your decision and recent reviews. A person can claim a pull reviewer's work there (the page shows the brief, the rubric, the work and the screenshots, then a form for findings), release a claim, and sign off reviews that await sign-off or were escalated. Times are shown in UTC.
 
-`rb serve` only listens on this machine. To listen on another address, set `http.allow_remote: true` and put TLS in front of it, since the token travels with every request. Behind a TLS proxy, set `http.public_origin` to the address people open (for example `https://reviews.example.com`), so the inbox accepts their form posts. For git reviews the inbox links the full patch, since the work shown on the page is cut at 120,000 characters. Requests that name another host (DNS rebinding) or come from another site's page are refused. Behind an HTTPS `public_origin` the inbox cookie is `Secure`. MCP sessions a client never closed are dropped after an hour without requests (at most 100 are kept).
+`rb serve` only listens on this machine. To listen on another address, set `http.allow_remote: true` and put TLS in front of it, since the token travels with every request. Behind a TLS proxy, set `http.public_origin` to the address people open (for example `https://reviews.example.com`), so the inbox accepts their form posts. For git reviews the inbox links the full patch, since the work shown on the page is cut at 120,000 characters. Requests that name another host (DNS rebinding) or come from another site's page are refused. Behind an HTTPS `public_origin` the inbox cookie is `Secure`. MCP sessions a client never closed are dropped after an hour without requests; at most 100 are kept, and with all of them busy a new client is asked to retry. If your inbox session expires while you write a review, sending it asks for the token and then sends what you wrote.
 
 ## Use it from the command line
 
