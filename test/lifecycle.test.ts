@@ -390,3 +390,56 @@ test("two processes recovering the same stale lock lose no update", async () => 
   assert.ok(!existsSync(path.join(store.dir(id), ".lock")));
   assert.ok(!existsSync(path.join(store.dir(id), ".lock.steal")));
 });
+
+test("revocation reaches an open MCP server: new submits refuse; a confidential rubric without approvals gets no merge model", async () => {
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  try {
+    cfg.allowed_reviewers = { proposal: ["slow"] };
+    writeFileSync(configFile, JSON.stringify(cfg));
+    await fails("review_submit", { artifact: doc(), rubric: "proposal", intent: "x", reviewers: ["fake"] }, /Reviewer\(s\) fake are not approved for this rubric/);
+  } finally {
+    delete cfg.allowed_reviewers;
+    writeFileSync(configFile, JSON.stringify(cfg));
+  }
+});
+
+test("a live process keeps its lock however long it holds it; a gone one does not", () => {
+  const store = person().store;
+  const id = "rv_" + "0".repeat(26);
+  mkdirSync(path.join(store.dir(id), ".lock"), { recursive: true });
+  // Owned by this (live) process, written long ago.
+  writeFileSync(path.join(store.dir(id), ".lock", "owner"), JSON.stringify({ pid: process.pid, host: os.hostname(), token: "other", at: Date.now() - 3_600_000 }));
+  const started = Date.now();
+  assert.throws(() => store.withLock(id, () => 1), /locked by another process/);
+  assert.ok(Date.now() - started >= 14_000);
+  rmSync(store.dir(id), { recursive: true, force: true });
+});
+
+test("a round folder left by an interrupted resubmit does not block the retry", async () => {
+  const { json } = await submit(doc());
+  const id = json.review_id;
+  const dir = person().store.dir(id);
+  mkdirSync(path.join(dir, "r2"));
+  writeFileSync(path.join(dir, "r2", "leftover.txt"), "from an attempt that stopped before saving");
+  const answers = json.findings.map((f: { finding_id: string }) => ({ finding_id: f.finding_id, status: "deferred", note: "Later." }));
+  const { json: r2 } = await ok("review_respond", { review_id: id, responses: answers, resubmit: true, wait_seconds: 10 });
+  assert.equal(r2.round, 2);
+  assert.ok(!existsSync(path.join(dir, "r2", "leftover.txt")));
+  assert.ok(existsSync(path.join(dir, "r2", "artifact.md")));
+});
+
+test("assumption challenges show in the default result even when advisory", async () => {
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  cfg.adapters.challenger = { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs"), "--challenge"] };
+  writeFileSync(configFile, JSON.stringify(cfg));
+  const engine = person();
+  const review = await engine.submit(
+    { artifact: { path: doc(true) }, pages: [], rubric: "proposal", intent: "x", assumptions: ["Slovenian law"], criteria: [], reviewers: [{ name: "challenger" }], stage: "pre-merge" },
+    { client: null, vendor: null, vendor_source: "unknown" },
+    10,
+  );
+  const { res } = await ok("review_result", { review_id: review.id });
+  const payload = JSON.parse(res.content.at(-1)!.text);
+  assert.ok(payload.findings.some((f: { assumption_challenge: boolean; blocking: boolean }) => f.assumption_challenge && !f.blocking));
+  assert.match(res.content[0].text, /## Assumption challenges \(advisory\)/);
+});

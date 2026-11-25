@@ -12,7 +12,8 @@ import type { AuthorInfo, Review } from "./types.js";
 
 function resultPayload(review: Review, includeAdvisory: boolean) {
   const round = review.rounds.at(-1);
-  const findings = (round?.findings ?? []).filter((f) => includeAdvisory || f.blocking);
+  // Challenges to the author's assumptions are always shown, even when advisory (SPEC 6).
+  const findings = (round?.findings ?? []).filter((f) => includeAdvisory || f.blocking || f.assumption_challenge);
   return {
     review_id: review.id,
     state: review.state,

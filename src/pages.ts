@@ -81,6 +81,8 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
   try {
     browser = await pw.chromium.launch({
       headless: true,
+      // Playwright turns Chrome's own sandbox off by default; pages can be untrusted.
+      chromiumSandbox: true,
       ...(cfg.executable_path ? { executablePath: cfg.executable_path } : cfg.channel ? { channel: cfg.channel } : {}),
     });
   } catch (err) {

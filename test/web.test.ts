@@ -374,3 +374,26 @@ test("the link check compares origins and does not follow redirects off-site", {
   assert.equal(page.links_checked, 2); // the redirect and index.html, not the lookalike
   assert.deepEqual(page.broken_links, []);
 });
+
+test("snapshotting a repo never runs commands named in that repo's git config", async () => {
+  const repo = newRepo("site-trap");
+  const ran = path.join(tmp, "trap-ran");
+  writeFileSync(path.join(repo, ".gitattributes"), "* filter=evil\n");
+  sh(repo, "add", ".");
+  sh(repo, "commit", "-q", "-m", "attrs");
+  sh(repo, "checkout", "-q", "-b", "feature");
+  writeFileSync(path.join(repo, "index.html"), "changed\n");
+  sh(repo, "commit", "-q", "-am", "change");
+  writeFileSync(path.join(repo, "about.html"), "uncommitted\n");
+  // Armed only now, after the test's own git commands: commands a repo's config can name.
+  // Plain git runs filters on diff/checkout and fsmonitor on status.
+  sh(repo, "config", "filter.evil.clean", `touch ${ran}-clean; cat`);
+  sh(repo, "config", "filter.evil.smudge", `touch ${ran}-smudge; cat`);
+  sh(repo, "config", "core.fsmonitor", `touch ${ran}-fsmonitor; false`);
+
+  for (const mode of ["uncommitted", "base", "all"]) {
+    const { json, text } = await call("review_submit", { artifact: { git: { repo, mode, base: "main" } }, rubric: "code", intent: "x", wait_seconds: 30 });
+    assert.ok(json, `${mode}: ${text}`);
+  }
+  assert.deepEqual(readdirSync(tmp).filter((f) => f.startsWith("trap-ran")), []);
+});

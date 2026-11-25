@@ -71,6 +71,8 @@ export function runProcess(
     });
     child.on("close", (code) => {
       done();
+      // The reviewer is gone; anything it started that is still in its group goes too.
+      if (canceled || timedOut) killTree("SIGKILL");
       if (canceled) reject(new Error("canceled"));
       else resolve({ code, stdout, stderr, timedOut });
     });

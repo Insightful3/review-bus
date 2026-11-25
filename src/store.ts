@@ -29,8 +29,9 @@ function isStale(lock: string): boolean {
   }
   const owner = readOwner(lock);
   if (!owner) return age > 30_000; // created but owner not written yet, or left by a crash in between
-  if (Date.now() - owner.at > 120_000) return true;
-  if (owner.host !== os.hostname()) return false;
+  // On another machine (shared storage) liveness cannot be checked: fall back to age.
+  if (owner.host !== os.hostname()) return Date.now() - owner.at > 120_000;
+  // On this machine only a gone owner makes a lock stale, however long a live one holds it.
   try {
     process.kill(owner.pid, 0);
     return false;
@@ -238,6 +239,10 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
     if (includeAdvisory) {
       lines.push("", "## Advisory findings", "");
       lines.push(advisory.length ? advisory.map(findingLine).join("\n") : "None.");
+    } else {
+      // Challenges to the author's assumptions are always shown (SPEC 6).
+      const challenges = advisory.filter((f) => f.assumption_challenge);
+      if (challenges.length) lines.push("", "## Assumption challenges (advisory)", "", challenges.map(findingLine).join("\n"));
     }
   }
   return lines.join("\n") + "\n";

@@ -19,12 +19,13 @@ export async function snapshotDocument(sourcePath: string, reviewDir: string, ro
   const ext = path.extname(abs).toLowerCase();
   const kind = kindOf(ext);
   if (!kind) throw new Error(`Unsupported document type "${ext}". Supported: .md, .markdown, .txt, .docx, .pdf.`);
-  const data = readFileSync(abs);
-  const sha256 = createHash("sha256").update(data).digest("hex");
   const rdir = path.join(reviewDir, `r${round}`);
   mkdirSync(rdir, { recursive: true });
   const file = `r${round}/original${ext}`;
+  // Copy first, then hash and convert the copy: the source may be saved again meanwhile, and the
+  // hash must describe exactly what reviewers get.
   copyFileSync(abs, path.join(reviewDir, file));
+  const sha256 = createHash("sha256").update(readFileSync(path.join(reviewDir, file))).digest("hex");
   const converted = await toMarkdown(path.join(reviewDir, file), kind);
   if (!converted.markdown.trim()) throw new Error(`No text could be read from ${abs}.`);
   const markdown_file = `r${round}/artifact.md`;
@@ -67,9 +68,12 @@ export async function snapshotRound(
       if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`Related document not found: ${abs}`);
       const kind = kindOf(path.extname(abs).toLowerCase());
       if (!kind) throw new Error(`Unsupported related document type: ${abs}. Supported: .md, .markdown, .txt, .docx, .pdf.`);
-      const data = readFileSync(abs);
-      const converted = await toMarkdown(abs, kind);
-      const markdown_file = `${dirRel}/${String(i + 1).padStart(2, "0")}-${path.basename(abs, path.extname(abs)).replace(/[^a-z0-9]+/gi, "-").slice(0, 40)}.md`;
+      const base = `${dirRel}/${String(i + 1).padStart(2, "0")}-${path.basename(abs, path.extname(abs)).replace(/[^a-z0-9]+/gi, "-").slice(0, 40)}`;
+      const copy = path.join(reviewDir, `${base}.original${path.extname(abs).toLowerCase()}`);
+      copyFileSync(abs, copy); // hash and convert the same bytes, as for the main document
+      const data = readFileSync(copy);
+      const converted = await toMarkdown(copy, kind);
+      const markdown_file = `${base}.md`;
       writeFileSync(path.join(reviewDir, markdown_file), converted.markdown);
       const sha256 = createHash("sha256").update(data).digest("hex");
       hash.update(sha256);

@@ -118,6 +118,21 @@ process.stdin.on("end", async () => {
           assumption_challenge: false,
           confidence: 0.7,
         },
+        ...(process.argv.includes("--challenge")
+          ? [
+              {
+                claim: "The governing law is assumed but not stated.",
+                failure_scenario: "A dispute arises and the parties disagree on which law applies.",
+                evidence: "The author assumes Slovenian law; the document does not say.",
+                location: loc("Price and payment", "Invoices are due in 15 days."),
+                likelihood: "possible",
+                impact: "medium",
+                suggested_fix: "State the governing law.",
+                assumption_challenge: true,
+                confidence: 0.8,
+              },
+            ]
+          : []),
       ],
     })),
   );

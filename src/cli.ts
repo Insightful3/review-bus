@@ -57,21 +57,29 @@ function exitCodeFor(state: ReviewState): number {
 
 /** Waits for the round in this process, printing each reviewer as it finishes. Ctrl-C cancels. */
 async function follow(engine: Engine, id: string): Promise<Review> {
+  // Ctrl-C cancels the review and waits until its reviewers have really stopped (a reviewer that
+  // ignores SIGTERM is killed after 5 s); a second Ctrl-C exits at once.
+  let interrupted = false;
   const onInt = () => {
+    if (interrupted) process.exit(130);
+    interrupted = true;
     try {
       engine.cancel(id);
-      console.error(`\nrb: canceled ${id}`);
+      console.error(`\nrb: canceling ${id}, waiting for reviewers to stop (Ctrl-C again to quit now)`);
     } catch {
       /* already finished */
     }
-    process.exit(130);
+    void engine.settled(id).then(() => {
+      console.error(`rb: canceled ${id}`);
+      process.exit(130);
+    });
   };
-  process.once("SIGINT", onInt);
+  process.on("SIGINT", onInt);
   const reported = new Set<string>();
   const t0 = Date.now();
   let review = engine.get(id);
   console.error(`rb: ${id} round ${review.rounds.length}, reviewers: ${review.rounds.at(-1)!.reviewers.map((r) => r.label).join(", ")}`);
-  while (review.state === "in_review") {
+  while (review.state === "in_review" && !interrupted) {
     await engine.waitFor(id, 5);
     review = engine.get(id);
     for (const r of review.rounds.at(-1)!.reviewers) {
@@ -81,6 +89,7 @@ async function follow(engine: Engine, id: string): Promise<Review> {
       }
     }
   }
+  if (interrupted) await new Promise(() => {}); // the Ctrl-C handler exits once reviewers stopped
   process.off("SIGINT", onInt);
   return review;
 }

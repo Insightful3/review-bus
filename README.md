@@ -14,7 +14,7 @@ Status: v0.1, working name. See `SPEC.md` for the design and `TASKS.md` for what
 
 ## Requirements
 
-- Node.js 22 or newer, and git
+- Node.js 22 or newer, and git 2.40 or newer
 - At least one reviewer CLI, logged in:
   - [Codex CLI](https://github.com/openai/codex) (`npm install -g @openai/codex`, then `codex login`)
   - [Claude Code](https://claude.com/claude-code) (`claude`)
@@ -246,6 +246,7 @@ rv_<id>/
 - review-bus does not write to the reviewed repo: the reviewers' copy is made with a temporary index (`git read-tree` and `git checkout-index`) and `git apply` inside the review folder.
 - Several sessions and `rb` can use the same reviews at once: every change to a review holds a lock shared by all processes, and a cancel from any of them stops the reviewers (the whole process group, forcefully if they ignore the polite signal).
 - Approvals (`allowed_reviewers`) are read from the config file again before each new round and merge, so revoking a reviewer takes effect without restarting sessions.
+- Custom `command` reviewers run with your own permissions, like any program you run: review-bus does not sandbox them. Use them for tests and scripts you trust; the Codex and Claude adapters are the read-only ones.
 - Whatever you submit is sent to the reviewer's vendor (OpenAI for Codex, Anthropic for Claude). Mark rubrics for confidential material with `confidential: true` and list approved reviewers in `allowed_reviewers`.
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.
 - Every agent session starts its own review-bus server. A review records which process runs it, so other sessions leave a running review alone and only mark it failed once that process is gone.

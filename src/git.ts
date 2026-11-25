@@ -37,11 +37,25 @@ export interface GitInfo {
   notes: string[];
 }
 
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+const EMPTY_TREE_ID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const EMPTY_TREE = EMPTY_TREE_ID;
+
+/**
+ * Every git call runs hardened against the reviewed repo's own configuration, which can name
+ * commands to run: attributes come from the empty tree (so no clean/smudge filters, diff drivers
+ * or export rules apply) and fsmonitor is off. Checked on git 2.54: with these, a repo whose config
+ * names a clean filter, a smudge filter and an fsmonitor command runs none of them during
+ * diff, status, read-tree and checkout-index.
+ */
+const HARDEN = ["-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "core.hooksPath=/dev/null"];
+const hardened = (cwd: string, args: string[]) => [...HARDEN, `--attr-source=${EMPTY_TREE_ID}`, "-C", cwd, ...args];
+const runGit = (cwd: string, args: string[], extra: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}) =>
+  spawnSync("git", hardened(cwd, args), { maxBuffer: extra.maxBuffer, env: extra.env ? { ...process.env, ...extra.env } : undefined });
 
 /** Runs git and returns raw bytes: patches must not be decoded (a non-UTF-8 file would change). */
 function gitBuf(cwd: string, args: string[], opts: { okCodes?: number[]; env?: NodeJS.ProcessEnv } = {}): Buffer {
-  const r = spawnSync("git", ["-C", cwd, ...args], { maxBuffer: 512 * 1024 * 1024, env: opts.env ? { ...process.env, ...opts.env } : undefined });
+  const r = runGit(cwd, args, { maxBuffer: 512 * 1024 * 1024, env: opts.env });
   if (r.error) throw new Error(`git not available: ${r.error.message}`);
   if (!(opts.okCodes ?? [0]).includes(r.status ?? -1)) {
     throw new Error(`git ${args[0]} failed: ${r.stderr.toString().trim().split("\n").slice(-3).join(" | ")}`);
@@ -54,12 +68,12 @@ function git(cwd: string, args: string[], opts: { okCodes?: number[] } = {}): st
 }
 
 const tryRev = (root: string, ref: string) => {
-  const r = spawnSync("git", ["-C", root, "rev-parse", "--verify", "-q", `${ref}^{commit}`]);
+  const r = runGit(root, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]);
   return r.status === 0 ? r.stdout.toString().trim() : null;
 };
 
 function defaultBase(root: string): string {
-  const head = spawnSync("git", ["-C", root, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]);
+  const head = runGit(root, ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]);
   const candidates = [head.status === 0 ? head.stdout.toString().trim() : null, "origin/main", "main", "origin/master", "master"];
   for (const c of candidates) if (c && tryRev(root, c)) return c;
   throw new Error("Could not find a base branch (tried origin/HEAD, origin/main, main, origin/master, master). Pass git.base.");
@@ -93,7 +107,7 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
   const repo = path.resolve(expandHome(spec.repo));
   const root = git(repo, ["rev-parse", "--show-toplevel"]).trim();
   const headSha = git(root, ["rev-parse", "HEAD"]).trim();
-  const branchOut = spawnSync("git", ["-C", root, "symbolic-ref", "-q", "--short", "HEAD"]);
+  const branchOut = runGit(root, ["symbolic-ref", "-q", "--short", "HEAD"]);
   const branch = branchOut.status === 0 ? branchOut.stdout.toString().trim() : null;
   const notes: string[] = [];
   let baseRef: string | null = null;

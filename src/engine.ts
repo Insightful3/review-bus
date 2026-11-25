@@ -40,7 +40,8 @@ export class Engine {
 
   async submit(req: ReviewRequest, author: AuthorInfo, waitSeconds = 0): Promise<Review> {
     const rubric = loadRubric(req.rubric, this.config.rubric_paths);
-    const allowed = this.allowedReviewers(req.rubric, rubric.meta);
+    // Approvals as they are on disk now: a session may have started before one was revoked.
+    const allowed = this.allowedReviewers(req.rubric, rubric.meta, this.currentConfig());
     const { specs, notes } = this.pickReviewers(req.reviewers, author, allowed);
     const runs = specs.map((spec) => this.planRun(spec, rubric.meta, req.stage));
     const id = newReviewId();
@@ -81,8 +82,11 @@ export class Engine {
       if (isNew && !existsSync(path.join(reviewDir, "review.json"))) rmSync(reviewDir, { recursive: true, force: true });
       throw err;
     }
+    // Called under the lock, after checking the saved review has exactly n-1 rounds. A folder for
+    // round n that the saved review does not reference is left by an attempt that stopped between
+    // moving its files and saving: remove it, or every retry would be blocked.
     const publish = () => {
-      if (existsSync(this.store.roundDir(review.id, n))) throw new Error(`Round ${n} of ${review.id} was started by someone else meanwhile. Nothing was started.`);
+      rmSync(this.store.roundDir(review.id, n), { recursive: true, force: true });
       renameSync(path.join(staging, `r${n}`), this.store.roundDir(review.id, n));
     };
     const addRound = (r: Review) => {
@@ -345,6 +349,11 @@ export class Engine {
     };
   }
 
+  /** Resolves when this process's round for the review has fully finished (reviewers exited). */
+  async settled(id: string): Promise<void> {
+    await this.running.get(id);
+  }
+
   async waitFor(id: string, seconds: number): Promise<void> {
     const job = this.running.get(id);
     if (!job) {
@@ -437,12 +446,23 @@ export class Engine {
     roundDir: string,
     signal: AbortSignal,
   ): Promise<void> {
+    // Last check before anything leaves the machine: approvals as they are on disk right now.
+    let dispatchError: (name: string) => string | null;
+    try {
+      const allowed = this.allowedReviewers(review.request.rubric, review.rubric_meta, this.currentConfig());
+      dispatchError = (name) => (allowed && !allowed.includes(name) ? `no longer approved for ${review.request.rubric}; nothing was sent` : null);
+    } catch (err) {
+      const message = (err as Error).message;
+      dispatchError = () => message;
+    }
     const results = await Promise.all(
       round.reviewers.map(async (run) => {
         run.status = "running";
         run.started_at = now();
         this.saveRun(id, n, run);
         try {
+          const refused = dispatchError(run.name);
+          if (refused) throw new Error(refused);
           const res = await runAdapter(this.config.adapters[run.name], {
             reviewerName: run.name,
             prompt,
@@ -481,7 +501,7 @@ export class Engine {
       max_blocking: this.config.policy.max_blocking,
       high_blocks_always: review.rubric_meta.high_blocks_always === true,
     };
-    const { merged, merge } = await this.merge(raised, review.request.rubric, roundDir, signal, (f) => wouldBlock(f, policy));
+    const { merged, merge } = await this.merge(raised, review.request.rubric, review.rubric_meta, roundDir, signal, (f) => wouldBlock(f, policy));
     const findings: Finding[] = merged.map((m, i) => ({
       ...m.finding,
       finding_id: `r${n}.f${i + 1}`,
@@ -544,6 +564,7 @@ export class Engine {
   private async merge(
     raised: Raised[],
     rubricName: string,
+    rubricMeta: Record<string, unknown>,
     roundDir: string,
     signal: AbortSignal,
     canBlock: CanBlock,
@@ -552,13 +573,15 @@ export class Engine {
     if (reviewers.size < 2) return { merged: mergeFindings(raised, canBlock), merge: { method: "none", by: null, error: null } };
     // The merge model sees quotes from the work: check approvals as they are on disk now.
     let current: Config;
+    let allowed: string[] | null;
     try {
       current = this.currentConfig();
+      // Throws for a confidential rubric whose approval entry was removed: then no model sees it.
+      allowed = this.allowedReviewers(rubricName, rubricMeta, current);
     } catch (err) {
       return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: (err as Error).message } };
     }
     const mw = current.merge_with;
-    const allowed = current.allowed_reviewers[rubricName];
     if (!mw || !this.config.adapters[mw.adapter] || (allowed && !allowed.includes(mw.adapter))) {
       return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: mw ? `${mw.adapter} is not approved for ${rubricName}` : null } };
     }

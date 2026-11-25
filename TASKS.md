@@ -49,6 +49,7 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 
 ## Later
 
+- [ ] Open decision (self-review round 3, f5): an agent with shell access can run `rb signoff` with your name. Options: leave as is, or require an interactive terminal and typing the review id.
 - [ ] Return the review_id before slow page capture (self-review round 2, f10). Trade-off: snapshot errors would then arrive as a failed review, not as an error on review_submit.
 - [ ] Optional `model` for Codex in `~/.review-bus/config.json`: reviewers ignore `~/.codex/config.toml` now, so they use Codex's default model.
 - [ ] Optional `codex exec review` native pass (SPEC 8)
