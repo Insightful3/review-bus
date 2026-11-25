@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { expandHome } from "./config.js";
+import { envWithoutGit } from "./env.js";
 
 export const GitSpec = z.object({
   repo: z.string().describe("Path to the git repository"),
@@ -88,7 +89,7 @@ function refuseInfoAttributes(root: string): void {
 // a remote and can run a configured transport command). A missing object is an error instead.
 const NO_FETCH_ENV = { GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" };
 const runGit = (cwd: string, args: string[], extra: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}) =>
-  spawnSync("git", hardened(cwd, args), { maxBuffer: extra.maxBuffer, env: { ...process.env, ...NO_FETCH_ENV, ...extra.env } });
+  spawnSync("git", hardened(cwd, args), { maxBuffer: extra.maxBuffer, env: { ...envWithoutGit(), ...NO_FETCH_ENV, ...extra.env } });
 
 /** Runs git and returns raw bytes: patches must not be decoded (a non-UTF-8 file would change). */
 function gitBuf(cwd: string, args: string[], opts: { okCodes?: number[]; env?: NodeJS.ProcessEnv } = {}): Buffer {
@@ -214,7 +215,7 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
   // GIT_CEILING_DIRECTORIES stops git from treating a parent folder of the review dir as the repo.
   const apply = spawnSync("git", ["apply", "--binary", "--whitespace=nowarn", path.join(reviewDir, patchFile)], {
     cwd: treeAbs,
-    env: { ...process.env, GIT_CEILING_DIRECTORIES: path.dirname(treeAbs) },
+    env: { ...envWithoutGit(), GIT_CEILING_DIRECTORIES: path.dirname(treeAbs) },
   });
   if (apply.status !== 0) throw new Error(`Could not apply the change to the base copy: ${apply.stderr.toString().trim()}`);
 

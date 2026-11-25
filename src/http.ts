@@ -12,7 +12,11 @@ import type { Engine } from "./engine.js";
 import { createServer } from "./server.js";
 import { answerFromForm, INBOX_JS, renderClaimPage, renderError, renderInbox, renderLogin, renderReviewPage } from "./inbox.js";
 
-const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
+// rb.localhost: browsers resolve *.localhost to this machine, and a cookie set for it is not sent to
+// other services on localhost or 127.0.0.1 (cookies ignore ports, host names do not).
+const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost", "rb.localhost"]);
+/** Inbox sessions live this long. They are kept in memory: restarting rb serve logs everyone out. */
+const SESSION_MS = 12 * 60 * 60 * 1000;
 
 /** The token from token_file, created (random, mode 600) on first start. */
 export function loadToken(file: string): string {
@@ -80,11 +84,24 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
       return false;
     }
   };
-  const cookieToken = (req: http.IncomingMessage) =>
-    (req.headers.cookie ?? "")
-      .split(";")
-      .map((c) => c.trim().split("="))
-      .find(([k]) => k === "rb_token")?.[1] ?? "";
+  // The inbox cookie holds a random session id, never the MCP token: cookies are not separated by
+  // port, so another service on the same host name would receive it.
+  const sessionsByCookie = new Map<string, number>(); // session id -> expiry (ms)
+  const cookieName = () => `rb_session_${port}`;
+  const sessionOk = (req: http.IncomingMessage) => {
+    const value =
+      (req.headers.cookie ?? "")
+        .split(";")
+        .map((c) => c.trim().split("="))
+        .find(([k]) => k === cookieName())?.[1] ?? "";
+    const expiry = value ? sessionsByCookie.get(value) : undefined;
+    if (!expiry) return false;
+    if (expiry < Date.now()) {
+      sessionsByCookie.delete(value);
+      return false;
+    }
+    return true;
+  };
 
   const send = (res: http.ServerResponse, status: number, body: string, type = "text/html; charset=utf-8", extra: Record<string, string> = {}) => {
     res.writeHead(status, { "content-type": type, ...SECURITY_HEADERS, ...extra });
@@ -150,7 +167,13 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
       if (req.method === "POST") {
         const form = new URLSearchParams(await readBody(req, 64 * 1024));
         if (same((form.get("token") ?? "").trim(), token)) {
-          res.writeHead(303, { location: "/inbox", "set-cookie": `rb_token=${token}; HttpOnly; SameSite=Strict; Path=/`, ...SECURITY_HEADERS });
+          const session = randomBytes(32).toString("hex");
+          sessionsByCookie.set(session, Date.now() + SESSION_MS);
+          res.writeHead(303, {
+            location: "/inbox",
+            "set-cookie": `${cookieName()}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}`,
+            ...SECURITY_HEADERS,
+          });
           res.end();
           return;
         }
@@ -160,7 +183,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
       send(res, 200, renderLogin(null));
       return;
     }
-    if (!same(cookieToken(req), token)) {
+    if (!sessionOk(req)) {
       res.writeHead(303, { location: "/inbox/login", ...SECURITY_HEADERS });
       res.end();
       return;
@@ -241,7 +264,13 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
   };
 
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://localhost");
+    } catch {
+      send(res, 400, "Bad request", "text/plain");
+      return;
+    }
     if (!hostOk(req) || !originOk(req)) {
       send(res, 403, "Forbidden: unexpected Host or Origin", "text/plain");
       return;

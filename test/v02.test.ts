@@ -1,9 +1,10 @@
 // v0.2: pull reviewers, MCP over HTTP with a token, the web inbox, rubric packs, the review id
 // before slow page capture, and Codex's native review pass (with a fake codex).
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -403,4 +404,183 @@ test("codex-review: Codex's native review runs in a scratch repo built from the 
   const doc = await engine.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" }, PERSON, 10);
   await engine.settled(doc.id);
   assert.match(engine.get(doc.id).rounds[0].reviewers[0].error!, /git changes only/);
+});
+
+test("importing server.js (as rb serve does) starts no stdio server; running it does", async () => {
+  const run = (args: string[]) =>
+    new Promise<number>((resolve) => {
+      const p = spawn(process.execPath, args, { cwd: ROOT, env: { ...process.env, REVIEW_BUS_CONFIG: configFile }, stdio: ["pipe", "ignore", "ignore"] });
+      const t = setTimeout(() => {
+        p.kill();
+        resolve(-1); // still running: something reads stdin
+      }, 3000);
+      p.on("exit", (code) => {
+        clearTimeout(t);
+        resolve(code ?? 0);
+      });
+    });
+  assert.equal(await run(["--input-type=module", "-e", `await import(${JSON.stringify(path.join(ROOT, "dist/src/server.js"))});`]), 0);
+  assert.equal(await run([path.join(ROOT, "dist/src/server.js")]), -1);
+});
+
+test("the claim page shows a person the brief, the rubric and the work, with labelled fields", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "Win the Bluefin project.", assumptions: ["The client hosts it."], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  const html = await (await fetch(`${base}inbox/claim/${review.id}/person/start`, { method: "POST", headers: { cookie }, body: new URLSearchParams({ by: "Ana" }) })).text();
+  assert.match(html, /What the author wants<\/h2><p>Win the Bluefin project\./);
+  assert.match(html, /The client hosts it\./);
+  assert.match(html, /Rubric: proposal/);
+  assert.match(html, /<h2>The work<\/h2>/);
+  assert.match(html, /Total price: EUR 24,000/);
+  for (const f of ["f_claim", "f_failure", "f_evidence", "f_impact", "f_likelihood"]) assert.match(html, new RegExp(`name="${f}" aria-label="`));
+  engine.release(review.id, "person", "test");
+});
+
+// ---- Fixes from Codex's review of v0.2 ----
+
+test("a request target the URL parser rejects gets a 400 and the server keeps serving", async () => {
+  const { port } = new URL(base);
+  const reply = await new Promise<string>((resolve) => {
+    const sock = net.connect(Number(port), "127.0.0.1", () => sock.write(`GET //[ HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`));
+    let data = "";
+    sock.on("data", (d) => (data += d));
+    sock.on("close", () => resolve(data));
+  });
+  assert.match(reply, /^HTTP\/1\.1 (400|404)/);
+  assert.equal((await fetch(`${base}inbox/login`)).status, 200);
+});
+
+test("the inbox cookie is a session id scoped by port, never the MCP token", async () => {
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!;
+  assert.ok(!cookie.includes(token));
+  assert.match(cookie, new RegExp(`^rb_session_${new URL(base).port}=[0-9a-f]{64};`));
+  // The token itself as a cookie does not open the inbox.
+  const forged = await fetch(`${base}inbox`, { headers: { cookie: `rb_session_${new URL(base).port}=${token}` }, redirect: "manual" });
+  assert.equal(forged.status, 303);
+});
+
+test("a pull answer after the deadline is refused even if nobody looked in between", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }, { name: "quick" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  const work = engine.claim(review.id, "quick", { by: "Late", client: null });
+  await new Promise((r) => setTimeout(r, 1300));
+  await assert.rejects(engine.post(review.id, "quick", work.token, { output: { verdict: "approve", summary: "x", findings: [] } }), /missed its deadline/);
+  await engine.settled(review.id);
+  assert.equal(engine.get(review.id).rounds[0].reviewers.find((r) => r.name === "quick")!.status, "failed");
+});
+
+test("a round whose answers are all in but whose finisher died is finished by the next process", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  const file = path.join(tmp, "reviews", review.id, "review.json");
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  // As if the finishing process died mid-merge, while the round's runner is still alive.
+  Object.assign(saved, { state: "in_review" });
+  Object.assign(saved.rounds[0], { finished_at: null, findings: [], runner: { pid: process.pid + 0, host: os.hostname(), started_at: new Date().toISOString() }, finalizing: { pid: 999999, host: os.hostname(), started_at: new Date().toISOString() } });
+  writeFileSync(file, JSON.stringify(saved));
+  const other = new Engine(loadConfig());
+  other.get(review.id);
+  await other.settled(review.id);
+  const done = other.get(review.id);
+  assert.equal(done.state, "changes_requested");
+  assert.ok(done.rounds[0].findings.length > 0);
+});
+
+test("unclosed front matter is a rubric error, not a silently ignored confidential flag", () => {
+  const dir = path.join(tmp, "packs", "unclosed");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "contract.md"), RUBRIC.replace("require_signoff: true\n---\n", "require_signoff: true\n"));
+  assert.deepEqual(checkRubricPath(path.join(dir, "contract.md"))[0].problems, ["the front matter has no closing --- line"]);
+  assert.throws(() => loadRubric("contract", [dir]), /no closing --- line/);
+});
+
+test("responding to a review that failed before its first round says to submit again", async () => {
+  writeConfig({ snapshot_wait_seconds: 0 });
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: null, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  await e.settled(review.id);
+  await assert.rejects(e.respond(review.id, [], { resubmit: true }), /failed before its first round .* Submit the work again/);
+  writeConfig();
+});
+
+test("claim tokens are redacted from REVIEW_BUS_LOG", async () => {
+  const log = path.join(tmp, "requests.log");
+  process.env.REVIEW_BUS_LOG = log;
+  try {
+    const review = await engine.submit(
+      { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+      PERSON,
+      5,
+    );
+    const work = engine.claim(review.id, "person", { by: "Ana", client: null });
+    await call("review_post", { review_id: review.id, reviewer: "person", token: work.token, output: { verdict: "maybe" } });
+    const text = readFileSync(log, "utf8");
+    assert.match(text, /review_post/);
+    assert.ok(!text.includes(work.token));
+    assert.match(text, /\[redacted\]/);
+  } finally {
+    delete process.env.REVIEW_BUS_LOG;
+  }
+});
+
+test("codex-review: inherited GIT_* variables, ignored tracked files and relative symlinks", async () => {
+  const repo = path.join(tmp, "repo2");
+  const other = path.join(tmp, "other-repo");
+  mkdirSync(repo);
+  mkdirSync(other);
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd });
+  git(other, "init", "-q");
+  writeFileSync(path.join(other, "x.txt"), "x\n");
+  git(other, "add", ".");
+  git(other, "commit", "-q", "-m", "x");
+  const otherIndex = readFileSync(path.join(other, ".git", "index"));
+  const otherConfig = readFileSync(path.join(other, ".git", "config"));
+
+  writeFileSync(path.join(repo, ".gitignore"), "*.log\n");
+  writeFileSync(path.join(repo, "index.html"), "<h1>Hi</h1>\n");
+  writeFileSync(path.join(repo, "app.log"), "tracked on purpose\n");
+  writeFileSync(path.join(repo, "other.html"), "<p>other</p>\n");
+  symlinkSync("index.html", path.join(repo, "link.html"));
+  git(repo, "init", "-q");
+  git(repo, "add", ".");
+  git(repo, "add", "-f", "app.log");
+  git(repo, "commit", "-q", "-m", "base");
+  writeFileSync(path.join(repo, "app.log"), "tracked on purpose, changed\n");
+  execFileSync("rm", [path.join(repo, "link.html")]);
+  symlinkSync("other.html", path.join(repo, "link.html"));
+  git(repo, "commit", "-qam", "change");
+
+  process.env.GIT_DIR = path.join(other, ".git");
+  process.env.GIT_INDEX_FILE = path.join(other, ".git", "index");
+  process.env.GIT_WORK_TREE = other;
+  try {
+    const review = await engine.submit(
+      { artifact: { git: { repo, mode: "commit" } }, pages: [], rubric: "code", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" },
+      PERSON,
+      30,
+    );
+    await engine.settled(review.id);
+    const run = engine.get(review.id).rounds[0].reviewers[0];
+    assert.equal(run.status, "done", run.error ?? "");
+    // Both changed files (the ignored-but-tracked log and the symlink) are in the scratch repo's change.
+    assert.match(readFileSync(path.join(tmp, "reviews", review.id, "r1", "native.native.md"), "utf8"), /\(2 changed\)/);
+  } finally {
+    delete process.env.GIT_DIR;
+    delete process.env.GIT_INDEX_FILE;
+    delete process.env.GIT_WORK_TREE;
+  }
+  assert.ok(readFileSync(path.join(other, ".git", "index")).equals(otherIndex), "the other repo's index is untouched");
+  assert.ok(readFileSync(path.join(other, ".git", "config")).equals(otherConfig), "the other repo's config is untouched");
 });

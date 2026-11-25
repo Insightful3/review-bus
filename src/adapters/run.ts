@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { envWithoutGit } from "../env.js";
 
 export interface ProcResult {
   code: number | null;
@@ -46,7 +47,7 @@ export function runProcess(
     }
     const child = spawn(command, args, {
       cwd: opts.cwd,
-      env: { ...process.env, ...opts.env },
+      env: { ...envWithoutGit(), ...opts.env },
       stdio: ["pipe", "pipe", "pipe"],
       detached: true, // own process group, see killTree
     });

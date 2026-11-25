@@ -137,7 +137,10 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
       // Opt-in diagnostics: which tool calls arrive, and whether as tasks (REVIEW_BUS_LOG=<file>).
       if (process.env.REVIEW_BUS_LOG && m.method) {
         const name = (m.params as { name?: string } | undefined)?.name;
-        const detail = m.method === "initialize" || m.method === "server/discover" || m.method === "tools/call" || m.method?.startsWith("tasks/") ? { params: m.params } : {};
+        // Claim tokens are credentials: never written to the log.
+        const params = m.params as { arguments?: Record<string, unknown> } | undefined;
+        const safe = params?.arguments && "token" in params.arguments ? { ...params, arguments: { ...params.arguments, token: "[redacted]" } } : params;
+        const detail = m.method === "initialize" || m.method === "server/discover" || m.method === "tools/call" || m.method?.startsWith("tasks/") ? { params: safe } : {};
         appendFileSync(process.env.REVIEW_BUS_LOG, JSON.stringify({ at: new Date().toISOString(), method: m.method, tool: name ?? null, task: Boolean(m.params?.task), ...detail }) + "\n");
       }
       deliver?.(message, extra);
@@ -146,11 +149,9 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
 
   /** Resolves once the review's current round is over, wherever it runs. */
   const untilDone = async (id: string) => {
-    while (isActive(engine.get(id).state)) {
-      await engine.waitFor(id, 30);
-      // waitFor returns at once while only pull reviewers are left (they may take days): poll slowly.
-      if (onlyPullLeft(engine.get(id))) await new Promise((r) => setTimeout(r, 5000));
-    }
+    // A task ends when the round does, or when only pull reviewers are left: they may take days,
+    // longer than a task lives, and the result then says who is still to answer.
+    while (isActive(engine.get(id).state) && !onlyPullLeft(engine.get(id))) await engine.waitFor(id, 30);
     return engine.get(id);
   };
 

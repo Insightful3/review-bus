@@ -269,6 +269,7 @@ export class Engine {
     // Answers, checks and (without resubmit) closing happen in one locked step.
     const review = this.store.update(id, (r) => {
       if (r.state === "submitted") throw new Error(`Review ${id} is still being prepared (taking the snapshot). Wait for the result first.`);
+      if (!r.rounds.length) throw new Error(`Review ${id} failed before its first round (${r.notes.at(-1) ?? r.state}). Submit the work again as a new review.`);
       const round = r.rounds.at(-1)!;
       if (r.state === "in_review") throw new Error(`Review ${id} is still in review (round ${round.n}). Wait for the result first.`);
       if (r.state === "canceled") throw new Error(`Review ${id} is canceled.`);
@@ -502,6 +503,16 @@ export class Engine {
 
   /** Loads a review. A round left in_review with no job in this process was cut off by a restart. */
   get(id: string): Review {
+    const loaded = this.store.load(id);
+    // Every reviewer answered but the process finishing the round is gone (or never started):
+    // finish it here, so saved answers are not lost.
+    const rd = loaded.rounds.at(-1);
+    if (loaded.state === "in_review" && rd && !this.running.has(id) && roundSettled(rd) && !rd.finished_at && !this.runningElsewhere(rd.finalizing)) {
+      if (this.claimFinalize(id, rd.n)) {
+        this.finalizeInBackground(id, rd.n);
+        return this.store.load(id);
+      }
+    }
     const review = this.store.load(id);
     const cutOff = (r: Review) => {
       if (this.running.has(id)) return false;
@@ -847,6 +858,7 @@ export class Engine {
       }
       output = parsed.data;
     }
+    this.get(id); // records a missed deadline first, so a late answer is refused below
     let n = 0;
     let finish = false;
     this.store.update(id, (r) => {
@@ -854,6 +866,8 @@ export class Engine {
       const round = r.rounds.at(-1)!;
       const run = round.reviewers.find((x) => x.name === reviewer);
       if (!run || run.adapter !== "pull") throw new Error(`Review ${id} round ${round.n} has no pull reviewer "${reviewer}".`);
+      if (run.status === "failed" && run.error?.startsWith("no answer by the deadline")) throw new Error(`Reviewer "${reviewer}" missed its deadline (${run.deadline}); the answer was not recorded.`);
+      if (run.deadline && Date.parse(run.deadline) < Date.now()) throw new Error(`Reviewer "${reviewer}" missed its deadline (${run.deadline}); the answer was not recorded.`);
       if (run.status !== "running" || !run.claim || !safeEqual(run.claim.token, token)) {
         throw new Error(`No claim of "${reviewer}" on review ${id} round ${round.n} matches this token. Claim it first (review_claim).`);
       }

@@ -4,6 +4,7 @@ import path from "node:path";
 import type { AdapterConfig } from "../config.js";
 import { ReviewerOutput, reviewerOutputJsonSchema } from "../spec/reviewer-output.js";
 import { describeFailure, runProcess } from "./run.js";
+import { envWithoutGit } from "../env.js";
 
 export interface ReviewJob {
   reviewerName: string;
@@ -169,7 +170,7 @@ function scratchGit(cwd: string, args: string[], input?: Buffer): void {
       "-c", "user.name=review-bus", "-c", "user.email=review-bus@localhost", "-c", "init.defaultBranch=main",
       ...args,
     ],
-    { cwd, input, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, maxBuffer: 64 * 1024 * 1024 },
+    { cwd, input, env: { ...envWithoutGit(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, maxBuffer: 64 * 1024 * 1024 },
   );
   if (r.status !== 0) throw new Error(`git ${args[0]} in the codex-review copy failed: ${r.stderr.toString().trim().split("\n")[0]}`);
 }
@@ -203,7 +204,8 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
   if (!job.git) throw new Error("codex-review reviews git changes only; use the codex reviewer for documents and pages.");
   const native = path.join(job.outDir, `${job.reviewerName}.native`);
   rmSync(native, { recursive: true, force: true });
-  cpSync(job.git.tree, native, { recursive: true });
+  // verbatimSymlinks: a relative link must stay relative, or the reverse patch no longer matches it.
+  cpSync(job.git.tree, native, { recursive: true, verbatimSymlinks: true });
   const patch = readFileSync(job.git.patch);
   scratchGit(native, ["init", "-q"]);
   // The project's .gitattributes came along with the copy. info/attributes wins over it: no filters
@@ -212,9 +214,11 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
   // the author's repo, crashes git 2.54 in a repo without commits.)
   writeFileSync(path.join(native, ".git", "info", "attributes"), "* -filter -text -ident -working-tree-encoding\n");
   if (patch.length) scratchGit(native, ["apply", "-R", "--whitespace=nowarn", "-"], patch);
-  scratchGit(native, ["add", "-A"]);
+  // -f: every file of the copy is tracked in the project, including ones its .gitignore matches.
+  scratchGit(native, ["add", "-A", "-f"]);
   scratchGit(native, ["commit", "-q", "--allow-empty", "-m", "base"]);
-  if (patch.length) scratchGit(native, ["apply", "--whitespace=nowarn", "-"], patch);
+  // --index: the change is staged too, so new files that .gitignore matches are still part of it.
+  if (patch.length) scratchGit(native, ["apply", "--index", "--whitespace=nowarn", "-"], patch);
 
   const outFile = path.join(job.outDir, `${job.reviewerName}.native.md`);
   const args = ["exec", "review", "--uncommitted", ...codexIsolation(), "--output-last-message", outFile, ...codexModelArgs(job), ...cfg.args];

@@ -256,7 +256,8 @@ async function main() {
       const port = Number(v.port ?? engine.config.http.port);
       const host = v.host ?? engine.config.http.host;
       const { url } = await startHttp(engine, { port, host });
-      console.error(`rb: review-bus MCP over HTTP at ${url}mcp, inbox at ${url}inbox (token from ${engine.config.http.token_file})`);
+      const inbox = host === "127.0.0.1" || host === "localhost" ? `http://rb.localhost:${new URL(url).port}/inbox (or ${url}inbox)` : `${url}inbox`;
+      console.error(`rb: review-bus MCP over HTTP at ${url}mcp, inbox at ${inbox}. Token: ${engine.config.http.token_file}`);
       await new Promise(() => {}); // until Ctrl-C
       return;
     }

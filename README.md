@@ -202,7 +202,7 @@ rb serve
 claude mcp add --transport http review-bus http://127.0.0.1:7777/mcp --header "Authorization: Bearer $(cat ~/.review-bus/http-token)"
 ```
 
-Open `http://127.0.0.1:7777/inbox` and paste the token once (it is kept in a cookie for that browser). The inbox shows work waiting for pull reviewers, reviews waiting for your decision and recent reviews. A person can claim a pull reviewer's work there (the page shows the brief, the rubric, the work and the screenshots, then a form for findings), release a claim, and sign off reviews that await sign-off or were escalated. Times are shown in UTC.
+Open `http://rb.localhost:7777/inbox` (or `http://127.0.0.1:7777/inbox`) and paste the token once. The browser then keeps a session for 12 hours, until `rb serve` restarts. The session cookie is not the token, and on `rb.localhost` it is not sent to other services you run on `localhost` or `127.0.0.1`, which share cookies regardless of port. The inbox shows work waiting for pull reviewers, reviews waiting for your decision and recent reviews. A person can claim a pull reviewer's work there (the page shows the brief, the rubric, the work and the screenshots, then a form for findings), release a claim, and sign off reviews that await sign-off or were escalated. Times are shown in UTC.
 
 `rb serve` only listens on this machine. To listen on another address, set `http.allow_remote: true` and put TLS in front of it, since the token travels with every request. Requests that name another host (DNS rebinding) or come from another site's page are refused.
 
@@ -323,8 +323,9 @@ rv_<id>/
 - Custom `command` reviewers run with your own permissions, like any program you run: review-bus does not sandbox them. Use them for tests and scripts you trust; the Codex and Claude adapters are the read-only ones.
 - Whatever you submit is sent to the reviewer's vendor (OpenAI for Codex, Anthropic for Claude). Mark rubrics for confidential material with `confidential: true` and list approved reviewers in `allowed_reviewers`.
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.
-- `rb serve` listens on `127.0.0.1` only unless `http.allow_remote` is set, needs the token for `/mcp` and the inbox, and refuses requests with another `Host` or `Origin` (DNS rebinding, other sites' pages). The inbox cookie is `HttpOnly` and `SameSite=Strict`, and pages are served with a strict Content Security Policy. The inbox never serves `review.json`, only a round's screenshots and Markdown.
-- Pull reviewer claim tokens are compared in constant time and never appear in results, reports or the inbox's review pages.
+- `rb serve` listens on `127.0.0.1` only unless `http.allow_remote` is set, needs the token for `/mcp` and the inbox, and refuses requests with another `Host` or `Origin` (DNS rebinding, other sites' pages). The inbox keeps a random session id in an `HttpOnly`, `SameSite=Strict` cookie (never the token), and pages are served with a strict Content Security Policy. The inbox never serves `review.json`, only a round's screenshots and Markdown, and never follows a symlink out of the review folder. A bad request cannot stop the server.
+- Pull reviewer claim tokens are compared in constant time and never appear in results, reports, the inbox's review pages or the `REVIEW_BUS_LOG` file. An answer after the deadline is refused.
+- git variables in review-bus's environment (`GIT_DIR`, `GIT_INDEX_FILE` and the rest, as set inside a git hook) are removed before any git call and from every reviewer's environment, so they cannot point git at another repository.
 - `codex-review` builds its scratch git repo inside the round folder, with your global and system git config ignored and filters and line-ending conversion switched off.
 - Every agent session starts its own review-bus server. A review records which process runs it, so other sessions leave a running review alone and only mark it failed once that process is gone.
 
@@ -338,7 +339,7 @@ Found when review-bus reviewed itself with Codex, and not fixed yet:
 - **A rubric made confidential during a resubmit** is checked with the rules it had when the review started.
 - **Slow pages on resubmit.** A new review returns its id before slow page capture (see Waiting and timeouts), but a resubmit still captures the pages before it returns. Clients that show progress are not affected.
 - **Who may act as a pull reviewer.** Without `claim_clients`, any connected MCP client can claim a pull reviewer's work, the author's own agent included. MCP client names are what the client says it is, so `claim_clients` keeps honest clients apart rather than stopping a determined one.
-- **The inbox and the HTTP token.** One token opens everything, the same trust as your terminal: whoever has it can claim work, post answers and sign off. The HTTP server speaks plain HTTP; keep it on this machine or put TLS in front.
+- **The inbox and the HTTP token.** One token opens everything, the same trust as your terminal: whoever has it can claim work, post answers and sign off. The HTTP server speaks plain HTTP; keep it on this machine or put TLS in front. On `127.0.0.1` or `localhost` (rather than `rb.localhost`), another local service that the browser visits receives the inbox session cookie.
 - **Sign-off.** `rb signoff` and the inbox record whatever name they are given, and anything that can run commands in your terminal (an agent included) can run it. This is a deliberate choice, not an oversight.
 
 ## Development

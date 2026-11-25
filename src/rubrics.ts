@@ -23,6 +23,8 @@ const NAME = /^[a-z0-9][a-z0-9-]*$/;
 
 function parseFrontMatter(text: string): { meta: Record<string, unknown>; body: string } {
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  // An unclosed header would be read as body text, and a confidential: true in it silently ignored.
+  if (!m && /^---\r?\n/.test(text)) throw new Error("the front matter has no closing --- line");
   if (!m) return { meta: {}, body: text };
   const meta: Record<string, unknown> = {};
   for (const line of m[1].split(/\r?\n/)) {
@@ -84,8 +86,13 @@ export function loadRubric(name: string, rubricPaths: string[], packs: RubricPac
     }
     if (!file) throw new Error(`Rubric "${name}" not found in: ${rubricPaths.join(", ")}`);
   }
-  const { meta, body } = parseFrontMatter(readFileSync(file, "utf8"));
-  return { name, file, body: body.trim(), meta };
+  let parsed;
+  try {
+    parsed = parseFrontMatter(readFileSync(file, "utf8"));
+  } catch (err) {
+    throw new Error(`Rubric "${name}" (${file}): ${(err as Error).message}`);
+  }
+  return { name, file, body: parsed.body.trim(), meta: parsed.meta };
 }
 
 /** The part of a rubric name approvals fall back to: "pack/contract-b2b" -> "contract-b2b". */
@@ -140,7 +147,13 @@ const KNOWN = new Set([...FLAGS, "effort", "models", "report_notice"]);
  */
 export function checkRubric(text: string): string[] {
   const problems: string[] = [];
-  const { meta, body } = parseFrontMatter(text);
+  let meta: Record<string, unknown>;
+  let body: string;
+  try {
+    ({ meta, body } = parseFrontMatter(text));
+  } catch (err) {
+    return [(err as Error).message];
+  }
   for (const h of ["## Purpose", "## What to check", "## Out of scope", "## Impact anchors"]) if (!body.includes(h)) problems.push(`missing section "${h}"`);
   const anchors = body.split("## Impact anchors")[1] ?? "";
   for (const level of ["critical:", "high:", "medium:", "low:"]) if (!anchors.includes(level)) problems.push(`Impact anchors lack "${level}"`);
