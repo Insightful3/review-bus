@@ -1,0 +1,58 @@
+{
+  "rubric_paths": [
+    "./rubrics",
+    "../review-bus-private/rubrics"
+  ],
+  "storage": {
+    "documents": "~/.review-bus/reviews"
+  },
+  "default_reviewers": [
+    "codex",
+    "claude"
+  ],
+  "author_vendors": {
+    "claude-code": "anthropic",
+    "codex-mcp-client": "openai"
+  },
+  "allowed_reviewers": {
+    "contract-b2b": [
+      "codex",
+      "claude"
+    ]
+  },
+  "adapters": {
+    "codex": {
+      "type": "codex",
+      "command": "codex",
+      "vendor": "openai",
+      "model": null,
+      "effort": "medium",
+      "args": [],
+      "timeout_seconds": 900
+    },
+    "claude": {
+      "type": "claude",
+      "command": "claude",
+      "vendor": "anthropic",
+      "model": null,
+      "effort": "medium",
+      "args": [],
+      "timeout_seconds": 900
+    },
+    "fake": {
+      "type": "command",
+      "command": "node",
+      "args": [
+        "./test/fake-reviewer.mjs",
+        "{model}",
+        "{effort}"
+      ],
+      "vendor": "other",
+      "timeout_seconds": 30
+    }
+  },
+  "policy": {
+    "max_blocking": 5,
+    "max_rounds": 3
+  }
+}

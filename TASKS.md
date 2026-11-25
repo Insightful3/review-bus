@@ -1,0 +1,47 @@
+# v0.1 task list
+
+Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
+
+## Slice 1: one document review loop (in progress)
+
+- [x] Project scaffold: TypeScript, Node 22+, ESM, `@modelcontextprotocol/sdk`, `zod`
+- [x] Reviewer output schema in zod, JSON Schema generated into `spec/` (Codex strict rules)
+- [x] Config loader (`REVIEW_BUS_CONFIG`, `~/.review-bus/config.json`, cwd)
+- [x] Rubric loader from `rubric_paths` (Markdown + front matter), `proposal` rubric
+- [x] Document snapshot for Markdown and plain text (copy + SHA-256)
+- [x] Reviewer prompt builder
+- [x] Adapters: generic command (fake reviewer for tests), Codex (`codex exec`)
+- [x] Risk policy: matrix, draft stage, no failure scenario means advisory, cap of 5 blocking
+- [x] Storage: `review.json` + `report.md` per review, outside the repo
+- [x] MCP tools `review_submit` and `review_result` over stdio
+- [x] End-to-end test: MCP client submits a Markdown doc, fake reviewer runs, result comes back
+- [x] Codex flags checked against `codex exec --help` (codex-cli 0.172.0); fake `codex` in tests checks them
+- [x] One real Codex review of the fixture proposal through the MCP server (about 30 s, 3 blocking, 2 advisory)
+- [x] Model and effort (SPEC 8a): config, rubric front matter, stage defaults, per-call override; passed as CLI flags; actual `adapter:model:effort` on findings and in `report.md`
+- [x] Reviewer vendor differs from author (SPEC 8a): adapter `vendor`, `author_vendors` from MCP `clientInfo.name` (names checked), `author_vendor` override
+
+## Slice 2: close the loop (done)
+
+- [x] `review_respond` (accepted / rejected with reason / deferred) and resubmit as round n+1, previous round in the prompt
+- [x] Round cap of 3, then `escalated`
+- [x] `review_status` (live reviewer status), `review_wait`, `review_list`, `review_cancel` (kills reviewers)
+- [x] `review_signoff` and `require_signoff` from rubric front matter
+- [x] Mark running rounds `failed` after a restart; late results from an old round do not change state
+- [x] `report.md` keeps earlier rounds with the author's answers
+
+## Slice 3: widen (in progress)
+
+- [x] Claude adapter (`claude -p ... --restricted`), fake `claude` in tests; real run with Codex as the author over MCP and Claude reviewing (SPEC 11.3)
+- [x] Git snapshots: uncommitted, base, commit; patch + `git archive` copy (nothing written to the author's repo)
+- [x] Page review: headless Chrome screenshots (desktop, mobile, tiled), page facts, broken links; images to Codex (`--image`), Claude (Read) and command reviewers
+- [x] `webpage` rubric
+- [x] DOCX (mammoth) and PDF (pdftotext, else unpdf) to Markdown; fictional DOCX and PDF fixtures from `scripts/make-fixtures.mjs`
+- [ ] Duplicate finding merge across reviewers (`agreement`)
+- [x] `contract-b2b` rubric: sign-off, not-legal-advice notice, `effort: high`, `confidential: true`
+- [x] Per-rubric `allowed_reviewers`
+- [ ] Client timeouts: MCP clients give up after about 60 s by default (SDK, Codex `tool_timeout_sec`), and a high-effort review takes longer. Cap waits below that (config `max_wait_seconds`, default 50) and have authors poll `review_wait`; document it in the README
+- [ ] Policy: a high-impact finding marked `assumption_challenge` never blocks (real run: missing governing law was advisory). Decide whether high and critical assumption challenges should block
+- [ ] `related` artifact for contracts (the accepted proposal), compared for price, scope and timeline
+- [ ] Rubrics: `code` (with git snapshots), then `client-email`, `linkedin-post`, `sop`, `plan`
+- [ ] CLI `rb`: submit, status, show, list, respond, signoff
+- [ ] Tests from SPEC section 11, README, LICENSE

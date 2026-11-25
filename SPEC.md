@@ -1,0 +1,217 @@
+# Review Bus v0.1 build spec
+
+Goal of v0.1: one full review loop on real work, for one user on one machine. An author agent (Claude Code or Codex) submits a code change or a document, Codex and/or Claude review it headless, the author answers each finding, and the review closes or goes another round.
+
+## 1. Scope
+
+In v0.1:
+
+- MCP server over stdio (HTTP later)
+- Artifacts: git changes (uncommitted, branch vs base, single commit), documents (Markdown, plain text, DOCX, PDF from a local path), and web pages (rendered and screenshotted, alone or together with a git change)
+- Reviewers (push mode, headless, read-only): Codex CLI, Claude Code CLI, generic command (for tests and custom reviewers)
+- Rubrics as Markdown files: `code`, `contract-b2b`, `proposal`, `webpage` first; then `client-email`, `linkedin-post`, `sop`, `plan`
+- Lifecycle with rounds (max 3), author responses, human sign-off where policy requires it
+- Risk policy that computes which findings block
+- Storage under `.reviews/` (one folder per review, JSON state + `report.md`)
+- CLI `rb` for humans: `submit`, `status`, `show`, `list`, `respond`, `signoff`
+
+Not in v0.1: hosted mode, web inbox, pull-mode reviewers (`list_pending`/`claim`/`post`), Gemini adapter, MCP Tasks, channels, GitHub sync, verification pass.
+
+## 2. Lifecycle
+
+States: `submitted` → `in_review` → `changes_requested` | `awaiting_signoff` | `approved` | `escalated` | `failed` | `canceled`, plus `needs_input` (reserved for pull reviewers later).
+
+- A round runs all configured reviewers on one frozen snapshot, in parallel.
+- After a round: if no open blocking finding → `approved`, or `awaiting_signoff` when the policy requires a person. Otherwise `changes_requested`.
+- The author answers every blocking finding with `accepted`, `rejected` (reason required) or `deferred`. Then either closes the review or resubmits a new snapshot (round n+1).
+- After round 3 with blocking findings still open → `escalated` (a person decides).
+- If the server restarts while a round is running, that round is marked `failed` on load.
+
+Rules settled while building slice 2:
+
+- Answers can come in several `review_respond` calls. A finding id must belong to the latest round.
+- Closing (`resubmit: false`) happens once every blocking finding has an answer: `approved`, or `awaiting_signoff` when the rubric requires a person. If any blocking finding was `accepted` but not re-reviewed, the review gets a note saying so.
+- Resubmitting is allowed from `changes_requested` and `failed`, never from `escalated`, `awaiting_signoff`, `approved` or `canceled`. If the new snapshot is identical to the previous one, the history says so.
+- The next round's prompt lists the previous round's findings with the author's answers. Reviewers check that accepted findings are fixed and do not raise a rejected finding again unless the reason does not hold.
+- `review_signoff` works from `awaiting_signoff` and from `escalated` (a person deciding after the round cap) and records who, when, and from which state.
+- `review_cancel` kills the running reviewer processes.
+- A round that finishes after a newer round has started (possible after a restart) keeps its results but does not change the review state.
+
+## 3. Snapshots
+
+- **Git:** record base SHA plus a patch of the change (`git diff` vs base, including untracked files, which are added as new-file patches without touching the index). The reviewers' copy is `git archive <base>` extracted into `r<n>/tree/` with the patch applied. This replaces the throwaway `git worktree` of the first draft: nothing is written to the author's `.git` (no worktree entries left behind after a crash, no refs). Store the patch in the review folder. Modes: `uncommitted` (working tree vs HEAD), `base` (merge-base of the base branch and HEAD, to HEAD; commits only, uncommitted edits are noted and left out; base defaults to `origin/HEAD`, then `main`, then `master`), `commit` (one commit vs its parent, or vs the empty tree for a root commit). The prompt gets the changed files and the diff (up to 120,000 characters; beyond that reviewers read the files in `tree/`).
+- **Pages:** `review_submit` takes `pages`, a list of http(s) URLs (for example the author's local dev server). The server, not the reviewer, renders each page in headless Chrome (Playwright with `channel: "chrome"`, so no browser download) at desktop (1366px) and mobile (390px) width. Screenshots are cut into tiles 1800px tall so text stays readable for the model, up to 16,000px per page by default (`browser.max_height`; real mobile home pages run to about 15,000px; the report says when a page is cut off). The server also records the facts a screenshot cannot show: HTTP status, title, meta description, `lang`, canonical, social tags, headings, images without alt text, broken same-origin links (up to 40 per page) and console errors. Codex gets the screenshots with `--image=<file>`; Claude opens them with its read tool (they are inside its working folder); command reviewers get their paths in `REVIEW_BUS_IMAGES`. Pages are captured again on resubmit. The dev server must be running; review-bus never starts the author's code.
+- **Document:** copy the file into the review folder, record its SHA-256, convert to Markdown (DOCX via `mammoth` HTML output and a small converter that keeps headings, lists and tables; PDF via `pdftotext` if present, else `unpdf`, with a `## Page N` heading per page). Reviewers get the Markdown. Conversion warnings (for example a PDF with no text, likely scanned) are recorded on the snapshot and shown in the report. OCR is not supported.
+- A finding always refers to the snapshot of its round, even if the author keeps editing.
+
+## 4. MCP tools (v0.1)
+
+| Tool | Input | Output |
+| --- | --- | --- |
+| `review_submit` | `artifact` (path, or `{git: {repo, mode: uncommitted|base|commit, base?, commit?}}`), `rubric`, `intent`, `assumptions[]`, `criteria[]`, `reviewers[]` (names or `{name, model?, effort?}`; default from config, filtered by vendor, see 8a), `author_vendor?`, `stage` (draft|pre-merge|release), `wait_seconds` (default 0) | `review_id`, state; full result if it finished within `wait_seconds` |
+| `review_status` | `review_id` | state, round, reviewers done/pending, counts of blocking and advisory findings |
+| `review_wait` | `review_id`, `seconds` (max 600) | blocks until the round finishes or time runs out, then returns status |
+| `review_result` | `review_id`, `include_advisory` (default false) | verdicts and findings for the latest round, as JSON plus a short Markdown summary |
+| `review_respond` | `review_id`, `responses[]` of `{finding_id, status, note}`, `resubmit` (bool), optional new artifact | new state; starts round n+1 when `resubmit` is true |
+| `review_signoff` | `review_id`, `by` (person's name), `note` | moves `awaiting_signoff` to `approved` |
+| `review_list` | optional state filter | recent reviews |
+| `review_cancel` | `review_id` | `canceled` |
+
+Long rounds run in the background inside the server process. MCP Tasks (protocol 2026-07-28, supported by Claude Code CLI from v2.1.304) come in v0.2 so Claude Code is woken when a result lands.
+
+## 5. Data shapes
+
+Reviewer output (what each adapter must return, validated with zod):
+
+```json
+{
+  "verdict": "approve | changes_requested | comment",
+  "summary": "one paragraph",
+  "findings": [
+    {
+      "claim": "string",
+      "failure_scenario": "string or null",
+      "evidence": "string",
+      "location": {"path": "string or null", "line_start": "int or null", "line_end": "int or null", "section": "string or null", "quote": "string or null"},
+      "likelihood": "certain | likely | possible | remote",
+      "impact": "critical | high | medium | low",
+      "suggested_fix": "string or null",
+      "assumption_challenge": "bool",
+      "confidence": "number 0..1"
+    }
+  ]
+}
+```
+
+For Codex `--output-schema`, the JSON Schema must use `additionalProperties: false` on every object and list every property in `required` (use `null` types for optional values). Generate the JSON Schema from the zod schema and keep one source of truth in `spec/`.
+
+Server-added fields per finding: `finding_id`, `reviewer` (adapter:model:effort, see 8a), `round`, `blocking` (bool, computed), `severity` (derived), `agreement` (how many reviewers raised it), `response {status, note, at}`.
+
+## 6. Risk policy
+
+Default matrix (impact × likelihood → blocks?):
+
+| Impact | Certain | Likely | Possible | Remote |
+| --- | --- | --- | --- | --- |
+| Critical | block | block | block | block |
+| High | block | block | block | advisory |
+| Medium | block | block | advisory | advisory |
+| Low | advisory | advisory | advisory | advisory |
+
+Rules:
+
+- A finding with no `failure_scenario` is advisory, whatever the reviewer said.
+- `assumption_challenge: true` findings are always shown, never blocking on their own.
+- Max blocking findings per round: 5 (highest risk first; the rest become advisory).
+- `stage: draft` uses a lighter matrix (only critical blocks).
+- Duplicate findings across reviewers (same location, similar claim) are merged; `agreement` counts the reviewers.
+- Policy lives in `review-bus.config.json` and each rubric can override it.
+
+Contract rubric overrides (`contract-b2b`):
+
+- `require_signoff: true` (a person must sign off; agent approval alone never closes it)
+- High and critical findings block at any likelihood
+- Report header states that reviewers are not lawyers and this is not legal advice
+
+## 7. Rubrics
+
+Markdown files, each with: purpose, what to check, what is out of scope, impact anchors, policy overrides (front matter).
+
+Rubrics are loaded from several folders, in order, with later folders overriding earlier ones by rubric name. Configured as `rubric_paths` in `review-bus.config.json`, for example `["./rubrics", "../review-bus-private/rubrics"]`. Generic rubrics ship in this repo's `rubrics/`; client-specific and Insightful3 packs live in the private repo.
+
+- `code`: correctness, security, data loss, missing tests for changed behaviour. Out of scope: style the linter handles, naming preferences.
+- `contract-b2b`: parties and registration details, scope and deliverables, price, payment terms and late interest, term and termination, liability cap and exclusions, IP ownership and licence, confidentiality, data protection (DPA needed when personal data is processed), governing law and jurisdiction, defined terms used consistently, numbers and dates consistent across clauses and annexes. Optional `related` artifact: the accepted proposal; any mismatch in price, scope or timeline is high impact. Assumptions should include jurisdiction and language (for example Slovenian law, Slovenian text).
+- `proposal`: the client understands what they get, by when and for how much; no promise the author can't keep; dates that depend on the client are stated as such; price and terms match.
+
+Document impact anchors: critical = wrong price, legal commitment, wrong client or leaked confidential data; high = wrong fact or misleading claim the reader acts on; medium = unclear ask or wrong tone for the audience; low = style.
+
+## 8. Adapters
+
+Configured in `review-bus.config.json`, not hard-coded. Each adapter: command, args template, timeout, how to read the output.
+
+- **Codex, documents and code with rubric:** `codex exec` in read-only sandbox, prompt on stdin, `--output-schema <schema.json>`, `-o <out.json>`, working dir = worktree (code) or the review folder (documents).
+- **Codex, native code review (optional):** `codex exec review --uncommitted|--base|--commit --json -o out.md`, then a second pass converts its text into the finding shape. Off by default.
+- **Claude:** `claude -p` with `--output-format json`, `--json-schema <schema>`, `--tools Read,Grep,Glob`, `--permission-prompts none`, `--restricted` (no command tools, user and project settings ignored, file tools confined to the working dir), `--strict-mcp-config`, `--no-session-persistence`, working dir as above. The answer is in `structured_output` of the JSON envelope; `is_error: true` fails the reviewer.
+- **Codex as the author:** `codex exec` refuses MCP tool calls unless the server's tools are approved. Set `default_tools_approval_mode = "approve"` on the review-bus server (Codex 0.172.0 accepts `auto`, `prompt`, `writes`, `approve`).
+- **Command:** any executable that reads the review prompt on stdin and prints reviewer output JSON on stdout. Used by tests with a fake reviewer.
+
+Check the real flags with `--help` on this machine before relying on them.
+
+The reviewer prompt contains: rubric, intent, assumptions, criteria, artifact (Markdown or the worktree), output rules (failure scenario required, use the fixed scales, quote exactly). It never contains the author's conversation.
+
+## 8a. Model, effort and reviewer vendor
+
+Every adapter takes a `model` and an `effort`. Both are passed to the reviewer CLI as flags, recorded on every finding, and shown in `report.md`.
+
+**Effort scale:** `low | medium | high | xhigh | max`. Both CLIs accept all five (Claude Code 2.1.316, Codex 0.172.0 for every current model). Codex also has `ultra` on some models; it is allowed in config for the Codex adapter only. An adapter rejects a value its CLI does not accept, with a clear error, before starting the round.
+
+**How each adapter passes them** (checked with `--help` on this machine, 25 Nov 2026):
+
+| Adapter | Model | Effort |
+| --- | --- | --- |
+| Claude | `--model <model>` | `--effort <level>` |
+| Codex | `-m <model>` | `-c model_reasoning_effort="<level>"` (Codex has no effort flag; this is the config key `~/.codex/config.toml` uses) |
+| Command | `{model}` and `{effort}` placeholders in `args`, plus env vars `REVIEW_BUS_MODEL` and `REVIEW_BUS_EFFORT` | same |
+
+When `model` is null the flag is left out and the CLI uses its own default.
+
+**Precedence** (first one set wins):
+
+1. `review_submit` call: `reviewers` entries may be objects, `{name, model?, effort?}`, as well as plain names.
+2. Rubric front matter: `effort: high`, and per adapter `models: {"codex": "...", "claude": "..."}` (model names are vendor specific, effort is not).
+3. Stage default: `release` uses `high`, `draft` uses `medium`. `pre-merge` has no stage default.
+4. Adapter config in `review-bus.config.json` (`model`, `effort`). The example config uses `effort: medium`.
+
+The rubric wins over the stage, so `contract-b2b` ships with `effort: high` in its front matter and stays `high` even at `stage: draft`.
+
+**What gets recorded:**
+
+- The model and effort that actually ran, as the CLI reports them (Codex prints `model:` and `reasoning effort:` in its log; Claude's `--output-format json` names the model in the keys of `modelUsage` but does not report effort, so Claude's effort is always recorded as `requested`). If the CLI does not report a value, record the requested one and mark it `requested`.
+- Each finding's `reviewer` field is `adapter:model:effort`, for example `codex:gpt-6.1-sol:high`. `adapter` is the adapter's name in config (so two command reviewers stay apart), and `default` stands for a CLI default that was not reported.
+- Each reviewer run in `review.json` stores `model`, `effort`, and where each came from (`call`, `rubric`, `stage`, `config`, `cli_default`).
+- `report.md` lists every reviewer as `adapter:model:effort` in the Reviewers section and on each finding.
+
+**Reviewer vendor must differ from the author's:**
+
+- Each adapter in config has a `vendor` (`anthropic`, `openai`, `other`).
+- The server learns the author's vendor from the MCP `initialize` request (`clientInfo.name`), mapped through `author_vendors` in config. Built-in defaults: `{"claude-code": "anthropic", "codex-mcp-client": "openai"}` (the names Claude Code 2.1.316 and Codex 0.172.0 send, checked with a probe server on 25 Nov 2026). `review_submit` also takes an optional `author_vendor` to set it explicitly.
+- When `reviewers` is not given, the server uses only those `default_reviewers` whose vendor differs from the author's. If none is left, `review_submit` fails with an error saying so; it never falls back to a same-vendor reviewer silently.
+- When the caller names `reviewers` explicitly, a same-vendor reviewer is allowed, but the result and `report.md` carry a note: "Reviewer is the same vendor as the author."
+- If the author's vendor is unknown, the server uses `default_reviewers` as configured and notes "Author vendor unknown" in the report.
+
+## 9. Security
+
+- Reviewers run read-only, in a throwaway worktree or a copy of the document.
+- Per-rubric `allowed_reviewers` in config: contracts only go to reviewers the user has approved for confidential data. Explicitly named reviewers outside the list are refused; default reviewers are filtered to the list. A rubric with `confidential: true` in its front matter (like `contract-b2b`) refuses to run until config lists its reviewers.
+- Rubric front matter `report_notice` is shown at the top of the result and `report.md` (`contract-b2b`: reviewers are not lawyers, not legal advice).
+- Optional masking of names and amounts before dispatch (v0.2).
+- Artifact content is data; reviewer instructions only come from the prompt and rubric.
+
+## 10. Storage
+
+```
+.reviews/
+  rv_<ulid>/
+    review.json      # full state: request, rounds, findings, responses, history
+    r1/artifact.*    # snapshot (patch or document copy + markdown)
+    r1/<reviewer>.json
+    report.md        # human-readable, regenerated on every change
+```
+
+Location: `~/.review-bus/reviews/` for everything in v0.1 (configurable as `storage.documents`). The first draft put code reviews in `.reviews/` inside the reviewed repo; that would mean writing to the author's repo and its `.gitignore`, so it is left for later as an opt-in. Each git round holds a full copy of the project in `r<n>/tree/`, so large repos use more disk. Review results never go into the review-bus repo itself. Start with JSON files; add a SQLite index only when listing gets slow.
+
+## 10a. Config
+
+`review-bus.config.json` is looked up in this order: path in `REVIEW_BUS_CONFIG`, then `~/.review-bus/config.json`, then the current folder. It holds `rubric_paths`, `storage`, adapters (each with `vendor`, `model`, `effort`), default reviewers, `author_vendors`, the risk policy and per-rubric `allowed_reviewers`. Ship an example as `review-bus.config.example.json`; the real one lives in the private repo or `~/.review-bus/`.
+
+## 10b. Repo hygiene
+
+- `test/fixtures/` holds made-up documents only (a fictional contract between two fictional companies, a fictional proposal, a small sample code change).
+- `.gitignore` covers `.reviews/`, `review-bus.config.json`, `*.docx`/`*.pdf` outside `test/fixtures/`, and `.env`.
+
+## 11. Done when
+
+1. Tests pass with a fake command reviewer: document review, git review, respond and resubmit, round cap reaching `escalated`, contract needing sign-off, risk matrix cases.
+2. From Claude Code: `review_submit` on a real contract with Codex as reviewer returns findings; responding and resubmitting works.
+3. From Codex: the same tools work when Codex is the author and Claude is the reviewer.
+4. README covers install, `claude mcp add` and `codex mcp add`, config, writing a rubric.
