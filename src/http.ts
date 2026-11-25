@@ -259,7 +259,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
     const parts = url.pathname.split("/").filter(Boolean).slice(1); // after "inbox"
     try {
       if (req.method === "GET" && parts.length === 0) {
-        send(res, 200, renderInbox(engine));
+        send(res, 200, renderInbox(await engine.summaries()));
         return;
       }
       if (parts[0] === "review" && parts[1]) {

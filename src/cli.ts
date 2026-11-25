@@ -2,6 +2,7 @@
 // rb: review-bus for people. Same engine and storage as the MCP server.
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.js";
 import { Engine, isActive, onlyPullLeft } from "./engine.js";
@@ -26,7 +27,7 @@ Usage:
   rb cancel <review_id>
   rb pending [--reviewer <name>]
   rb claim <review_id> <reviewer> --by <your name>
-  rb post <review_id> <reviewer> --token <token> (--file <answer.json> | --decline <reason>) [--model <model>]
+  rb post <review_id> <reviewer> (--file <answer.json> | --decline <reason>) [--model <model>] [--token-stdin]
   rb release <review_id> <reviewer> --claim-id <id> --by <your name>
   rb rubrics
   rb rubric-check <folder>
@@ -44,6 +45,8 @@ submit and respond --resubmit wait until the reviewers finish (Ctrl-C cancels th
 until only pull reviewers are left (then check back with rb status).
 pending, claim and post are for pull reviewers (type "pull" in config): a person or another agent
 fetches the work and answers with reviewer output JSON (claim prints the prompt and the schema).
+post asks for the claim token without showing it; scripts pass it in REVIEW_BUS_CLAIM_TOKEN or on
+standard input with --token-stdin (never as an argument: it would land in shell history).
 Exit codes: 0 approved or awaiting sign-off, 2 changes requested, escalated or failed, 1 error.
 Config: REVIEW_BUS_CONFIG, else ~/.review-bus/config.json.`;
 
@@ -60,6 +63,36 @@ function parseReviewer(s: string): ReviewerSpec {
   if (!name) fail(`bad --reviewer "${s}"`);
   if (effort && !Effort.safeParse(effort).success) fail(`bad effort "${effort}" in --reviewer ${s}`);
   return { name, ...(model ? { model } : {}), ...(effort ? { effort: effort as Effort } : {}) };
+}
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => (data += d));
+    process.stdin.on("end", () => resolve(data));
+  });
+}
+
+/** Reads a line from the terminal without echoing it. */
+function askHidden(question: string): Promise<string> {
+  if (!process.stdin.isTTY) fail("no terminal to ask for the claim token: set REVIEW_BUS_CLAIM_TOKEN or use --token-stdin");
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+    const out = rl as unknown as { _writeToOutput: (s: string) => void };
+    let asked = false;
+    out._writeToOutput = (s: string) => {
+      if (!asked) {
+        process.stderr.write(s);
+        asked = true;
+      }
+    };
+    rl.question(question, (answer) => {
+      rl.close();
+      process.stderr.write("\n");
+      resolve(answer);
+    });
+  });
 }
 
 function exitCodeFor(state: ReviewState): number {
@@ -138,6 +171,7 @@ async function main() {
       by: { type: "string" },
       note: { type: "string" },
       token: { type: "string" },
+      "token-stdin": { type: "boolean" },
       "claim-id": { type: "string" },
       file: { type: "string" },
       decline: { type: "string" },
@@ -287,10 +321,12 @@ async function main() {
     }
     case "post": {
       if (!pos[1]) fail("post needs <review_id> <reviewer>");
-      if (!v.token) fail("post needs --token (from rb claim)");
+      if (v.token) fail("post takes the token without --token (it would land in shell history): type it when asked, set REVIEW_BUS_CLAIM_TOKEN, or pipe it with --token-stdin");
       if (!v.file === !v.decline) fail("post needs either --file <answer.json> or --decline <reason>");
       const output = v.file ? JSON.parse(readFileSync(path.resolve(v.file), "utf8")) : undefined;
-      const r = await engine.post(id(), pos[1], v.token, { output, decline: v.decline, model: v.model ?? null });
+      const token = v["token-stdin"] ? (await readStdin()).trim() : process.env.REVIEW_BUS_CLAIM_TOKEN?.trim() || (await askHidden("Claim token: "));
+      if (!token) fail("no claim token given");
+      const r = await engine.post(id(), pos[1], token, { output, decline: v.decline, model: v.model ?? null });
       console.log(`${r.id}  ${r.state}  round ${r.rounds.length}`);
       return;
     }

@@ -222,6 +222,8 @@ rb respond <review_id> r1.f1=accepted r1.f2=rejected:"Intentional, agreed with t
 rb signoff <review_id> --by "Your Name"
 ```
 
+`rb post` asks for the claim token without showing it (scripts: `REVIEW_BUS_CLAIM_TOKEN`, or `--token-stdin`); it never takes the token as an argument, where it would land in shell history.
+
 More commands: `rb rubrics` lists every rubric you can name; `rb rubric-check <file or folder>` checks rubrics before you use them; `rb pending`, `rb claim`, `rb post` and `rb release` are for pull reviewers; `rb serve` starts the HTTP server and inbox.
 
 `submit` and `respond --resubmit` wait for the reviewers and print the report (or stop once only pull reviewers are left); Ctrl-C cancels the review. Exit codes: 0 approved or awaiting sign-off, 2 changes requested, escalated or failed, 1 error. A person is the author, so no reviewer is skipped for being the same vendor. Run `rb --help` for all options.

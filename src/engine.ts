@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { readdir, readFile } from "node:fs/promises";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -74,6 +75,34 @@ function safeEqual(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
+/** Pull reviewer work waiting for an answer in these reviews, oldest first. */
+export function pendingFrom(reviews: Review[], reviewer?: string): PendingWork[] {
+  const out: PendingWork[] = [];
+  for (const r of reviews.filter((x) => x.state === "in_review")) {
+    const round = r.rounds.at(-1);
+    if (!round) continue;
+    for (const run of round.reviewers) {
+      if (run.adapter !== "pull" || (run.status !== "waiting" && run.status !== "running")) continue;
+      if (reviewer && run.name !== reviewer) continue;
+      out.push({
+        review_id: r.id,
+        round: round.n,
+        reviewer: run.name,
+        status: run.status === "waiting" ? "waiting" : "claimed",
+        claimed_by: run.claim?.by ?? null,
+        claimed_at: run.claim?.at ?? null,
+        claim_id: run.claim?.id ?? null,
+        deadline: run.deadline ?? null,
+        rubric: r.request.rubric,
+        intent: r.request.intent,
+        stage: r.request.stage,
+        artifact: describeArtifact(r.request),
+        submitted_at: r.created_at,
+      });
+    }
+  }
+  return out.reverse();
+}
 export interface PendingWork {
   review_id: string;
   round: number;
@@ -183,13 +212,15 @@ export class Engine {
       } else if (first) {
         await tracked;
         // A cancel recorded meanwhile (another process) is kept: only an untouched review is removed.
-        let canceled = false;
+        // Checked and removed under the review's lock, so a cancel from another process lands either
+        // before (kept) or after (the review is already gone), never in between.
         try {
-          canceled = this.store.load(id).state === "canceled";
+          this.store.withLock(id, () => {
+            if (this.store.load(id).state !== "canceled") rmSync(this.store.dir(id), { recursive: true, force: true });
+          });
         } catch {
           /* already gone */
         }
-        if (!canceled) rmSync(this.store.dir(id), { recursive: true, force: true });
         throw first;
       }
     } else {
@@ -226,7 +257,8 @@ export class Engine {
     const t = now();
     // Each attempt builds its round in a private staging folder (relative paths stay r<n>/...).
     // It is moved into place under the lock, so two racing resubmits never touch each other's files.
-    const reviewDir = this.store.dir(review.id);
+    // Owner-only before the snapshot writes anything (a slow conversion leaves files there a while).
+    const reviewDir = this.store.ensureDir(review.id);
     const staging = path.join(reviewDir, `.staging-${process.pid}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`);
     const dropStaging = () => rmSync(staging, { recursive: true, force: true });
     let snapshot;
@@ -659,7 +691,7 @@ export class Engine {
     let adapterFor: (name: string) => Config["adapters"][string] | undefined = () => undefined;
     try {
       const current = this.currentConfig();
-      const allowed = this.allowedReviewers(review.request.rubric, this.metaNow(review), current);
+      const allowed = this.allowedReviewers(review.request.rubric, this.metaNow(review, current), current);
       adapterFor = (name) => current.adapters[name];
       dispatchError = (name) =>
         !current.adapters[name]
@@ -759,7 +791,7 @@ export class Engine {
       high_blocks_always: review.rubric_meta.high_blocks_always === true,
     };
     // The merge model sees quotes: approvals as the rubric is now (confidential if it became so).
-    const { merged, merge } = await this.merge(raised, review.request.rubric, this.metaNow(review), roundDir, signal, (f) => wouldBlock(f, policy));
+    const { merged, merge } = await this.merge(raised, review.request.rubric, review.rubric_meta, roundDir, signal, (f) => wouldBlock(f, policy), review);
     const findings: Finding[] = merged.map((m, i) => ({
       ...m.finding,
       finding_id: `r${n}.f${i + 1}`,
@@ -808,9 +840,18 @@ export class Engine {
     if (this.running.has(id)) return;
     const abort = new AbortController();
     this.aborts.set(id, abort);
+    // A cancel from another process (rb cancel) stops a slow merge model too.
+    const watcher = setInterval(() => {
+      try {
+        if (this.store.load(id).state === "canceled") abort.abort();
+      } catch {
+        /* mid-write; next tick */
+      }
+    }, 1000);
     const job = this.finalize(id, n, abort.signal)
       .catch((err) => this.recordRoundError(id, n, err, abort))
       .finally(() => {
+        clearInterval(watcher);
         this.running.delete(id);
         this.aborts.delete(id);
       });
@@ -821,32 +862,28 @@ export class Engine {
 
   /** Pull reviewer work waiting for an answer, oldest first. */
   pending(reviewer?: string): PendingWork[] {
-    const out: PendingWork[] = [];
-    for (const r of this.list("in_review", 1000)) {
-      const round = r.rounds.at(-1);
-      if (!round) continue;
-      for (const run of round.reviewers) {
-        if (run.adapter !== "pull" || (run.status !== "waiting" && run.status !== "running")) continue;
-        if (reviewer && run.name !== reviewer) continue;
-        out.push({
-          review_id: r.id,
-          round: round.n,
-          reviewer: run.name,
-          status: run.status === "waiting" ? "waiting" : "claimed",
-          claimed_by: run.claim?.by ?? null,
-          claimed_at: run.claim?.at ?? null,
-          claim_id: run.claim?.id ?? null,
-          deadline: run.deadline ?? null,
-          rubric: r.request.rubric,
-          intent: r.request.intent,
-          stage: r.request.stage,
-          artifact: describeArtifact(r.request),
-          submitted_at: r.created_at,
-        });
+    return pendingFrom(this.list("in_review", 1000), reviewer);
+  }
+
+  /**
+   * Every saved review, newest first, read asynchronously and without side effects (no cut-off
+   * checks): for listings such as the inbox, which must not hold up the server on a large archive.
+   */
+  async summaries(): Promise<Review[]> {
+    if (!existsSync(this.store.root)) return [];
+    const dirs = (await readdir(this.store.root)).filter((d) => /^rv_[0-9a-z]{26}$/.test(d)).sort().reverse();
+    const out: Review[] = [];
+    for (const d of dirs) {
+      try {
+        out.push(JSON.parse(await readFile(path.join(this.store.root, d, "review.json"), "utf8")));
+      } catch {
+        /* no review.json yet, or mid-write */
       }
     }
-    return out.reverse();
+    return out;
   }
+
+
 
   /**
    * Claims a pull reviewer's work: returns the reviewer prompt, the files and the answer schema,
@@ -867,7 +904,7 @@ export class Engine {
     if (before.state !== "in_review") throw new Error(`Review ${id} is ${before.state}; there is nothing to claim.`);
     const expected = before.rounds.at(-1)!.n;
     const prompt = readFileSync(path.join(this.store.roundDir(id, expected), "prompt.md"), "utf8");
-    const rubricNow = loadRubric(before.request.rubric, this.config.rubric_paths, this.config.rubric_packs);
+    const rubricNow = loadRubric(before.request.rubric, current.rubric_paths, current.rubric_packs);
     const rubricText = rubricNow.body;
     const token = randomBytes(16).toString("hex");
     let n = 0;
@@ -1001,9 +1038,11 @@ export class Engine {
    * if the rubric is confidential now. A rubric that cannot be loaded now (renamed, broken) counts as
    * confidential: when in doubt, nothing goes to a reviewer or model without an approval.
    */
-  private metaNow(review: Review): Record<string, unknown> {
+  private metaNow(review: Review, current: Config): Record<string, unknown> {
     try {
-      const now = loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs).meta;
+      // Rubric folders and packs as configured now: a confidential replacement added while a server
+      // runs counts at once.
+      const now = loadRubric(review.request.rubric, current.rubric_paths, current.rubric_packs).meta;
       return { ...review.rubric_meta, confidential: review.rubric_meta.confidential === true || now.confidential === true };
     } catch {
       return { ...review.rubric_meta, confidential: true };
@@ -1015,10 +1054,10 @@ export class Engine {
    * patch, related documents, screenshots), as a regular file reached without a symlink. Never the
    * project copy or review.json. Null when it is not one.
    */
-  snapshotFile(id: string, rel: string): { file: string; image: boolean } | null {
+  snapshotFile(id: string, rel: string, round?: number): { file: string; image: boolean } | null {
     const review = this.get(id);
     const recorded = new Set(
-      review.rounds.flatMap((rd) => [
+      review.rounds.filter((rd) => round === undefined || rd.n === round).flatMap((rd) => [
         rd.snapshot.markdown_file,
         rd.snapshot.git?.patch_file,
         ...(rd.snapshot.related ?? []).map((x) => x.markdown_file),
@@ -1042,8 +1081,9 @@ export class Engine {
     if (review.state !== "in_review" || !run || run.status !== "running" || !run.claim || !safeEqual(run.claim.token_sha256, sha256(token))) {
       throw new Error(`No live claim of "${reviewer}" on review ${id} matches this token.`);
     }
-    const found = this.snapshotFile(id, rel);
-    if (!found) throw new Error(`${rel} is not a file of this review's snapshot. Use the paths review_claim lists (relative to the review folder).`);
+    // Only the claimed round's files: an earlier round may hold a version the author replaced.
+    const found = this.snapshotFile(id, rel, review.rounds.at(-1)!.n);
+    if (!found) throw new Error(`${rel} is not a file of this round's snapshot. Use the paths review_claim lists (relative to the review folder).`);
     return found;
   }
 
@@ -1119,6 +1159,7 @@ export class Engine {
     roundDir: string,
     signal: AbortSignal,
     canBlock: CanBlock,
+    review?: Review,
   ): Promise<{ merged: Merged[]; merge: NonNullable<Round["merge"]> }> {
     const reviewers = new Set(raised.map((r) => r.reviewer));
     if (reviewers.size < 2) return { merged: mergeFindings(raised, canBlock), merge: { method: "none", by: null, error: null } };
@@ -1127,8 +1168,10 @@ export class Engine {
     let allowed: string[] | null;
     try {
       current = this.currentConfig();
+      // Confidential as the rubric is now, under the config as it is now (fail closed).
+      const meta = review ? this.metaNow(review, current) : rubricMeta;
       // Throws for a confidential rubric whose approval entry was removed: then no model sees it.
-      allowed = this.allowedReviewers(rubricName, rubricMeta, current);
+      allowed = this.allowedReviewers(rubricName, meta, current);
     } catch (err) {
       return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: (err as Error).message } };
     }

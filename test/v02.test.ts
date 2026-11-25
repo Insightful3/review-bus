@@ -1099,7 +1099,7 @@ test("review_file gives a claimed reviewer the snapshot files, and nothing else"
   const wrong = (await client.callTool({ name: "review_file", arguments: { review_id: review.id, reviewer: "person", token: "x".repeat(32), path: "r1/artifact.md" } })) as ToolResult;
   assert.equal(wrong.isError, true);
   const other = (await client.callTool({ name: "review_file", arguments: { review_id: review.id, reviewer: "person", token: work.token, path: "review.json" } })) as ToolResult;
-  assert.match(other.content[0].text, /not a file of this review's snapshot/);
+  assert.match(other.content[0].text, /not a file of this round's snapshot/);
   engine.release(review.id, "person", "test", work.claim_id);
 });
 
@@ -1311,5 +1311,99 @@ test("a codex-review stopped during preparation leaves no scratch copy", async (
   await e.settled(review.id);
   assert.match(e.get(review.id).rounds[0].reviewers[0].error!, /Codex was not started/);
   assert.ok(!existsSync(path.join(tmp, "reviews", review.id, "r1", "native.native")));
+  writeConfig();
+});
+
+// ---- Fresh review #2 (rv_01m8a5046v2wpk95k6vjk7sj7j) ----
+
+test("a confidential rubric added to the config while a server runs is honoured at claim time", async () => {
+  const d1 = path.join(tmp, "rubrics-a");
+  const d2 = path.join(tmp, "rubrics-b");
+  mkdirSync(d1, { recursive: true });
+  mkdirSync(d2, { recursive: true });
+  writeFileSync(path.join(d1, "swap.md"), RUBRIC.replace("confidential: true\n", ""));
+  writeFileSync(path.join(d2, "swap.md"), RUBRIC);
+  writeConfig({ rubric_paths: [d1] });
+  const e = new Engine(loadConfig()); // started with d1 only
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "swap", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" }, PERSON, 5);
+  writeConfig({ rubric_paths: [d1, d2] }); // a confidential replacement, added while running
+  assert.throws(() => e.claim(review.id, "person", { by: "Ana", client: null }), /confidential/);
+  writeConfig();
+});
+
+test("a review folder is private before the snapshot writes into it", async () => {
+  const bin = path.join(tmp, "slow-bin2");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(path.join(bin, "pdftotext"), "#!/bin/sh\nsleep 1\necho 'Slow PDF text'\n", { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  const oldMask = process.umask(0o022);
+  process.env.PATH = `${bin}:${oldPath}`;
+  try {
+    const before = new Set(existsSync(path.join(tmp, "reviews")) ? execFileSync("ls", [path.join(tmp, "reviews")]).toString().split("\n") : []);
+    const pending = engine.submit(
+      { artifact: { path: path.join(ROOT, "test/fixtures/proposal-bluefin.pdf") }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+      PERSON,
+    );
+    await new Promise((r) => setTimeout(r, 400)); // pdftotext is still running
+    const fresh = execFileSync("ls", [path.join(tmp, "reviews")]).toString().split("\n").filter((d) => d && !before.has(d));
+    assert.equal(fresh.length, 1);
+    assert.equal(statSync(path.join(tmp, "reviews", fresh[0])).mode & 0o777, 0o700);
+    const review = await pending;
+    await engine.settled(review.id);
+  } finally {
+    process.env.PATH = oldPath;
+    process.umask(oldMask);
+  }
+});
+
+test("rb post never takes the claim token as an argument", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const work = engine.claim(review.id, "person", { by: "Ana", client: null });
+  const answer = path.join(tmp, "answer.json");
+  writeFileSync(answer, JSON.stringify({ verdict: "approve", summary: "ok", findings: [] }));
+  const rb = (args: string[], opts: { env?: Record<string, string>; input?: string } = {}) =>
+    spawnSync(process.execPath, [path.join(ROOT, "dist/src/cli.js"), ...args], { encoding: "utf8", env: { ...process.env, REVIEW_BUS_CONFIG: configFile, ...opts.env }, input: opts.input ?? "" });
+  const withArg = rb(["post", review.id, "person", "--token", work.token, "--file", answer]);
+  assert.equal(withArg.status, 1);
+  assert.match(withArg.stderr, /without --token/);
+  const viaStdin = rb(["post", review.id, "person", "--token-stdin", "--file", answer], { input: work.token + "\n" });
+  assert.equal(viaStdin.status, 0, viaStdin.stderr);
+  assert.equal(engine.get(review.id).state, "approved");
+});
+
+test("review_file serves only the claimed round's files", async () => {
+  const doc = path.join(tmp, "two-rounds.md");
+  writeFileSync(doc, readFileSync(FIXTURE, "utf8"));
+  const review = await engine.submit({ artifact: { path: doc }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" }, PERSON, 5);
+  const w1 = engine.claim(review.id, "person", { by: "Ana", client: null });
+  await engine.post(review.id, "person", w1.token, { output: { verdict: "changes_requested", summary: "fix", findings: [finding("Price is wrong.")] } });
+  const r1 = engine.get(review.id);
+  await engine.respond(review.id, r1.rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "accepted" as const })), { resubmit: true });
+  const w2 = engine.claim(review.id, "person", { by: "Bo", client: null });
+  assert.deepEqual(w2.snapshot_files, ["r2/artifact.md"]);
+  assert.ok(engine.claimedFile(review.id, "person", w2.token, "r2/artifact.md"));
+  assert.throws(() => engine.claimedFile(review.id, "person", w2.token, "r1/artifact.md"), /not a file of this round's snapshot/);
+});
+
+test("a cancel from another process stops a slow merge started by the last pull answer", async () => {
+  const dir = path.join(tmp, "rubrics-cancel-merge");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "open2.md"), RUBRIC.replace("confidential: true\n", ""));
+  mergeConfig(dir, 8000);
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "open2", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }, { name: "person2" }], stage: "pre-merge" }, PERSON, 5);
+  const a = e.claim(review.id, "person", { by: "Ana", client: null });
+  const b = e.claim(review.id, "person2", { by: "Bo", client: null });
+  await e.post(review.id, "person", a.token, { output: { verdict: "changes_requested", summary: "a", findings: [finding("Price is 70% off.")] } });
+  await e.post(review.id, "person2", b.token, { output: { verdict: "changes_requested", summary: "b", findings: [finding("Price is 70% wrong.")] } }, { waitSeconds: 0.2 });
+  const started = Date.now();
+  new Engine(loadConfig()).cancel(review.id); // as rb cancel in another terminal
+  await e.settled(review.id);
+  assert.ok(Date.now() - started < 5000, `merge kept running ${Date.now() - started} ms after the cancel`);
+  assert.equal(e.get(review.id).state, "canceled");
   writeConfig();
 });

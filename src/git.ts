@@ -143,11 +143,11 @@ function countLines(patch: string): { insertions: number; deletions: number } {
  * Returns the info, the patch text and a hash that identifies this exact change.
  */
 /** snapshotGit in a worker thread (git-worker.ts), so the event loop keeps serving meanwhile. */
-export function snapshotGitAsync(spec: GitSpec, reviewDir: string, round: number): Promise<{ info: GitInfo; patch: string; sha256: string }> {
+export function snapshotGitAsync(spec: GitSpec, reviewDir: string, round: number): Promise<{ info: GitInfo; sha256: string }> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./git-worker.js", import.meta.url), { workerData: { spec, reviewDir, round } });
     let settled = false;
-    worker.once("message", (m: { ok: boolean; result?: { info: GitInfo; patch: string; sha256: string }; noChanges?: boolean; message?: string }) => {
+    worker.once("message", (m: { ok: boolean; result?: { info: GitInfo; sha256: string }; noChanges?: boolean; message?: string }) => {
       settled = true;
       if (m.ok) resolve(m.result!);
       else reject(m.noChanges ? new NoChangesError(m.message) : new Error(m.message));

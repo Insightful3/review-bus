@@ -85,6 +85,14 @@ export class Store {
     return path.join(this.root, id);
   }
 
+  /** Creates the review folder owner-only (700) before anything is written into it. */
+  ensureDir(id: string): string {
+    const dir = this.dir(id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+    return dir;
+  }
+
   roundDir(id: string, n: number): string {
     return path.join(this.dir(id), `r${n}`);
   }

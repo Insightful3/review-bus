@@ -2,7 +2,7 @@
 // person. Plain server-rendered HTML; the only script adds finding rows to the answer form.
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import type { ClaimedWork, Engine } from "./engine.js";
+import { pendingFrom, type ClaimedWork, type Engine } from "./engine.js";
 import { describeArtifact } from "./snapshot.js";
 import type { Review } from "./types.js";
 
@@ -100,11 +100,12 @@ function table(rows: string[], empty: string): string {
   return `<div class="scroll"><table><thead><tr><th>Review</th><th>Rubric</th><th>State</th><th>Round</th><th>Updated</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
 }
 
-export function renderInbox(engine: Engine): string {
-  const reviews = engine.list(undefined, 100);
-  const pending = engine.pending();
+/** All sections from one pass over the saved reviews (newest first). */
+export function renderInbox(all: Review[]): string {
+  const reviews = all.slice(0, 100);
+  const pending = pendingFrom(all);
   // Every review waiting for a decision, however old: not only those among the 100 most recent.
-  const decide = [...engine.list("awaiting_signoff", 100_000), ...engine.list("escalated", 100_000)].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const decide = all.filter((r) => r.state === "awaiting_signoff" || r.state === "escalated").sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const work = pending.length
     ? `<div class="scroll"><table><thead><tr><th>Review</th><th>Reviewer</th><th>Rubric</th><th>Status</th><th>Due</th></tr></thead><tbody>${pending
         .map(
