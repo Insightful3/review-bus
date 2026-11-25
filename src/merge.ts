@@ -91,8 +91,13 @@ ${lines.join("\n")}
 `;
 }
 
+/**
+ * The kept version is the riskiest one that has a failure scenario: a version without one is
+ * always advisory, so keeping it could make a blocking finding advisory just by merging.
+ */
 function toMerged(group: Raised[]): Merged {
-  const sorted = [...group].sort((x, y) => riskScore(y.finding) - riskScore(x.finding));
+  const canBlock = (f: ReviewerFinding) => (f.failure_scenario?.trim() ? 1 : 0);
+  const sorted = [...group].sort((x, y) => canBlock(y.finding) - canBlock(x.finding) || riskScore(y.finding) - riskScore(x.finding));
   const [primary, ...rest] = sorted;
   return {
     finding: primary.finding,

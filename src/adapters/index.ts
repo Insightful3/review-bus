@@ -92,6 +92,14 @@ async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> 
     "--ephemeral",
     "--color",
     "never",
+    // Isolation (checked on codex-cli 0.172.0): without these a reviewer inherits the user's
+    // MCP servers (some can run code or control the computer), ChatGPT apps, plugins, hooks,
+    // browser and computer use, and web access, none of which the read-only sandbox covers.
+    // Login still works: auth lives in CODEX_HOME, not in config.toml.
+    "--ignore-user-config",
+    ...["apps", "plugins", "remote_plugin", "computer_use", "browser_use", "browser_use_external", "hooks", "image_generation"].flatMap((f) => ["--disable", f]),
+    "-c",
+    'web_search="disabled"',
     "--cd",
     job.cwd,
     "--output-schema",

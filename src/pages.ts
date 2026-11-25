@@ -124,14 +124,16 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
             throw new Error(pageLoadError(url, err));
           }
         }
-        // Lazy images: scroll to the bottom and back so they load before the screenshot.
-        await page.evaluate(async () => {
-          for (let y = 0; y < document.body.scrollHeight; y += window.innerHeight) {
+        // Lazy images: scroll down and back so they load before the screenshot. Bounded by the
+        // screenshot height, 200 steps and 15 s, so an infinite-scroll page cannot hang the capture.
+        await page.evaluate(async (maxHeight: number) => {
+          const until = Date.now() + 15_000;
+          for (let y = 0, i = 0; y < Math.min(document.body.scrollHeight, maxHeight) && i < 200 && Date.now() < until; y += window.innerHeight, i++) {
             window.scrollTo(0, y);
             await new Promise((r) => setTimeout(r, 50));
           }
           window.scrollTo(0, 0);
-        });
+        }, cfg.max_height);
         await page.waitForTimeout(300);
         const fullHeight = await page.evaluate(() => document.documentElement.scrollHeight);
         const height = Math.min(fullHeight, cfg.max_height);

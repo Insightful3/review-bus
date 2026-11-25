@@ -15,7 +15,11 @@ const fail = (msg) => {
 
 if (args[0] !== "exec") fail("expected exec subcommand");
 if (value("--sandbox") !== "read-only") fail("sandbox must be read-only");
-for (const flag of ["--skip-git-repo-check", "--ephemeral"]) if (!args.includes(flag)) fail(`missing ${flag}`);
+for (const flag of ["--skip-git-repo-check", "--ephemeral", "--ignore-user-config"]) if (!args.includes(flag)) fail(`missing ${flag}`);
+for (const feature of ["apps", "plugins", "computer_use", "browser_use", "hooks"]) {
+  if (!args.some((a, i) => a === "--disable" && args[i + 1] === feature)) fail(`feature ${feature} must be disabled`);
+}
+if (!args.some((a, i) => a === "-c" && args[i + 1] === 'web_search="disabled"')) fail("web search must be disabled");
 if (args.at(-1) !== "-") fail("prompt must come from stdin (-)");
 const schemaFile = value("--output-schema");
 const outFile = value("--output-last-message");
@@ -23,7 +27,7 @@ const cd = value("--cd");
 if (!schemaFile || !existsSync(schemaFile)) fail("missing --output-schema file");
 if (!outFile) fail("missing --output-last-message");
 if (!cd || realpathSync(cd) !== realpathSync(process.cwd())) fail("--cd must match the working dir");
-const effortArg = value("-c");
+const effortArg = args.find((a, i) => args[i - 1] === "-c" && a.startsWith("model_reasoning_effort="));
 if (effortArg !== undefined && !/^model_reasoning_effort="(low|medium|high|xhigh|max|ultra)"$/.test(effortArg)) fail(`bad -c value: ${effortArg}`);
 // Like real Codex: report the model and effort that ran, using its own defaults when not given.
 const model = value("-m") ?? "fake-default-model";

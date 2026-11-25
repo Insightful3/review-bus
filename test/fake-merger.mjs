@@ -3,8 +3,10 @@
 // identical, one per reviewer per group, like the real merge prompt asks. --fake-mode=bad answers
 // with an id in two groups; --fake-mode=fail exits with an error.
 const mode = process.argv.find((a) => a.startsWith("--fake-mode="))?.split("=")[1];
+const sleep = Number(process.argv.find((a) => a.startsWith("--sleep="))?.split("=")[1] ?? 0);
 let input = "";
-process.stdin.on("data", (d) => (input += d)).on("end", () => {
+process.stdin.on("data", (d) => (input += d)).on("end", async () => {
+  if (sleep) await new Promise((r) => setTimeout(r, sleep));
   if (mode === "fail") process.exit(3);
   const items = [...input.matchAll(/^- (f\d+) \(reviewer ([^)]+)\) \[[^\]]*\] (.*?) Quote:/gm)].map((m) => ({ id: m[1], reviewer: m[2], claim: m[3] }));
   if (mode === "bad") {

@@ -21,6 +21,8 @@ export interface ResponseInput {
 
 /** States in which nothing more happens without a person or a new submit. */
 const FINAL: ReviewState[] = ["approved", "canceled"];
+/** States from which the author may start the next round. */
+const RESUBMITTABLE: ReviewState[] = ["changes_requested", "failed"];
 
 const now = () => new Date().toISOString();
 
@@ -56,13 +58,13 @@ export class Engine {
       rounds: [],
       history: [{ at: t, event: "submitted", detail: `${describeArtifact(req)} with rubric ${req.rubric}` }],
     };
-    await this.startRound(review, runs);
+    await this.startRound(review, runs, true);
     if (waitSeconds > 0) await this.waitFor(id, waitSeconds);
     return this.get(id);
   }
 
   /** Snapshots the artifact as round n+1, saves, and runs the reviewers in the background. */
-  private async startRound(review: Review, runs: ReviewerRun[]): Promise<void> {
+  private async startRound(review: Review, runs: ReviewerRun[], isNew: boolean): Promise<void> {
     const n = review.rounds.length + 1;
     const t = now();
     let snapshot;
@@ -81,22 +83,33 @@ export class Engine {
       rmSync(saved ? this.store.roundDir(review.id, n) : this.store.dir(review.id), { recursive: true, force: true });
       throw err;
     }
-    const prev = review.rounds.at(-1);
-    if (prev && prev.snapshot.sha256 === snapshot.sha256) {
-      review.history.push({ at: t, event: "note", detail: `round ${n} document is unchanged since round ${prev.n}` });
+    const addRound = (r: Review) => {
+      const prev = r.rounds.at(-1);
+      if (prev && prev.snapshot.sha256 === snapshot.sha256) {
+        r.history.push({ at: t, event: "note", detail: `round ${n} document is unchanged since round ${prev.n}` });
+      }
+      r.request.artifact = review.request.artifact;
+      r.rounds.push({ n, started_at: t, finished_at: null, runner: { pid: process.pid, host: os.hostname(), started_at: t }, snapshot, reviewers: runs, findings: [] });
+      r.state = "in_review";
+      r.history.push({ at: t, event: "round_started", detail: `round ${n}` });
+    };
+    if (isNew) {
+      addRound(review);
+      this.store.withLock(review.id, () => this.store.save(review));
+    } else {
+      // Another process may have changed the review while the snapshot was taken.
+      try {
+        this.store.update(review.id, (r) => {
+          if (r.rounds.length !== n - 1 || !RESUBMITTABLE.includes(r.state)) {
+            throw new Error(`Review ${review.id} changed while round ${n} was being prepared (now ${r.state}, round ${r.rounds.length}). Nothing was started.`);
+          }
+          addRound(r);
+        });
+      } catch (err) {
+        rmSync(this.store.roundDir(review.id, n), { recursive: true, force: true });
+        throw err;
+      }
     }
-    review.rounds.push({
-      n,
-      started_at: t,
-      finished_at: null,
-      runner: { pid: process.pid, host: os.hostname(), started_at: t },
-      snapshot,
-      reviewers: runs,
-      findings: [],
-    });
-    review.state = "in_review";
-    review.history.push({ at: t, event: "round_started", detail: `round ${n}` });
-    this.store.save(review);
 
     const abort = new AbortController();
     this.aborts.set(review.id, abort);
@@ -116,86 +129,90 @@ export class Engine {
     responses: ResponseInput[],
     opts: { resubmit: boolean; artifact?: string; waitSeconds?: number },
   ): Promise<{ review: Review; unanswered: string[] }> {
-    const review = this.get(id);
+    this.get(id); // marks a round cut off by a dead process as failed
+    let unanswered: string[] = [];
+    // Answers, checks and (without resubmit) closing happen in one locked step.
+    const review = this.store.update(id, (r) => {
+      const round = r.rounds.at(-1)!;
+      if (r.state === "in_review") throw new Error(`Review ${id} is still in review (round ${round.n}). Wait for the result first.`);
+      if (r.state === "canceled") throw new Error(`Review ${id} is canceled.`);
+      const t = now();
+      for (const x of responses) {
+        const f = round.findings.find((y) => y.finding_id === x.finding_id);
+        if (!f) {
+          const older = r.rounds.some((rd) => rd.findings.some((y) => y.finding_id === x.finding_id));
+          throw new Error(`Finding ${x.finding_id} is not in round ${round.n}${older ? " (it belongs to an earlier round)" : ""}.`);
+        }
+        const note = (x.note ?? "").trim();
+        if (x.status === "rejected" && !note) throw new Error(`Rejecting ${x.finding_id} needs a reason in note.`);
+        f.response = { status: x.status, note, at: t };
+      }
+      if (responses.length) {
+        r.history.push({ at: t, event: "responded", detail: responses.map((x) => `${x.finding_id} ${x.status}`).join(", ") });
+      }
+      unanswered = round.findings.filter((f) => f.blocking && !f.response).map((f) => f.finding_id);
+      if (opts.resubmit) return; // checked below; the answers are saved either way
+      if (r.state === "changes_requested" && !unanswered.length) {
+        const accepted = round.findings.filter((f) => f.blocking && f.response?.status === "accepted").length;
+        r.state = r.rubric_meta.require_signoff === true ? "awaiting_signoff" : "approved";
+        r.history.push({
+          at: now(),
+          event: "closed_by_author",
+          detail: `all blocking findings answered, state ${r.state}${accepted ? `; ${accepted} accepted finding(s) not re-reviewed` : ""}`,
+        });
+        if (accepted) r.notes.push(`Round ${round.n}: ${accepted} accepted blocking finding(s) were closed without a re-review.`);
+      }
+    });
+    if (!opts.resubmit) return { review, unanswered };
+
     const round = review.rounds.at(-1)!;
-    if (review.state === "in_review") throw new Error(`Review ${id} is still in review (round ${round.n}). Wait for the result first.`);
-    if (review.state === "canceled") throw new Error(`Review ${id} is canceled.`);
-
-    const t = now();
-    for (const r of responses) {
-      const f = round.findings.find((x) => x.finding_id === r.finding_id);
-      if (!f) {
-        const older = review.rounds.some((rd) => rd.findings.some((x) => x.finding_id === r.finding_id));
-        throw new Error(`Finding ${r.finding_id} is not in round ${round.n}${older ? " (it belongs to an earlier round)" : ""}.`);
+    if (review.state === "escalated") throw new Error(`Review ${id} is escalated after ${round.n} rounds. A person decides with review_signoff.`);
+    if (!RESUBMITTABLE.includes(review.state)) throw new Error(`Review ${id} is ${review.state}; submit a new review instead of resubmitting.`);
+    if (unanswered.length) throw new Error(`Answer every blocking finding before resubmitting. Unanswered: ${unanswered.join(", ")}.`);
+    if (round.n >= this.config.policy.max_rounds) throw new Error(`Review ${id} has used all ${this.config.policy.max_rounds} rounds.`);
+    const rubric = loadRubric(review.request.rubric, this.config.rubric_paths);
+    // Approvals can change between rounds: check the reviewers against today's config (SPEC 9).
+    const allowed = this.allowedReviewers(review.request.rubric, rubric.meta);
+    for (const spec of review.request.reviewers) {
+      if (!this.config.adapters[spec.name]) throw new Error(`Reviewer "${spec.name}" is no longer configured. Submit a new review.`);
+      if (allowed && !allowed.includes(spec.name)) {
+        throw new Error(`Reviewer "${spec.name}" is no longer approved for ${review.request.rubric} (approved: ${allowed.join(", ")}). Nothing was sent. Submit a new review.`);
       }
-      const note = (r.note ?? "").trim();
-      if (r.status === "rejected" && !note) throw new Error(`Rejecting ${r.finding_id} needs a reason in note.`);
-      f.response = { status: r.status, note, at: t };
     }
-    if (responses.length) {
-      review.history.push({ at: t, event: "responded", detail: responses.map((r) => `${r.finding_id} ${r.status}`).join(", ") });
-      this.store.save(review); // keep the answers even if a resubmit below fails
+    const runs = review.request.reviewers.map((spec) => this.planRun(spec, rubric.meta, review.request.stage));
+    // A new document path replaces the old one; git changes and pages are simply captured again.
+    if (opts.artifact) {
+      if (!review.request.artifact?.path) throw new Error("artifact can only be changed for document reviews; git changes and pages are captured again on resubmit.");
+      review.request.artifact = { path: opts.artifact };
     }
-    const unanswered = round.findings.filter((f) => f.blocking && !f.response).map((f) => f.finding_id);
-
-    if (opts.resubmit) {
-      if (review.state === "escalated") {
-        throw new Error(`Review ${id} is escalated after ${round.n} rounds. A person decides with review_signoff.`);
-      }
-      if (FINAL.includes(review.state) || review.state === "awaiting_signoff") {
-        throw new Error(`Review ${id} is ${review.state}; submit a new review instead of resubmitting.`);
-      }
-      if (unanswered.length) throw new Error(`Answer every blocking finding before resubmitting. Unanswered: ${unanswered.join(", ")}.`);
-      if (round.n >= this.config.policy.max_rounds) {
-        throw new Error(`Review ${id} has used all ${this.config.policy.max_rounds} rounds.`);
-      }
-      const rubric = loadRubric(review.request.rubric, this.config.rubric_paths);
-      const runs = review.request.reviewers.map((spec) => this.planRun(spec, rubric.meta, review.request.stage));
-      // A new document path replaces the old one; git changes and pages are simply captured again.
-      if (opts.artifact) {
-        if (!review.request.artifact?.path) throw new Error("artifact can only be changed for document reviews; git changes and pages are captured again on resubmit.");
-        review.request.artifact = { path: opts.artifact };
-      }
-      await this.startRound(review, runs);
-      if (opts.waitSeconds) await this.waitFor(id, opts.waitSeconds);
-      return { review: this.get(id), unanswered: [] };
-    }
-
-    if (review.state === "changes_requested" && !unanswered.length) {
-      const accepted = round.findings.filter((f) => f.blocking && f.response?.status === "accepted").length;
-      review.state = review.rubric_meta.require_signoff === true ? "awaiting_signoff" : "approved";
-      review.history.push({
-        at: now(),
-        event: "closed_by_author",
-        detail: `all blocking findings answered, state ${review.state}${accepted ? `; ${accepted} accepted finding(s) not re-reviewed` : ""}`,
-      });
-      if (accepted) review.notes.push(`Round ${round.n}: ${accepted} accepted blocking finding(s) were closed without a re-review.`);
-    }
-    this.store.save(review);
-    return { review, unanswered };
+    await this.startRound(review, runs, false);
+    if (opts.waitSeconds) await this.waitFor(id, opts.waitSeconds);
+    return { review: this.get(id), unanswered: [] };
   }
 
   /** A person approves a review that awaits sign-off or was escalated. */
   signoff(id: string, by: string, note: string): Review {
-    const review = this.get(id);
-    if (review.state !== "awaiting_signoff" && review.state !== "escalated") {
-      throw new Error(`Review ${id} is ${review.state}; only awaiting_signoff or escalated reviews can be signed off.`);
-    }
     if (!by.trim()) throw new Error("Sign-off needs the person's name in by.");
-    const t = now();
-    review.signoff = { by: by.trim(), note: note.trim(), at: t, from_state: review.state };
-    review.history.push({ at: t, event: "signed_off", detail: `by ${by.trim()} from ${review.state}${note.trim() ? `: ${note.trim()}` : ""}` });
-    review.state = "approved";
-    this.store.save(review);
-    return review;
+    this.get(id);
+    return this.store.update(id, (review) => {
+      if (review.state !== "awaiting_signoff" && review.state !== "escalated") {
+        throw new Error(`Review ${id} is ${review.state}; only awaiting_signoff or escalated reviews can be signed off.`);
+      }
+      const t = now();
+      review.signoff = { by: by.trim(), note: note.trim(), at: t, from_state: review.state };
+      review.history.push({ at: t, event: "signed_off", detail: `by ${by.trim()} from ${review.state}${note.trim() ? `: ${note.trim()}` : ""}` });
+      review.state = "approved";
+    });
   }
 
+  /** Cancels a review. The process running its round (this one or another) stops the reviewers. */
   cancel(id: string): Review {
-    const review = this.get(id);
-    if (FINAL.includes(review.state)) throw new Error(`Review ${id} is already ${review.state}.`);
-    review.state = "canceled";
-    review.history.push({ at: now(), event: "canceled" });
-    this.store.save(review);
+    this.get(id);
+    const review = this.store.update(id, (r) => {
+      if (FINAL.includes(r.state)) throw new Error(`Review ${id} is already ${r.state}.`);
+      r.state = "canceled";
+      r.history.push({ at: now(), event: "canceled" });
+    });
     this.aborts.get(id)?.abort();
     return review;
   }
@@ -312,12 +329,13 @@ export class Engine {
   /** Loads a review. A round left in_review with no job in this process was cut off by a restart. */
   get(id: string): Review {
     const review = this.store.load(id);
-    if (review.state === "in_review" && !this.running.has(id) && !this.runningElsewhere(review)) {
-      review.state = "failed";
-      review.history.push({ at: now(), event: "failed", detail: "round was running when the server stopped" });
-      this.store.save(review);
-    }
-    return review;
+    const cutOff = (r: Review) => r.state === "in_review" && !this.running.has(id) && !this.runningElsewhere(r);
+    if (!cutOff(review)) return review;
+    return this.store.update(id, (r) => {
+      if (!cutOff(r)) return; // changed meanwhile
+      r.state = "failed";
+      r.history.push({ at: now(), event: "failed", detail: "round was running when the server stopped" });
+    });
   }
 
   /**
@@ -342,11 +360,10 @@ export class Engine {
 
   /** Saves one reviewer's live status so review_status can show progress. Sync, so no interleaving. */
   private saveRun(id: string, n: number, run: ReviewerRun): void {
-    const r = this.store.load(id);
-    const rd = r.rounds.find((x) => x.n === n);
-    if (!rd) return;
-    rd.reviewers = rd.reviewers.map((x) => (x.name === run.name ? { ...run } : x));
-    this.store.save(r);
+    this.store.update(id, (r) => {
+      const rd = r.rounds.find((x) => x.n === n);
+      if (rd) rd.reviewers = rd.reviewers.map((x) => (x.name === run.name ? { ...run } : x));
+    });
   }
 
   private async runRound(id: string, n: number, signal: AbortSignal): Promise<void> {
@@ -363,6 +380,31 @@ export class Engine {
     const prompt = buildPrompt(review.request, rubric, snap, text, snap.markdown_file ? path.basename(snap.markdown_file) : "", previous, related);
     writeFileSync(path.join(roundDir, "prompt.md"), prompt);
 
+    // A cancel can come from another process (rb cancel, another session): watch the stored state.
+    const watcher = setInterval(() => {
+      try {
+        if (this.store.load(id).state === "canceled") this.aborts.get(id)?.abort();
+      } catch {
+        /* mid-write; try again next tick */
+      }
+    }, 1000);
+    try {
+      await this.finishRound(id, n, review, round, prompt, images, roundDir, signal);
+    } finally {
+      clearInterval(watcher);
+    }
+  }
+
+  private async finishRound(
+    id: string,
+    n: number,
+    review: Review,
+    round: Round,
+    prompt: string,
+    images: string[],
+    roundDir: string,
+    signal: AbortSignal,
+  ): Promise<void> {
     const results = await Promise.all(
       round.reviewers.map(async (run) => {
         run.status = "running";
@@ -399,10 +441,8 @@ export class Engine {
       }),
     );
 
-    // Reload state written meanwhile (e.g. cancel), then apply results.
-    const fresh = this.store.load(id);
-    const freshRound = fresh.rounds.find((r) => r.n === n)!;
     // Merge the same finding from several reviewers before the policy decides what blocks.
+    // This awaits a model, so it happens before the final reload below (a cancel may land meanwhile).
     const raised = results.flatMap(({ run, output }) => (output ? output.findings.map((finding) => ({ finding, reviewer: run.label })) : []));
     const { merged, merge } = await this.merge(raised, review.request.rubric, roundDir, signal);
     const findings: Finding[] = merged.map((m, i) => ({
@@ -417,26 +457,34 @@ export class Engine {
       response: null,
     }));
     const blocking = computeBlocking(findings, {
-      stage: fresh.request.stage,
+      stage: review.request.stage,
       max_blocking: this.config.policy.max_blocking,
-      high_blocks_always: fresh.rubric_meta.high_blocks_always === true,
+      high_blocks_always: review.rubric_meta.high_blocks_always === true,
     });
     findings.forEach((f, i) => (f.blocking = blocking[i]));
-    freshRound.reviewers = round.reviewers;
-    freshRound.findings = findings;
-    freshRound.merge = merge;
-    freshRound.finished_at = now();
-    // Canceled meanwhile, or a newer round started (after a restart marked this one failed):
-    // keep this round's results but leave the review state alone.
-    if (fresh.state !== "in_review" || fresh.rounds.at(-1)!.n !== n) return this.store.save(fresh);
 
-    fresh.state = this.stateAfterRound(fresh, freshRound);
-    fresh.history.push({
-      at: now(),
-      event: "round_finished",
-      detail: `round ${n}: ${findings.filter((f) => f.blocking).length} blocking, ${findings.filter((f) => !f.blocking).length} advisory, state ${fresh.state}`,
+    // Apply the results to the latest stored state, under the lock.
+    this.store.update(id, (fresh) => {
+      const freshRound = fresh.rounds.find((r) => r.n === n);
+      if (!freshRound) return;
+      freshRound.reviewers = round.reviewers;
+      freshRound.findings = findings;
+      freshRound.merge = merge;
+      freshRound.finished_at = now();
+      // Canceled meanwhile, or a newer round started (after a restart marked this one failed):
+      // keep this round's results but leave the review state alone.
+      if (fresh.state !== "in_review" || fresh.rounds.at(-1)!.n !== n) return;
+      fresh.state = this.stateAfterRound(fresh, freshRound);
+      const failed = freshRound.reviewers.filter((r) => r.status === "failed").map((r) => r.label);
+      if (failed.length && fresh.state !== "failed") {
+        fresh.notes.push(`Round ${n}: reviewer(s) ${failed.join(", ")} failed; their review is missing from this round.`);
+      }
+      fresh.history.push({
+        at: now(),
+        event: "round_finished",
+        detail: `round ${n}: ${findings.filter((f) => f.blocking).length} blocking, ${findings.filter((f) => !f.blocking).length} advisory${failed.length ? `, failed: ${failed.join(", ")}` : ""}, state ${fresh.state}`,
+      });
     });
-    this.store.save(fresh);
   }
 
   /**
@@ -475,6 +523,10 @@ export class Engine {
   private stateAfterRound(review: Review, round: Round): ReviewState {
     if (round.reviewers.every((r: ReviewerRun) => r.status === "failed")) return "failed";
     const openBlocking = round.findings.some((f) => f.blocking);
+    // A requested reviewer that failed means the review is incomplete: never approve it.
+    // With blocking findings from the others the author has work anyway; without, resubmit to retry.
+    const someFailed = round.reviewers.some((r: ReviewerRun) => r.status === "failed");
+    if (!openBlocking && someFailed) return "failed";
     if (!openBlocking) return review.rubric_meta.require_signoff === true ? "awaiting_signoff" : "approved";
     if (round.n >= this.config.policy.max_rounds) return "escalated";
     return "changes_requested";

@@ -284,6 +284,8 @@ test("a page server that is not running gives a clear error and leaves no half-m
   const saved = JSON.parse(readFileSync(path.join(reviewDir(id), "review.json"), "utf8"));
   assert.deepEqual([saved.state, saved.rounds.length, saved.rounds[0].findings[0].response.status], ["changes_requested", 1, "accepted"]);
   assert.ok(!existsSync(path.join(reviewDir(id), "r2")));
+  // Bring the shared test server back for the tests that follow.
+  await new Promise<void>((r) => server.listen(Number(new URL(base).port), "127.0.0.1", r));
 });
 
 test("mode all reviews the whole project at HEAD; lockfile and binary diffs stay out of the prompt", async () => {
@@ -311,4 +313,23 @@ test("mode all reviews the whole project at HEAD; lockfile and binary diffs stay
   assert.match(change, /lockfile and binary diffs left out of this prompt \(the files are in tree\/\): (logo\.png, package-lock\.json|package-lock\.json, logo\.png)/);
   assert.doesNotMatch(change, /xxxxxxxxxx/);
   assert.match(change, /diff --git a\/index\.html b\/index\.html/);
+});
+
+test("an infinite-scroll page cannot hang the capture", { skip: !hasChrome && "Google Chrome not installed" }, async (t) => {
+  if (!hasChrome) return t.skip("Google Chrome not installed");
+  const repo = newRepo("site-infinite");
+  writeFileSync(
+    path.join(repo, "feed.html"),
+    `<!doctype html><html lang="en"><title>Feed</title><body style="margin:0"><div id="f"></div><script>
+      const f = document.getElementById("f");
+      const more = () => { for (let i = 0; i < 20; i++) { const d = document.createElement("div"); d.style.height = "200px"; d.textContent = "item"; f.appendChild(d); } };
+      more(); addEventListener("scroll", more);
+    </script></body></html>`,
+  );
+  const started = Date.now();
+  const { json, text } = await call("review_submit", { pages: [`${base}/site-infinite/feed.html`], rubric: "webpage", intent: "x", wait_seconds: 5 });
+  assert.ok(json, text);
+  assert.ok(Date.now() - started < 60_000, "capture should finish");
+  const desktop = snapshotOf(json.review_id).pages[0].screenshots.filter((s: { viewport: string }) => s.viewport === "desktop");
+  assert.ok(desktop.at(-1).y + desktop.at(-1).height <= 16000);
 });

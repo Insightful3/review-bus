@@ -243,7 +243,7 @@ rv_<id>/
 
 ## Security and privacy
 
-- Reviewers are read-only. Codex runs in its read-only sandbox. Claude runs with `--restricted` and only the Read, Grep and Glob tools, confined to the review folder. They work on a copy, never on your files or repo.
+- Reviewers are read-only. Codex runs in its read-only sandbox, without your Codex config's MCP servers, ChatGPT apps, plugins, hooks, browser or computer use, or web access (otherwise those would be reachable despite the sandbox). Claude runs with `--restricted` and only the Read, Grep and Glob tools, confined to the review folder. They work on a copy, never on your files or repo.
 - review-bus does not write to the reviewed repo: the reviewers' copy is made with `git archive` and `git apply` inside the review folder.
 - Whatever you submit is sent to the reviewer's vendor (OpenAI for Codex, Anthropic for Claude). Mark rubrics for confidential material with `confidential: true` and list approved reviewers in `allowed_reviewers`.
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.

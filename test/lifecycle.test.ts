@@ -1,7 +1,8 @@
 // Slice 2: respond, resubmit, round cap, sign-off, status, wait, list, cancel, restart.
 // The fake reviewer drops a finding once its quoted text is gone from the document.
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -74,7 +75,7 @@ before(async () => {
       rubric_paths: [path.join(tmp, "rubrics")],
       storage: { documents: path.join(tmp, "reviews") },
       default_reviewers: ["fake"],
-      adapters: { fake: fake(), slow: fake(["--sleep=20000"]), sleepy: fake(["--sleep-r1=300", "--sleep-r2=1500"]) },
+      adapters: { fake: fake(), slow: fake(["--sleep=20000"]), sleepy: fake(["--sleep-r1=300", "--sleep-r2=1500"]), broken: { ...fake(), command: "/nonexistent/reviewer" } },
     }),
   );
   client = new Client({ name: "lifecycle-author", version: "0.0.0" });
@@ -246,4 +247,60 @@ test("a round cut off by a restart is marked failed; a resubmit runs a new round
   assert.equal(finished.length, 1);
   assert.match(finished[0]!, /^round 2:/);
   assert.equal(final.rounds[0].findings.length, 4); // round 1 results kept for the record
+});
+
+test("a failed reviewer stops approval even when the others found nothing blocking", async () => {
+  const { json } = await submit(doc(true), { reviewers: ["fake", "broken"] });
+  assert.equal(json.state, "failed");
+  assert.deepEqual(json.reviewers.map((r: { status: string }) => r.status), ["done", "failed"]);
+  // Resubmitting retries the round.
+  const { json: r2 } = await ok("review_respond", { review_id: json.review_id, resubmit: true, wait_seconds: 10 });
+  assert.equal(r2.round, 2);
+});
+
+test("a resubmit checks today's approved reviewers: a revoked reviewer gets nothing", async () => {
+  process.env.REVIEW_BUS_CONFIG = configFile;
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  const approve = (list: string[]) => {
+    cfg.allowed_reviewers = { proposal: list };
+    writeFileSync(configFile, JSON.stringify(cfg));
+    return new Engine(loadConfig());
+  };
+  const author = { client: null, vendor: null, vendor_source: "unknown" as const };
+  const req = { artifact: { path: doc() }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" as const };
+  const engine = approve(["fake"]);
+  const review = await engine.submit(req, author, 10);
+  assert.equal(review.state, "changes_requested");
+  const answers = review.rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+  await assert.rejects(approve(["slow"]).respond(review.id, answers, { resubmit: true }), /Reviewer "fake" is no longer approved for proposal/);
+  const after = engine.store.load(review.id);
+  assert.equal(after.rounds.length, 1); // nothing was sent
+  assert.ok(after.rounds[0].findings.filter((f) => f.blocking).every((f) => f.response)); // answers kept
+  delete cfg.allowed_reviewers;
+  writeFileSync(configFile, JSON.stringify(cfg));
+});
+
+test("several processes writing the same review at once lose nothing", async () => {
+  process.env.REVIEW_BUS_CONFIG = configFile;
+  const engine = new Engine(loadConfig());
+  const review = await submit(doc(true), { wait_seconds: 10 });
+  const id = review.json.review_id;
+  const before = engine.store.load(id).history.length;
+  const script = `
+    import("${path.join(ROOT, "dist/src/store.js")}").then(({ Store }) => {
+      const s = new Store(process.argv[1]);
+      for (let i = 0; i < 40; i++) s.update(process.argv[2], (r) => { r.history.push({ at: "", event: "note", detail: process.argv[3] + "-" + i }); });
+    });`;
+  const writers = [1, 2, 3, 4].map(
+    (w) =>
+      new Promise<number | null>((res) => {
+        const p = spawn(process.execPath, ["-e", script, path.dirname(engine.store.dir(id)), id, `w${w}`], { stdio: "inherit" });
+        p.on("exit", res);
+      }),
+  );
+  assert.deepEqual(await Promise.all(writers), [0, 0, 0, 0]);
+  const after = engine.store.load(id); // parses: never left half written
+  assert.equal(after.history.length, before + 160);
+  assert.ok(!existsSync(path.join(engine.store.dir(id), ".lock")));
+  assert.deepEqual(readdirSync(engine.store.dir(id)).filter((f) => f.endsWith(".tmp")), []);
 });

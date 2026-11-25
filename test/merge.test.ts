@@ -122,3 +122,32 @@ test("a bad or failing merge model falls back to rules and says so", async () =>
 test("merge_with must name a configured adapter", async () => {
   await assert.rejects(engineWith({ adapter: "ghost" }), /merge_with\.adapter "ghost" is not in adapters/);
 });
+
+test("merging keeps a version with a failure scenario, so a blocking finding stays blocking", () => {
+  const noScenario = f("Price mismatch between summary and table.", "Summary", "Total price: EUR 24,000", { impact: "critical", failure_scenario: null });
+  const withScenario = f("Price mismatch between summary and table.", "Summary", "Total price: EUR 24,000", { impact: "high" });
+  const [m] = mergeFindings([
+    { finding: noScenario, reviewer: "claude" },
+    { finding: withScenario, reviewer: "codex" },
+  ]);
+  assert.equal(m.agreement, 2);
+  assert.equal(m.finding.impact, "high");
+  assert.ok(m.finding.failure_scenario);
+});
+
+test("a cancel made while the merge model runs is not overwritten", async () => {
+  const engine = await engineWith({ adapter: "merger" }, ["--sleep=1500"]);
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" },
+    { client: "test", vendor: null, vendor_source: "unknown" },
+  );
+  // Wait until both reviewers are done and the merge model is running.
+  while (!engine.store.load(review.id).rounds[0].reviewers.every((r) => r.status === "done")) await new Promise((r) => setTimeout(r, 50));
+  await new Promise((r) => setTimeout(r, 300));
+  engine.cancel(review.id);
+  await engine.waitFor(review.id, 10);
+  await new Promise((r) => setTimeout(r, 200));
+  const after = engine.store.load(review.id);
+  assert.equal(after.state, "canceled");
+  assert.ok(after.history.some((h) => h.event === "canceled"));
+});

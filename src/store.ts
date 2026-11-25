@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { describeArtifact } from "./snapshot.js";
 import type { Finding, Review } from "./types.js";
@@ -44,14 +44,67 @@ export class Store {
     return JSON.parse(readFileSync(path.join(this.dir(id), "review.json"), "utf8"));
   }
 
+  /**
+   * Writes review.json atomically (unique temp file, then rename) and regenerates report.md.
+   * Callers that read, change and write must hold the review's lock: use update().
+   */
   save(review: Review): void {
     const dir = this.dir(review.id);
     mkdirSync(dir, { recursive: true });
     review.updated_at = new Date().toISOString();
-    const tmp = path.join(dir, "review.json.tmp");
+    const suffix = `${process.pid}.${randomBytes(4).toString("hex")}`;
+    const tmp = path.join(dir, `review.json.${suffix}.tmp`);
     writeFileSync(tmp, JSON.stringify(review, null, 2));
     renameSync(tmp, path.join(dir, "review.json"));
-    writeFileSync(path.join(dir, "report.md"), renderReport(review));
+    const reportTmp = path.join(dir, `report.md.${suffix}.tmp`);
+    writeFileSync(reportTmp, renderReport(review));
+    renameSync(reportTmp, path.join(dir, "report.md"));
+  }
+
+  /**
+   * Runs fn while holding the review's lock, shared by every process using this storage (several
+   * agent sessions and rb). The lock is a directory, created atomically. A lock older than 30 s is
+   * treated as left behind by a crashed process. fn must be synchronous and must not lock again.
+   */
+  withLock<T>(id: string, fn: () => T): T {
+    const dir = this.dir(id);
+    mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, ".lock");
+    const deadline = Date.now() + 15_000;
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      try {
+        mkdirSync(lock);
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        try {
+          if (Date.now() - statSync(lock).mtimeMs > 30_000) {
+            rmSync(lock, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          continue; // released meanwhile
+        }
+        if (Date.now() > deadline) throw new Error(`Review ${id} is locked by another process; try again.`);
+        Atomics.wait(pause, 0, 0, 20);
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      rmSync(lock, { recursive: true, force: true });
+    }
+  }
+
+  /** Loads, changes and saves a review under its lock. If fn throws, nothing is saved. */
+  update(id: string, fn: (review: Review) => void): Review {
+    return this.withLock(id, () => {
+      const review = this.load(id);
+      fn(review);
+      this.save(review);
+      return review;
+    });
   }
 }
 

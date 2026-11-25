@@ -113,3 +113,22 @@ test("once the running process is gone, the round is marked failed", async () =>
   process.env.REVIEW_BUS_CONFIG = configFile;
   assert.equal(new Engine(loadConfig()).get(id).state, "failed");
 });
+
+test("a cancel from another process stops the running reviewers", async () => {
+  const child = spawn(process.execPath, [RB, "submit", FIXTURE, "--rubric", "proposal", "--intent", "x", "--reviewer", "slow"], { env });
+  let err = "";
+  child.stderr.on("data", (d) => (err += d));
+  const exited = new Promise<number | null>((r) => child.on("exit", (code) => r(code)));
+  while (!/rv_[0-9a-z]{26}/.test(err)) await new Promise((r) => setTimeout(r, 50));
+  const id = idFrom(err);
+
+  const started = Date.now();
+  process.env.REVIEW_BUS_CONFIG = configFile;
+  new Engine(loadConfig()).cancel(id); // this test process, not the one running the round
+  const code = await exited; // rb sees the review end and exits
+  assert.ok(Date.now() - started < 8000, "the slow reviewer (20 s) should have been stopped");
+  assert.equal(code, 2);
+  const review = new Engine(loadConfig()).get(id);
+  assert.equal(review.state, "canceled");
+  assert.deepEqual([review.rounds[0].reviewers[0].status, review.rounds[0].reviewers[0].error], ["failed", "canceled"]);
+});
