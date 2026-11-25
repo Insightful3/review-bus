@@ -151,3 +151,39 @@ test("a cancel made while the merge model runs is not overwritten", async () => 
   assert.equal(after.state, "canceled");
   assert.ok(after.history.some((h) => h.event === "canceled"));
 });
+
+test("merging keeps the version the policy would block: medium/certain over high/remote", async () => {
+  const { wouldBlock } = await import("../src/policy.js");
+  const policy = { stage: "pre-merge" as const, max_blocking: 5 };
+  const highRemote = f("Same problem.", "Summary", "Total price: EUR 24,000", { impact: "high", likelihood: "remote" });
+  const mediumCertain = f("Same problem.", "Summary", "Total price: EUR 24,000", { impact: "medium", likelihood: "certain" });
+  const items = [
+    { finding: highRemote, reviewer: "codex" },
+    { finding: mediumCertain, reviewer: "claude" },
+  ];
+  const [m] = mergeFindings(items, (x) => wouldBlock(x, policy));
+  assert.deepEqual([m.finding.impact, m.finding.likelihood, m.agreement], ["medium", "certain", 2]);
+  const [g] = applyGroups(items, [["f1", "f2"]], (x) => wouldBlock(x, policy))!;
+  assert.deepEqual([g.finding.impact, g.finding.likelihood], ["medium", "certain"]);
+});
+
+test("an error outside the reviewers fails the round instead of crashing the process", async () => {
+  const engine = await engineWith(null);
+  const unhandled: unknown[] = [];
+  const onUnhandled = (e: unknown) => unhandled.push(e);
+  process.on("unhandledRejection", onUnhandled);
+  (engine as unknown as { finishRound: () => Promise<void> }).finishRound = async () => {
+    throw new Error("disk full");
+  };
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" },
+    { client: "test", vendor: null, vendor_source: "unknown" },
+    5,
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  process.off("unhandledRejection", onUnhandled);
+  assert.deepEqual(unhandled, []);
+  const after = engine.get(review.id);
+  assert.equal(after.state, "failed");
+  assert.ok(after.history.some((h) => h.detail === "round 1: disk full"));
+});

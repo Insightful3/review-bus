@@ -2,7 +2,7 @@
 // reviewers' copy is `git archive <base>` plus the patch, inside the review folder.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { expandHome } from "./config.js";
@@ -38,15 +38,19 @@ export interface GitInfo {
 }
 
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-const MAX_ARCHIVE_BYTES = 300 * 1024 * 1024;
 
-function git(cwd: string, args: string[], opts: { okCodes?: number[]; input?: Buffer } = {}): string {
-  const r = spawnSync("git", ["-C", cwd, ...args], { maxBuffer: 512 * 1024 * 1024, input: opts.input });
+/** Runs git and returns raw bytes: patches must not be decoded (a non-UTF-8 file would change). */
+function gitBuf(cwd: string, args: string[], opts: { okCodes?: number[]; env?: NodeJS.ProcessEnv } = {}): Buffer {
+  const r = spawnSync("git", ["-C", cwd, ...args], { maxBuffer: 512 * 1024 * 1024, env: opts.env ? { ...process.env, ...opts.env } : undefined });
   if (r.error) throw new Error(`git not available: ${r.error.message}`);
   if (!(opts.okCodes ?? [0]).includes(r.status ?? -1)) {
     throw new Error(`git ${args[0]} failed: ${r.stderr.toString().trim().split("\n").slice(-3).join(" | ")}`);
   }
-  return r.stdout.toString();
+  return r.stdout;
+}
+
+function git(cwd: string, args: string[], opts: { okCodes?: number[] } = {}): string {
+  return gitBuf(cwd, args, opts).toString();
 }
 
 const tryRev = (root: string, ref: string) => {
@@ -94,18 +98,18 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
   const notes: string[] = [];
   let baseRef: string | null = null;
   let baseSha: string;
-  let patch: string;
+  let patch: Buffer;
   let files: ChangedFile[];
 
   if (spec.mode === "uncommitted") {
     baseSha = headSha;
     baseRef = "HEAD";
-    patch = git(root, ["diff", "--binary", "--no-color", "--no-ext-diff", "HEAD"]);
+    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", "HEAD"]);
     files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "HEAD"]));
     // Untracked files, as "new file" patches, without touching the index.
     const untracked = git(root, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\0").filter(Boolean);
     for (const f of untracked) {
-      patch += git(root, ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", f], { okCodes: [0, 1] });
+      patch = Buffer.concat([patch, gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", f], { okCodes: [0, 1] })]);
       files.push({ path: f, status: "A" });
     }
   } else if (spec.mode === "base") {
@@ -113,7 +117,7 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     const baseTip = tryRev(root, baseRef);
     if (!baseTip) throw new Error(`Base "${baseRef}" not found in ${root}.`);
     baseSha = git(root, ["merge-base", baseTip, headSha]).trim();
-    patch = git(root, ["diff", "--binary", "--no-color", "--no-ext-diff", baseSha, headSha]);
+    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", baseSha, headSha]);
     files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", baseSha, headSha]));
     const commits = git(root, ["rev-list", "--count", `${baseSha}..${headSha}`]).trim();
     notes.push(`${commits} commit(s) on ${branch ?? "HEAD"} since ${baseRef}.`);
@@ -122,7 +126,7 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     // The whole project at HEAD, as if every file were new (committed files only).
     baseSha = EMPTY_TREE;
     baseRef = null;
-    patch = git(root, ["diff", "--binary", "--no-color", "--no-ext-diff", EMPTY_TREE, headSha]);
+    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", EMPTY_TREE, headSha]);
     files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", EMPTY_TREE, headSha]));
     if (git(root, ["status", "--porcelain"]).trim()) notes.push("The working tree has uncommitted changes; they are not part of this review (mode all reviews HEAD).");
   } else {
@@ -130,27 +134,30 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     if (!commitSha) throw new Error(`Commit "${spec.commit}" not found in ${root}.`);
     baseSha = tryRev(root, `${commitSha}^`) ?? EMPTY_TREE;
     baseRef = `${commitSha.slice(0, 12)}^`;
-    patch = git(root, ["diff", "--binary", "--no-color", "--no-ext-diff", baseSha, commitSha]);
+    patch = gitBuf(root, ["diff", "--binary", "--no-color", "--no-ext-diff", baseSha, commitSha]);
     files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", baseSha, commitSha]));
   }
-  if (!patch.trim()) throw new Error(`No changes to review in ${root} (mode ${spec.mode}).`);
+  if (!patch.toString("latin1").trim()) throw new Error(`No changes to review in ${root} (mode ${spec.mode}).`);
 
   const rdir = path.join(reviewDir, `r${round}`);
   mkdirSync(rdir, { recursive: true });
   const patchFile = `r${round}/change.patch`;
   writeFileSync(path.join(reviewDir, patchFile), patch);
 
-  // Reviewers' copy: the base version with the patch applied.
+  // Reviewers' copy: every tracked file of the base, then the patch applied. Built with a temporary
+  // index outside the repo (read-tree + checkout-index), not git archive, which drops files marked
+  // export-ignore and rewrites export-subst. Nothing is written to the author's repo.
   const treeDir = `r${round}/tree`;
   const treeAbs = path.join(reviewDir, treeDir);
   mkdirSync(treeAbs, { recursive: true });
   if (baseSha !== EMPTY_TREE) {
-    const archive = spawnSync("git", ["-C", root, "archive", "--format=tar", baseSha], { maxBuffer: MAX_ARCHIVE_BYTES });
-    if (archive.status !== 0) {
-      throw new Error(`git archive failed${archive.error ? ` (${archive.error.message}, the repo may be over ${MAX_ARCHIVE_BYTES / 1024 / 1024} MB)` : ""}.`);
+    const env = { GIT_INDEX_FILE: path.join(rdir, ".base-index") };
+    try {
+      gitBuf(root, ["read-tree", baseSha], { env });
+      gitBuf(root, ["checkout-index", "--all", "--force", `--prefix=${treeAbs}/`], { env });
+    } finally {
+      rmSync(env.GIT_INDEX_FILE, { force: true });
     }
-    const tar = spawnSync("tar", ["-x", "-f", "-", "-C", treeAbs], { input: archive.stdout });
-    if (tar.status !== 0) throw new Error(`tar failed: ${tar.stderr.toString().trim()}`);
   }
   // GIT_CEILING_DIRECTORIES stops git from treating a parent folder of the review dir as the repo.
   const apply = spawnSync("git", ["apply", "--binary", "--whitespace=nowarn", path.join(reviewDir, patchFile)], {
@@ -160,9 +167,11 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
   if (apply.status !== 0) throw new Error(`Could not apply the change to the base copy: ${apply.stderr.toString().trim()}`);
 
   const sha256 = createHash("sha256").update(baseSha).update(patch).digest("hex");
+  // Decoded only for the prompt and counts; the stored patch and the tree keep the exact bytes.
+  const text = patch.toString("utf8");
   return {
-    info: { repo_root: root, mode: spec.mode, base_ref: baseRef, base_sha: baseSha, head_sha: headSha, branch, patch_file: patchFile, tree_dir: treeDir, files, ...countLines(patch), notes },
-    patch,
+    info: { repo_root: root, mode: spec.mode, base_ref: baseRef, base_sha: baseSha, head_sha: headSha, branch, patch_file: patchFile, tree_dir: treeDir, files, ...countLines(text), notes },
+    patch: text,
     sha256,
   };
 }

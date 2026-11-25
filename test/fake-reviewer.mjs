@@ -8,6 +8,13 @@ function withFixes(doc, out) {
   return { ...out, findings, verdict: serious ? "changes_requested" : findings.length ? "comment" : "approve" };
 }
 
+// --ignore-term: a reviewer that ignores SIGTERM (it must still be stopped) and records its pid.
+if (process.argv.includes("--ignore-term")) {
+  process.on("SIGTERM", () => {});
+  const fs = await import("node:fs");
+  fs.writeFileSync(`${process.env.REVIEW_BUS_ROUND_DIR}/reviewer.pid`, String(process.pid));
+}
+
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => (input += d));

@@ -16,7 +16,7 @@ const fail = (msg) => {
 if (args[0] !== "exec") fail("expected exec subcommand");
 if (value("--sandbox") !== "read-only") fail("sandbox must be read-only");
 for (const flag of ["--skip-git-repo-check", "--ephemeral", "--ignore-user-config"]) if (!args.includes(flag)) fail(`missing ${flag}`);
-for (const feature of ["apps", "plugins", "computer_use", "browser_use", "hooks"]) {
+for (const feature of ["apps", "plugins", "remote_plugin", "computer_use", "browser_use", "browser_use_external", "hooks", "image_generation"]) {
   if (!args.some((a, i) => a === "--disable" && args[i + 1] === feature)) fail(`feature ${feature} must be disabled`);
 }
 if (!args.some((a, i) => a === "-c" && args[i + 1] === 'web_search="disabled"')) fail("web search must be disabled");

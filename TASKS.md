@@ -49,6 +49,8 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 
 ## Later
 
+- [ ] Return the review_id before slow page capture (self-review round 2, f10). Trade-off: snapshot errors would then arrive as a failed review, not as an error on review_submit.
+- [ ] Optional `model` for Codex in `~/.review-bus/config.json`: reviewers ignore `~/.codex/config.toml` now, so they use Codex's default model.
 - [ ] Optional `codex exec review` native pass (SPEC 8)
 - [ ] MCP Tasks so Claude Code is woken when a result lands (v0.2)
 - [ ] HTTP transport, web inbox, pull-mode reviewers (v0.2+)

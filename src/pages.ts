@@ -169,12 +169,21 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
           });
           // Check same-origin links (max 40) without leaving the site.
           const origin = new URL(page.url()).origin;
-          const internal = facts.links.filter((h) => h.startsWith(origin)).map((h) => h.split("#")[0]);
+          // Same origin by parsed URL (a prefix match would let localhost:4321.example.com through).
+          const sameOrigin = (h: string) => {
+            try {
+              return new URL(h).origin === origin;
+            } catch {
+              return false;
+            }
+          };
+          const internal = facts.links.filter(sameOrigin).map((h) => h.split("#")[0]);
           const toCheck = [...new Set(internal)].slice(0, 40);
           const broken: PageInfo["broken_links"] = [];
           for (const href of toCheck) {
             try {
-              const r = await ctx.request.get(href, { timeout: 10000, maxRedirects: 5 });
+              // No redirects: a same-origin link that redirects elsewhere is not followed off-site.
+              const r = await ctx.request.get(href, { timeout: 10000, maxRedirects: 0 });
               if (r.status() >= 400) broken.push({ href, status: r.status() });
             } catch (e) {
               broken.push({ href, status: (e as Error).message.split("\n")[0].slice(0, 80) });

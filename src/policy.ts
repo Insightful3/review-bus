@@ -54,6 +54,11 @@ export function severityOf(f: PolicyInput): "blocker" | "major" | "minor" | "inf
   return "info";
 }
 
+/** Whether a finding would block on its own under the policy, before the per-round cap. */
+export function wouldBlock(f: PolicyInput, opts: PolicyOptions): boolean {
+  return blocksByMatrix(f, opts);
+}
+
 function blocksByMatrix(f: PolicyInput, opts: PolicyOptions): boolean {
   if (!f.failure_scenario || !f.failure_scenario.trim()) return false;
   // Challenges to the author's assumptions block only when high or critical (then the matrix

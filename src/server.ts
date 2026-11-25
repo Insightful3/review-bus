@@ -223,7 +223,7 @@ export function createServer(engine: Engine): McpServer {
       description:
         "Answer findings of the latest round: accepted, rejected (reason required) or deferred. Every blocking finding needs an answer. " +
         "With resubmit=true, starts the next round on a fresh snapshot of the document (or of artifact, if given). " +
-        "With resubmit=false and every blocking finding answered, closes the review (approved, or awaiting_signoff when the rubric requires a person).",
+        "With resubmit=false and every blocking finding answered, closes the review (approved, or awaiting_signoff when the rubric requires a person; the person then signs off with rb signoff, not an agent).",
       inputSchema: {
         review_id: z.string(),
         responses: z
@@ -257,20 +257,8 @@ export function createServer(engine: Engine): McpServer {
     },
   );
 
-  server.registerTool(
-    "review_signoff",
-    {
-      description: "A person approves a review that is awaiting_signoff or escalated. Agents must not call this on their own; pass the person's name.",
-      inputSchema: { review_id: z.string(), by: z.string().describe("The person's name"), note: z.string().default("") },
-    },
-    async (args) => {
-      try {
-        return jsonReply(status(engine.signoff(args.review_id, args.by, args.note)));
-      } catch (err) {
-        return errorReply(err);
-      }
-    },
-  );
+  // No review_signoff tool: sign-off stands for a person's decision, and an agent could call it with
+  // any name. People sign off with `rb signoff` in their own terminal (SPEC 2).
 
   server.registerTool(
     "review_list",

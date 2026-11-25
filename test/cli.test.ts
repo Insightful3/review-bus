@@ -1,7 +1,7 @@
 // rb, the command line for people, plus a review running in another process (not marked failed).
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { before, test } from "node:test";
@@ -131,4 +131,49 @@ test("a cancel from another process stops the running reviewers", async () => {
   const review = new Engine(loadConfig()).get(id);
   assert.equal(review.state, "canceled");
   assert.deepEqual([review.rounds[0].reviewers[0].status, review.rounds[0].reviewers[0].error], ["failed", "canceled"]);
+});
+
+test("a review-bus.config.json in the current folder is never loaded", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "review-bus-untrusted-"));
+  const marker = path.join(dir, "ran");
+  writeFileSync(
+    path.join(dir, "review-bus.config.json"),
+    JSON.stringify({ default_reviewers: ["evil"], adapters: { evil: { type: "command", command: "/usr/bin/touch", args: [marker] } } }),
+  );
+  const home = mkdtempSync(path.join(os.tmpdir(), "review-bus-home-"));
+  const { REVIEW_BUS_CONFIG: _unused, ...rest } = env;
+  const r = spawnSync(process.execPath, [RB, "submit", FIXTURE, "--rubric", "proposal", "--intent", "x"], { cwd: dir, env: { ...rest, HOME: home }, encoding: "utf8", timeout: 30000 });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /No reviewers given and no default_reviewers in config/);
+  assert.equal(existsSync(marker), false);
+});
+
+test("a reviewer that ignores SIGTERM is still stopped by a cancel", async () => {
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  cfg.adapters.stubborn = { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs"), "--ignore-term", "--sleep=60000"] };
+  writeFileSync(configFile, JSON.stringify(cfg));
+  const child = spawn(process.execPath, [RB, "submit", FIXTURE, "--rubric", "proposal", "--intent", "x", "--reviewer", "stubborn"], { env });
+  let err = "";
+  child.stderr.on("data", (d) => (err += d));
+  const exited = new Promise((r) => child.on("exit", r));
+  while (!/rv_[0-9a-z]{26}/.test(err)) await new Promise((r) => setTimeout(r, 50));
+  const id = idFrom(err);
+  process.env.REVIEW_BUS_CONFIG = configFile;
+  const engine = new Engine(loadConfig());
+  const pidFile = path.join(engine.store.roundDir(id, 1), "reviewer.pid");
+  while (!existsSync(pidFile)) await new Promise((r) => setTimeout(r, 50));
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  engine.cancel(id);
+  const alive = () => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const until = Date.now() + 10_000;
+  while (alive() && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
+  assert.equal(alive(), false, "the reviewer should be killed after SIGTERM is ignored");
+  await exited;
 });

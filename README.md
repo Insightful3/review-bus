@@ -42,7 +42,7 @@ mkdir -p ~/.review-bus
 cp review-bus.config.example.json ~/.review-bus/config.json
 ```
 
-The config is looked up in this order: the path in `REVIEW_BUS_CONFIG`, then `~/.review-bus/config.json`, then `review-bus.config.json` in the current folder. Relative paths in it are resolved against the config file's folder.
+The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.json`. It is never read from the current folder: a config names commands to run, and a cloned repo is not a trusted source of commands. Relative paths in it are resolved against the config file's folder.
 
 | Key | What it does |
 | --- | --- |
@@ -99,7 +99,7 @@ The loop the agent runs:
 1. `review_submit` freezes a snapshot of the work and starts the reviewers in the background. It returns a `review_id`.
 2. `review_wait` (or `review_status`) until the round is done, then `review_result` for the findings.
 3. `review_respond` with an answer for each blocking finding: `accepted`, `rejected` (a reason is required) or `deferred`. Then either close the review (`resubmit: false`) or fix the work and start the next round (`resubmit: true`). The next round's reviewers see the previous findings and the author's answers.
-4. After 3 rounds with blocking findings still open, the review is `escalated` and a person decides. Rubrics can also require a person to sign off (`review_signoff`) before a review is approved.
+4. After 3 rounds with blocking findings still open, the review is `escalated` and a person decides. Rubrics can also require a person to sign off before a review is approved. Sign-off is only in `rb signoff`, in your own terminal: there is no MCP tool for it, because an agent could call one with any name.
 
 ### Tools
 
@@ -110,7 +110,6 @@ The loop the agent runs:
 | `review_wait` | Wait until the round finishes or time runs out, then return the status |
 | `review_result` | Verdicts and findings for the latest round, as Markdown plus JSON |
 | `review_respond` | Answer findings; close, or resubmit for the next round |
-| `review_signoff` | A person approves a review that awaits sign-off or was escalated |
 | `review_list` | Recent reviews, optionally filtered by state |
 | `review_cancel` | Cancel a review and stop its reviewers |
 
@@ -244,7 +243,9 @@ rv_<id>/
 ## Security and privacy
 
 - Reviewers are read-only. Codex runs in its read-only sandbox, without your Codex config's MCP servers, ChatGPT apps, plugins, hooks, browser or computer use, or web access (otherwise those would be reachable despite the sandbox). Claude runs with `--restricted` and only the Read, Grep and Glob tools, confined to the review folder. They work on a copy, never on your files or repo.
-- review-bus does not write to the reviewed repo: the reviewers' copy is made with `git archive` and `git apply` inside the review folder.
+- review-bus does not write to the reviewed repo: the reviewers' copy is made with a temporary index (`git read-tree` and `git checkout-index`) and `git apply` inside the review folder.
+- Several sessions and `rb` can use the same reviews at once: every change to a review holds a lock shared by all processes, and a cancel from any of them stops the reviewers (the whole process group, forcefully if they ignore the polite signal).
+- Approvals (`allowed_reviewers`) are read from the config file again before each new round and merge, so revoking a reviewer takes effect without restarting sessions.
 - Whatever you submit is sent to the reviewer's vendor (OpenAI for Codex, Anthropic for Claude). Mark rubrics for confidential material with `confidential: true` and list approved reviewers in `allowed_reviewers`.
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.
 - Every agent session starts its own review-bus server. A review records which process runs it, so other sessions leave a running review alone and only mark it failed once that process is gone.

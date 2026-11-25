@@ -57,14 +57,14 @@ export function isDuplicate(a: ReviewerFinding, b: ReviewerFinding): boolean {
 }
 
 /** Findings in, merged findings out (highest risk first within each merged group). Only merges across reviewers. */
-export function mergeFindings(items: Raised[]): Merged[] {
+export function mergeFindings(items: Raised[], canBlock: CanBlock = hasScenario): Merged[] {
   const groups: Raised[][] = [];
   for (const item of items) {
     const group = groups.find((g) => g.every((x) => x.reviewer !== item.reviewer) && g.some((x) => isDuplicate(x.finding, item.finding)));
     if (group) group.push(item);
     else groups.push([item]);
   }
-  return groups.map(toMerged);
+  return groups.map((g) => toMerged(g, canBlock));
 }
 
 // ---- Model-assisted merge: a cheap model groups findings that mean the same problem. ----
@@ -91,13 +91,18 @@ ${lines.join("\n")}
 `;
 }
 
+/** Whether a finding would block on its own. The engine passes the round's policy. */
+export type CanBlock = (f: ReviewerFinding) => boolean;
+const hasScenario: CanBlock = (f) => Boolean(f.failure_scenario?.trim());
+
 /**
- * The kept version is the riskiest one that has a failure scenario: a version without one is
- * always advisory, so keeping it could make a blocking finding advisory just by merging.
+ * The kept version is the riskiest one among those that would block under the round's policy:
+ * otherwise merging could turn a blocking finding advisory (for example high/remote kept over
+ * medium/certain, or a version without a failure scenario kept over one with).
  */
-function toMerged(group: Raised[]): Merged {
-  const canBlock = (f: ReviewerFinding) => (f.failure_scenario?.trim() ? 1 : 0);
-  const sorted = [...group].sort((x, y) => canBlock(y.finding) - canBlock(x.finding) || riskScore(y.finding) - riskScore(x.finding));
+function toMerged(group: Raised[], canBlock: CanBlock = hasScenario): Merged {
+  const b = (f: ReviewerFinding) => (canBlock(f) ? 1 : 0);
+  const sorted = [...group].sort((x, y) => b(y.finding) - b(x.finding) || riskScore(y.finding) - riskScore(x.finding));
   const [primary, ...rest] = sorted;
   return {
     finding: primary.finding,
@@ -112,7 +117,7 @@ function toMerged(group: Raised[]): Merged {
  * Unknown ids are ignored, missing ids stay on their own, and a group never holds two findings
  * from the same reviewer (extra ones are split off).
  */
-export function applyGroups(items: Raised[], groups: unknown): Merged[] | null {
+export function applyGroups(items: Raised[], groups: unknown, canBlock: CanBlock = hasScenario): Merged[] | null {
   if (!Array.isArray(groups)) return null;
   const seen = new Set<number>();
   const out: Raised[][] = [];
@@ -132,5 +137,5 @@ export function applyGroups(items: Raised[], groups: unknown): Merged[] | null {
   // Keep the reviewers' order: each group sits where its earliest finding was.
   const first = (g: Raised[]) => Math.min(...g.map((x) => items.indexOf(x)));
   out.sort((a, b) => first(a) - first(b));
-  return out.map(toMerged);
+  return out.map((g) => toMerged(g, canBlock));
 }

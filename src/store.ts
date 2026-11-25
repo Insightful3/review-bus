@@ -1,8 +1,43 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describeArtifact } from "./snapshot.js";
 import type { Finding, Review } from "./types.js";
+
+interface LockOwner {
+  pid: number;
+  host: string;
+  token: string;
+  at: number;
+}
+
+function readOwner(lock: string): LockOwner | null {
+  try {
+    return JSON.parse(readFileSync(path.join(lock, "owner"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isStale(lock: string): boolean {
+  let age: number;
+  try {
+    age = Date.now() - statSync(lock).mtimeMs;
+  } catch {
+    return false; // released meanwhile
+  }
+  const owner = readOwner(lock);
+  if (!owner) return age > 30_000; // created but owner not written yet, or left by a crash in between
+  if (Date.now() - owner.at > 120_000) return true;
+  if (owner.host !== os.hostname()) return false;
+  try {
+    process.kill(owner.pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "EPERM";
+  }
+}
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -45,8 +80,9 @@ export class Store {
   }
 
   /**
-   * Writes review.json atomically (unique temp file, then rename) and regenerates report.md.
-   * Callers that read, change and write must hold the review's lock: use update().
+   * Writes review.json atomically (unique temp file, then rename): the rename is the commit point.
+   * report.md is derived from it and regenerated on every save, so failing to write it does not
+   * fail the save. Callers that read, change and write must hold the review's lock: use update().
    */
   save(review: Review): void {
     const dir = this.dir(review.id);
@@ -57,43 +93,67 @@ export class Store {
     writeFileSync(tmp, JSON.stringify(review, null, 2));
     renameSync(tmp, path.join(dir, "review.json"));
     const reportTmp = path.join(dir, `report.md.${suffix}.tmp`);
-    writeFileSync(reportTmp, renderReport(review));
-    renameSync(reportTmp, path.join(dir, "report.md"));
+    try {
+      writeFileSync(reportTmp, renderReport(review));
+      renameSync(reportTmp, path.join(dir, "report.md"));
+    } catch (err) {
+      rmSync(reportTmp, { force: true });
+      console.error(`review-bus: could not write report.md for ${review.id}: ${(err as Error).message}`);
+    }
   }
 
   /**
    * Runs fn while holding the review's lock, shared by every process using this storage (several
-   * agent sessions and rb). The lock is a directory, created atomically. A lock older than 30 s is
-   * treated as left behind by a crashed process. fn must be synchronous and must not lock again.
+   * agent sessions and rb). The lock is a directory created atomically, with an owner file
+   * (pid, host, token). It is stale when its owner process on this host is gone, or after 120 s.
+   * Taking over a stale lock happens under a second, short-lived steal lock and re-checks the
+   * owner, so two processes recovering at once cannot remove each other's fresh lock. A process
+   * only ever removes a lock that holds its own token. fn must be synchronous and must not lock again.
    */
   withLock<T>(id: string, fn: () => T): T {
     const dir = this.dir(id);
     mkdirSync(dir, { recursive: true });
     const lock = path.join(dir, ".lock");
+    const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
     const deadline = Date.now() + 15_000;
     const pause = new Int32Array(new SharedArrayBuffer(4));
     for (;;) {
       try {
         mkdirSync(lock);
+        writeFileSync(path.join(lock, "owner"), JSON.stringify({ pid: process.pid, host: os.hostname(), token, at: Date.now() }));
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        try {
-          if (Date.now() - statSync(lock).mtimeMs > 30_000) {
-            rmSync(lock, { recursive: true, force: true });
-            continue;
-          }
-        } catch {
-          continue; // released meanwhile
-        }
-        if (Date.now() > deadline) throw new Error(`Review ${id} is locked by another process; try again.`);
-        Atomics.wait(pause, 0, 0, 20);
       }
+      this.takeOverIfStale(lock);
+      if (Date.now() > deadline) throw new Error(`Review ${id} is locked by another process; try again.`);
+      Atomics.wait(pause, 0, 0, 20);
     }
     try {
       return fn();
     } finally {
-      rmSync(lock, { recursive: true, force: true });
+      if (readOwner(lock)?.token === token) rmSync(lock, { recursive: true, force: true });
+    }
+  }
+
+  /** Removes the lock only if it is stale, and only one process at a time may try. */
+  private takeOverIfStale(lock: string): void {
+    const steal = `${lock}.steal`;
+    try {
+      mkdirSync(steal);
+    } catch {
+      // Someone else is checking. A steal lock left by a crash goes after 10 s.
+      try {
+        if (Date.now() - statSync(steal).mtimeMs > 10_000) rmSync(steal, { recursive: true, force: true });
+      } catch {
+        /* gone already */
+      }
+      return;
+    }
+    try {
+      if (isStale(lock)) rmSync(lock, { recursive: true, force: true });
+    } finally {
+      rmSync(steal, { recursive: true, force: true });
     }
   }
 

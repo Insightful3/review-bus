@@ -1,12 +1,12 @@
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runAdapter } from "./adapters/index.js";
-import type { Config } from "./config.js";
+import { loadConfig, type Config } from "./config.js";
 import { buildPrompt, screenshotFiles } from "./prompt.js";
-import { applyGroups, MERGE_SCHEMA, mergeFindings, mergePrompt, type Merged, type Raised } from "./merge.js";
+import { applyGroups, MERGE_SCHEMA, mergeFindings, mergePrompt, type CanBlock, type Merged, type Raised } from "./merge.js";
 import { runStructured } from "./adapters/index.js";
-import { computeBlocking, severityOf } from "./policy.js";
+import { computeBlocking, severityOf, wouldBlock, type PolicyOptions } from "./policy.js";
 import { loadRubric } from "./rubrics.js";
 import { describeArtifact, snapshotRound } from "./snapshot.js";
 import { newReviewId, Store } from "./store.js";
@@ -67,22 +67,24 @@ export class Engine {
   private async startRound(review: Review, runs: ReviewerRun[], isNew: boolean): Promise<void> {
     const n = review.rounds.length + 1;
     const t = now();
+    // Each attempt builds its round in a private staging folder (relative paths stay r<n>/...).
+    // It is moved into place under the lock, so two racing resubmits never touch each other's files.
+    const reviewDir = this.store.dir(review.id);
+    const staging = path.join(reviewDir, `.staging-${process.pid}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`);
+    const dropStaging = () => rmSync(staging, { recursive: true, force: true });
     let snapshot;
     try {
-      snapshot = await snapshotRound(
-        review.request.artifact,
-        review.request.pages,
-        this.store.dir(review.id),
-        n,
-        this.config.browser,
-        review.request.related ?? [],
-      );
+      snapshot = await snapshotRound(review.request.artifact, review.request.pages, staging, n, this.config.browser, review.request.related ?? []);
     } catch (err) {
-      // Leave nothing half made: a new review's folder goes, or just this round's folder.
-      const saved = existsSync(path.join(this.store.dir(review.id), "review.json"));
-      rmSync(saved ? this.store.roundDir(review.id, n) : this.store.dir(review.id), { recursive: true, force: true });
+      dropStaging();
+      // A new review that never got saved leaves nothing behind.
+      if (isNew && !existsSync(path.join(reviewDir, "review.json"))) rmSync(reviewDir, { recursive: true, force: true });
       throw err;
     }
+    const publish = () => {
+      if (existsSync(this.store.roundDir(review.id, n))) throw new Error(`Round ${n} of ${review.id} was started by someone else meanwhile. Nothing was started.`);
+      renameSync(path.join(staging, `r${n}`), this.store.roundDir(review.id, n));
+    };
     const addRound = (r: Review) => {
       const prev = r.rounds.at(-1);
       if (prev && prev.snapshot.sha256 === snapshot.sha256) {
@@ -93,27 +95,34 @@ export class Engine {
       r.state = "in_review";
       r.history.push({ at: t, event: "round_started", detail: `round ${n}` });
     };
-    if (isNew) {
-      addRound(review);
-      this.store.withLock(review.id, () => this.store.save(review));
-    } else {
-      // Another process may have changed the review while the snapshot was taken.
-      try {
+    try {
+      if (isNew) {
+        addRound(review);
+        this.store.withLock(review.id, () => {
+          publish();
+          this.store.save(review);
+        });
+      } else {
+        // Another process may have changed the review while the snapshot was taken.
         this.store.update(review.id, (r) => {
           if (r.rounds.length !== n - 1 || !RESUBMITTABLE.includes(r.state)) {
             throw new Error(`Review ${review.id} changed while round ${n} was being prepared (now ${r.state}, round ${r.rounds.length}). Nothing was started.`);
           }
+          publish();
           addRound(r);
         });
-      } catch (err) {
-        rmSync(this.store.roundDir(review.id, n), { recursive: true, force: true });
-        throw err;
       }
+    } finally {
+      dropStaging(); // empty after a successful move; the whole attempt after a failed one
     }
 
     const abort = new AbortController();
     this.aborts.set(review.id, abort);
-    const job = this.runRound(review.id, n, abort.signal).finally(() => {
+    // Errors outside a reviewer (writing the prompt, a full disk) must not crash the server process,
+    // which may be running other reviews: record them on the round instead.
+    const job = this.runRound(review.id, n, abort.signal)
+      .catch((err) => this.recordRoundError(review.id, n, err, abort))
+      .finally(() => {
       this.running.delete(review.id);
       this.aborts.delete(review.id);
     });
@@ -131,6 +140,7 @@ export class Engine {
   ): Promise<{ review: Review; unanswered: string[] }> {
     this.get(id); // marks a round cut off by a dead process as failed
     let unanswered: string[] = [];
+    let closeRefused: string | null = null;
     // Answers, checks and (without resubmit) closing happen in one locked step.
     const review = this.store.update(id, (r) => {
       const round = r.rounds.at(-1)!;
@@ -152,6 +162,13 @@ export class Engine {
       }
       unanswered = round.findings.filter((f) => f.blocking && !f.response).map((f) => f.finding_id);
       if (opts.resubmit) return; // checked below; the answers are saved either way
+      const failed = round.reviewers.filter((x) => x.status === "failed").map((x) => x.label);
+      if (r.state === "changes_requested" && !unanswered.length && failed.length) {
+        // The answers are kept, but an incomplete review cannot be closed as approved.
+        r.history.push({ at: now(), event: "note", detail: `not closed: reviewer(s) ${failed.join(", ")} failed in round ${round.n}` });
+        closeRefused = `Round ${round.n} is incomplete: reviewer(s) ${failed.join(", ")} failed. Resubmit to run them again, or a person signs off with rb signoff.`;
+        return;
+      }
       if (r.state === "changes_requested" && !unanswered.length) {
         const accepted = round.findings.filter((f) => f.blocking && f.response?.status === "accepted").length;
         r.state = r.rubric_meta.require_signoff === true ? "awaiting_signoff" : "approved";
@@ -163,18 +180,20 @@ export class Engine {
         if (accepted) r.notes.push(`Round ${round.n}: ${accepted} accepted blocking finding(s) were closed without a re-review.`);
       }
     });
+    if (closeRefused) throw new Error(closeRefused);
     if (!opts.resubmit) return { review, unanswered };
 
     const round = review.rounds.at(-1)!;
-    if (review.state === "escalated") throw new Error(`Review ${id} is escalated after ${round.n} rounds. A person decides with review_signoff.`);
+    if (review.state === "escalated") throw new Error(`Review ${id} is escalated after ${round.n} rounds. A person decides with rb signoff.`);
     if (!RESUBMITTABLE.includes(review.state)) throw new Error(`Review ${id} is ${review.state}; submit a new review instead of resubmitting.`);
     if (unanswered.length) throw new Error(`Answer every blocking finding before resubmitting. Unanswered: ${unanswered.join(", ")}.`);
     if (round.n >= this.config.policy.max_rounds) throw new Error(`Review ${id} has used all ${this.config.policy.max_rounds} rounds.`);
     const rubric = loadRubric(review.request.rubric, this.config.rubric_paths);
-    // Approvals can change between rounds: check the reviewers against today's config (SPEC 9).
-    const allowed = this.allowedReviewers(review.request.rubric, rubric.meta);
+    // Approvals can change between rounds: check the reviewers against the config on disk now (SPEC 9).
+    const current = this.currentConfig();
+    const allowed = this.allowedReviewers(review.request.rubric, rubric.meta, current);
     for (const spec of review.request.reviewers) {
-      if (!this.config.adapters[spec.name]) throw new Error(`Reviewer "${spec.name}" is no longer configured. Submit a new review.`);
+      if (!current.adapters[spec.name] || !this.config.adapters[spec.name]) throw new Error(`Reviewer "${spec.name}" is no longer configured. Submit a new review.`);
       if (allowed && !allowed.includes(spec.name)) {
         throw new Error(`Reviewer "${spec.name}" is no longer approved for ${review.request.rubric} (approved: ${allowed.join(", ")}). Nothing was sent. Submit a new review.`);
       }
@@ -237,8 +256,8 @@ export class Engine {
    * SPEC 9: reviewers approved for this rubric, or null when any reviewer may see it.
    * A rubric marked `confidential: true` refuses to run until config lists its reviewers.
    */
-  private allowedReviewers(rubricName: string, meta: Record<string, unknown>): string[] | null {
-    const list = this.config.allowed_reviewers[rubricName];
+  private allowedReviewers(rubricName: string, meta: Record<string, unknown>, config: Config = this.config): string[] | null {
+    const list = config.allowed_reviewers[rubricName];
     if (list) return list;
     if (meta.confidential === true) {
       throw new Error(
@@ -247,6 +266,19 @@ export class Engine {
       );
     }
     return null;
+  }
+
+  /**
+   * The config as it is on disk now, for decisions about what may be sent where (approvals can be
+   * revoked while a server keeps running). Fails closed: if the file cannot be read, nothing is sent.
+   */
+  private currentConfig(): Config {
+    if (!this.config.config_file) return this.config;
+    try {
+      return loadConfig(this.config.config_file);
+    } catch (err) {
+      throw new Error(`Could not re-read ${this.config.config_file}, so nothing was sent: ${(err as Error).message}`);
+    }
   }
 
   private pickReviewers(
@@ -444,7 +476,12 @@ export class Engine {
     // Merge the same finding from several reviewers before the policy decides what blocks.
     // This awaits a model, so it happens before the final reload below (a cancel may land meanwhile).
     const raised = results.flatMap(({ run, output }) => (output ? output.findings.map((finding) => ({ finding, reviewer: run.label })) : []));
-    const { merged, merge } = await this.merge(raised, review.request.rubric, roundDir, signal);
+    const policy: PolicyOptions = {
+      stage: review.request.stage,
+      max_blocking: this.config.policy.max_blocking,
+      high_blocks_always: review.rubric_meta.high_blocks_always === true,
+    };
+    const { merged, merge } = await this.merge(raised, review.request.rubric, roundDir, signal, (f) => wouldBlock(f, policy));
     const findings: Finding[] = merged.map((m, i) => ({
       ...m.finding,
       finding_id: `r${n}.f${i + 1}`,
@@ -456,11 +493,7 @@ export class Engine {
       also_raised_by: m.also_raised_by,
       response: null,
     }));
-    const blocking = computeBlocking(findings, {
-      stage: review.request.stage,
-      max_blocking: this.config.policy.max_blocking,
-      high_blocks_always: review.rubric_meta.high_blocks_always === true,
-    });
+    const blocking = computeBlocking(findings, policy);
     findings.forEach((f, i) => (f.blocking = blocking[i]));
 
     // Apply the results to the latest stored state, under the lock.
@@ -487,17 +520,47 @@ export class Engine {
     });
   }
 
+  private recordRoundError(id: string, n: number, err: unknown, abort: AbortController): void {
+    abort.abort();
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      this.store.update(id, (r) => {
+        const round = r.rounds.find((x) => x.n === n);
+        if (round && !round.finished_at) round.finished_at = now();
+        // Leave a canceled review, or a newer round, alone.
+        if (r.state !== "in_review" || r.rounds.at(-1)?.n !== n) return;
+        r.state = "failed";
+        r.history.push({ at: now(), event: "failed", detail: `round ${n}: ${message}` });
+      });
+    } catch (e) {
+      console.error(`review-bus: round ${n} of ${id} failed (${message}) and could not be recorded: ${(e as Error).message}`);
+    }
+  }
+
   /**
    * Merges duplicates across reviewers: with the configured model when there is one (and it may see
    * this rubric's content), else with conservative word-based rules.
    */
-  private async merge(raised: Raised[], rubricName: string, roundDir: string, signal: AbortSignal): Promise<{ merged: Merged[]; merge: NonNullable<Round["merge"]> }> {
+  private async merge(
+    raised: Raised[],
+    rubricName: string,
+    roundDir: string,
+    signal: AbortSignal,
+    canBlock: CanBlock,
+  ): Promise<{ merged: Merged[]; merge: NonNullable<Round["merge"]> }> {
     const reviewers = new Set(raised.map((r) => r.reviewer));
-    if (reviewers.size < 2) return { merged: mergeFindings(raised), merge: { method: "none", by: null, error: null } };
-    const mw = this.config.merge_with;
-    const allowed = this.config.allowed_reviewers[rubricName];
-    if (!mw || (allowed && !allowed.includes(mw.adapter))) {
-      return { merged: mergeFindings(raised), merge: { method: "rules", by: null, error: mw ? `${mw.adapter} is not approved for ${rubricName}` : null } };
+    if (reviewers.size < 2) return { merged: mergeFindings(raised, canBlock), merge: { method: "none", by: null, error: null } };
+    // The merge model sees quotes from the work: check approvals as they are on disk now.
+    let current: Config;
+    try {
+      current = this.currentConfig();
+    } catch (err) {
+      return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: (err as Error).message } };
+    }
+    const mw = current.merge_with;
+    const allowed = current.allowed_reviewers[rubricName];
+    if (!mw || !this.config.adapters[mw.adapter] || (allowed && !allowed.includes(mw.adapter))) {
+      return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: mw ? `${mw.adapter} is not approved for ${rubricName}` : null } };
     }
     const label = reviewerLabel(mw.adapter, mw.model, mw.effort);
     try {
@@ -512,11 +575,11 @@ export class Engine {
         schema: MERGE_SCHEMA as unknown as Record<string, unknown>,
         tools: "none",
       });
-      const merged = applyGroups(raised, (res.json as { groups?: unknown } | null)?.groups);
+      const merged = applyGroups(raised, (res.json as { groups?: unknown } | null)?.groups, canBlock);
       if (!merged) throw new Error("the grouping put a finding in two groups");
       return { merged, merge: { method: "model", by: reviewerLabel(mw.adapter, res.reportedModel ?? mw.model, res.reportedEffort ?? mw.effort), error: null } };
     } catch (err) {
-      return { merged: mergeFindings(raised), merge: { method: "rules", by: label, error: `model merge failed, used rules: ${(err as Error).message}` } };
+      return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: label, error: `model merge failed, used rules: ${(err as Error).message}` } };
     }
   }
 

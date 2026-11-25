@@ -76,16 +76,14 @@ function findConfigFile(): string | null {
   // An explicitly named config must exist: falling back silently would use a different config.
   const explicit = process.env.REVIEW_BUS_CONFIG;
   if (explicit && !existsSync(explicit)) throw new Error(`REVIEW_BUS_CONFIG points to ${explicit}, which does not exist.`);
-  const candidates = [
-    process.env.REVIEW_BUS_CONFIG,
-    path.join(os.homedir(), ".review-bus", "config.json"),
-    path.join(process.cwd(), "review-bus.config.json"),
-  ].filter((p): p is string => Boolean(p));
+  // No lookup in the current folder: a config names commands to run, and a folder (a cloned repo,
+  // a download) is not a trusted source of commands. Use REVIEW_BUS_CONFIG to point at one.
+  const candidates = [process.env.REVIEW_BUS_CONFIG, path.join(os.homedir(), ".review-bus", "config.json")].filter((p): p is string => Boolean(p));
   return candidates.find((p) => existsSync(p)) ?? null;
 }
 
-export function loadConfig(): Config {
-  const file = findConfigFile();
+/** Loads the config from REVIEW_BUS_CONFIG or ~/.review-bus/config.json, or from `file` to reload the same one. */
+export function loadConfig(file: string | null = findConfigFile()): Config {
   const raw = file ? JSON.parse(readFileSync(file, "utf8")) : {};
   const parsed = Config.parse(raw);
   const config_dir = file ? path.dirname(file) : process.cwd();

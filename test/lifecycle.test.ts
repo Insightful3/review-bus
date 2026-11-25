@@ -2,7 +2,7 @@
 // The fake reviewer drops a finding once its quoted text is gone from the document.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -93,13 +93,16 @@ after(async () => {
   await client?.close();
 });
 
-test("all eight tools are listed", async () => {
+test("seven tools are listed; sign-off is not one of them (people use rb signoff)", async () => {
   const { tools } = await client.listTools();
-  assert.deepEqual(
-    tools.map((t) => t.name).sort(),
-    ["review_cancel", "review_list", "review_respond", "review_result", "review_signoff", "review_status", "review_submit", "review_wait"],
-  );
+  assert.deepEqual(tools.map((t) => t.name).sort(), ["review_cancel", "review_list", "review_respond", "review_result", "review_status", "review_submit", "review_wait"]);
 });
+
+/** A person at the terminal: what rb signoff does. */
+function person(): Engine {
+  process.env.REVIEW_BUS_CONFIG = configFile;
+  return new Engine(loadConfig());
+}
 
 test("respond, fix, resubmit: round 2 approves and keeps round 1 history", async () => {
   const file = doc();
@@ -157,10 +160,10 @@ test("round cap: blocking findings still open after round 3 escalate, then a per
   assert.deepEqual([r3.round, r3.state], [3, "escalated"]);
 
   await fails("review_respond", rejectAll(3), /escalated after 3 rounds/);
-  await fails("review_signoff", { review_id: id, by: "  " }, /person's name/);
-  const { json: signed } = await ok("review_signoff", { review_id: id, by: "Test Person", note: "Price confirmed by phone." });
+  assert.throws(() => person().signoff(id, "  ", ""), /person's name/);
+  const signed = person().signoff(id, "Test Person", "Price confirmed by phone.");
   assert.equal(signed.state, "approved");
-  assert.equal(signed.signoff.from_state, "escalated");
+  assert.equal(signed.signoff?.from_state, "escalated");
 
   const history = JSON.parse(readFileSync(path.join(tmp, "reviews", id, "review.json"), "utf8")).history.map((h: { event: string; detail?: string }) => h.detail ?? h.event);
   assert.ok(history.some((d: string) => d === "round 2 document is unchanged since round 1"));
@@ -184,9 +187,8 @@ test("a rubric that requires sign-off waits for a person", async () => {
   const { json } = await submit(doc(true), { rubric: "signoff-test" });
   assert.equal(json.state, "awaiting_signoff");
   await fails("review_respond", { review_id: json.review_id, resubmit: true }, /awaiting_signoff/);
-  const { json: signed } = await ok("review_signoff", { review_id: json.review_id, by: "Test Person" });
-  assert.equal(signed.state, "approved");
-  await fails("review_signoff", { review_id: json.review_id, by: "Test Person" }, /only awaiting_signoff or escalated/);
+  assert.equal(person().signoff(json.review_id, "Test Person", "").state, "approved");
+  assert.throws(() => person().signoff(json.review_id, "Test Person", ""), /only awaiting_signoff or escalated/);
 });
 
 test("status shows a running reviewer; cancel stops it; wait returns early", async () => {
@@ -303,4 +305,88 @@ test("several processes writing the same review at once lose nothing", async () 
   assert.equal(after.history.length, before + 160);
   assert.ok(!existsSync(path.join(engine.store.dir(id), ".lock")));
   assert.deepEqual(readdirSync(engine.store.dir(id)).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("an author cannot close a review as approved while a reviewer of the round failed", async () => {
+  const { json } = await submit(doc(), { reviewers: ["fake", "broken"] });
+  assert.equal(json.state, "changes_requested");
+  const answers = json.findings.map((f: { finding_id: string }) => ({ finding_id: f.finding_id, status: "deferred", note: "Later." }));
+  await fails("review_respond", { review_id: json.review_id, responses: answers }, /incomplete: reviewer\(s\) broken:default:default failed/);
+  const after = person().get(json.review_id);
+  assert.equal(after.state, "changes_requested");
+  assert.ok(after.rounds[0].findings.filter((f) => f.blocking).every((f) => f.response?.status === "deferred")); // answers kept
+});
+
+test("revoking a reviewer while the MCP server keeps running stops the next round", async () => {
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  try {
+    const { json } = await submit(doc(), { reviewers: ["fake"] });
+    cfg.allowed_reviewers = { proposal: ["slow"] }; // fake is no longer approved
+    writeFileSync(configFile, JSON.stringify(cfg));
+    const answers = json.findings.map((f: { finding_id: string }) => ({ finding_id: f.finding_id, status: "deferred", note: "Later." }));
+    await fails("review_respond", { review_id: json.review_id, responses: answers, resubmit: true }, /Reviewer "fake" is no longer approved for proposal/);
+    assert.equal(person().get(json.review_id).rounds.length, 1);
+  } finally {
+    delete cfg.allowed_reviewers;
+    writeFileSync(configFile, JSON.stringify(cfg));
+  }
+});
+
+test("two resubmits racing: one wins with its own files, the other starts nothing", async () => {
+  const author = { client: null, vendor: null, vendor_source: "unknown" as const };
+  const first = doc();
+  const a = person();
+  const review = await a.submit({ artifact: { path: first }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, author, 10);
+  const answers = review.rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const, note: "Later." }));
+  const docA = doc();
+  const docB = doc(true);
+  const results = await Promise.allSettled([
+    person().respond(review.id, answers, { resubmit: true, artifact: docA }),
+    person().respond(review.id, answers, { resubmit: true, artifact: docB }),
+  ]);
+  assert.deepEqual(results.map((r) => r.status).sort(), ["fulfilled", "rejected"]);
+  const lost = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+  assert.match(lost.reason.message, /changed while round 2 was being prepared|started by someone else/);
+  const after = a.store.load(review.id);
+  assert.equal(after.rounds.length, 2);
+  // The saved round's files are the winner's own.
+  const winner = after.request.artifact!.path!;
+  assert.equal(readFileSync(path.join(a.store.dir(review.id), "r2/original.md"), "utf8"), readFileSync(winner, "utf8"));
+  assert.deepEqual(readdirSync(a.store.dir(review.id)).filter((f) => f.startsWith(".staging")), []);
+  await a.waitFor(review.id, 10);
+});
+
+test("a report that cannot be written does not undo a saved round", async () => {
+  const { json } = await submit(doc());
+  const dir = person().store.dir(json.review_id);
+  // Make report.md unwritable: a non-empty directory in its place.
+  rmSync(path.join(dir, "report.md"));
+  mkdirSync(path.join(dir, "report.md"));
+  writeFileSync(path.join(dir, "report.md", "x"), "x");
+  const answers = json.findings.map((f: { finding_id: string }) => ({ finding_id: f.finding_id, status: "deferred", note: "Later." }));
+  const { json: r2 } = await ok("review_respond", { review_id: json.review_id, responses: answers, resubmit: true, wait_seconds: 10 });
+  assert.equal(r2.round, 2);
+  assert.ok(existsSync(path.join(dir, "r2/artifact.md")));
+});
+
+test("two processes recovering the same stale lock lose no update", async () => {
+  const { json } = await submit(doc(true));
+  const store = person().store;
+  const id = json.review_id;
+  // A lock left by a process that is gone.
+  const dead = spawn(process.execPath, ["-e", ""]);
+  await new Promise((r) => dead.on("exit", r));
+  mkdirSync(path.join(store.dir(id), ".lock"));
+  writeFileSync(path.join(store.dir(id), ".lock", "owner"), JSON.stringify({ pid: dead.pid, host: os.hostname(), token: "dead", at: Date.now() }));
+  const before = store.load(id).history.length;
+  const script = `
+    import("${path.join(ROOT, "dist/src/store.js")}").then(({ Store }) => {
+      const s = new Store(process.argv[1]);
+      for (let i = 0; i < 25; i++) s.update(process.argv[2], (r) => { r.history.push({ at: "", event: "note", detail: process.argv[3] + i }); });
+    });`;
+  const runs = ["a", "b", "c"].map((w) => new Promise((res) => spawn(process.execPath, ["-e", script, path.dirname(store.dir(id)), id, w], { stdio: "inherit" }).on("exit", res)));
+  assert.deepEqual(await Promise.all(runs), [0, 0, 0]);
+  assert.equal(store.load(id).history.length, before + 75);
+  assert.ok(!existsSync(path.join(store.dir(id), ".lock")));
+  assert.ok(!existsSync(path.join(store.dir(id), ".lock.steal")));
 });

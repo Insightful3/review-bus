@@ -69,6 +69,10 @@ before(async () => {
   tmp = mkdtempSync(path.join(os.tmpdir(), "review-bus-web-"));
   // Serve whatever folder the URL names under tmp (each test has its own repo).
   server = http.createServer((req, res) => {
+    if (req.url?.endsWith("/redirect-out")) {
+      res.writeHead(302, { location: "http://example.invalid/elsewhere" }).end();
+      return;
+    }
     const file = path.join(tmp, decodeURIComponent(new URL(req.url!, "http://x").pathname));
     if (!file.startsWith(tmp) || !existsSync(file) || !file.endsWith(".html")) {
       res.writeHead(404).end("not found");
@@ -332,4 +336,41 @@ test("an infinite-scroll page cannot hang the capture", { skip: !hasChrome && "G
   assert.ok(Date.now() - started < 60_000, "capture should finish");
   const desktop = snapshotOf(json.review_id).pages[0].screenshots.filter((s: { viewport: string }) => s.viewport === "desktop");
   assert.ok(desktop.at(-1).y + desktop.at(-1).height <= 16000);
+});
+
+test("files marked export-ignore are still in the reviewers' copy; non-UTF-8 bytes arrive unchanged", async () => {
+  const repo = newRepo("site-attrs");
+  mkdirSync(path.join(repo, "tests"));
+  writeFileSync(path.join(repo, ".gitattributes"), "tests/ export-ignore\n");
+  writeFileSync(path.join(repo, "tests", "a.txt"), "old\n");
+  const latin1 = Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]); // "café" in Windows-1252
+  writeFileSync(path.join(repo, "legacy.txt"), latin1);
+  sh(repo, "add", ".");
+  sh(repo, "commit", "-q", "-m", "attrs");
+  sh(repo, "checkout", "-q", "-b", "feature");
+  writeFileSync(path.join(repo, "tests", "a.txt"), "new\n");
+  sh(repo, "commit", "-q", "-am", "change an export-ignored file");
+
+  const { json, text } = await call("review_submit", { artifact: { git: { repo, mode: "base", base: "main" } }, rubric: "code", intent: "x", wait_seconds: 30 });
+  assert.ok(json, text);
+  const tree = path.join(reviewDir(json.review_id), "r1/tree");
+  assert.equal(readFileSync(path.join(tree, "tests/a.txt"), "utf8"), "new\n");
+  assert.deepEqual([...readFileSync(path.join(tree, "legacy.txt"))], [...latin1]);
+  assert.ok(!existsSync(path.join(reviewDir(json.review_id), "r1/.base-index")));
+
+  const all = await call("review_submit", { artifact: { git: { repo, mode: "all" } }, rubric: "code", intent: "x", wait_seconds: 30 });
+  assert.ok(all.json, all.text);
+  assert.deepEqual([...readFileSync(path.join(reviewDir(all.json.review_id), "r1/tree/legacy.txt"))], [...latin1]);
+});
+
+test("the link check compares origins and does not follow redirects off-site", { skip: !hasChrome && "Google Chrome not installed" }, async (t) => {
+  if (!hasChrome) return t.skip("Google Chrome not installed");
+  const repo = newRepo("site-links");
+  const lookalike = `${base}.example.invalid/x`; // starts with the origin, but is another host
+  writeFileSync(path.join(repo, "links.html"), `<!doctype html><html lang="en"><title>Links</title><body><a href="${lookalike}">a</a><a href="/redirect-out">b</a><a href="index.html">c</a></body></html>`);
+  const { json, text } = await call("review_submit", { pages: [`${base}/site-links/links.html`], rubric: "webpage", intent: "x", wait_seconds: 5 });
+  assert.ok(json, text);
+  const page = snapshotOf(json.review_id).pages[0];
+  assert.equal(page.links_checked, 2); // the redirect and index.html, not the lookalike
+  assert.deepEqual(page.broken_links, []);
 });
