@@ -229,9 +229,9 @@ Each agent session starts its own server process over stdio, and `rb` runs revie
 
 From review-bus reviewing itself with Codex (4 high-effort passes); open, listed in README:
 
-- Reviewer reads: Codex runs under a read-restricted permission profile (round folder plus `:minimal` platform paths; home folder, other reviews, auth and temp folders denied) and Claude under `--restricted` (file tools confined to the round folder), both checked with canaries on 25 Nov 2026. Not covered: `command` reviewers, `:minimal` system paths, and Codex's `view_image` tool outside the folder (untested). `npm run check:isolation` re-checks the Codex profile.
-- Headless page capture follows redirects from a public page to private addresses.
-- Reviewers in their own process group can outlive a runner that is killed outright.
+- Reviewer reads: Codex runs under a read-restricted permission profile (round folder plus `:minimal` platform paths; home folder, other reviews, auth and temp folders denied) and Claude under `--restricted` (file tools confined to the round folder), both checked with canaries on 25 Nov 2026. Codex's `view_image` tool is confined too (checked: an image outside the folder fails with "Operation not permitted", one inside opens). Not covered: `command` reviewers and `:minimal` system paths. `npm run check:isolation` re-checks the Codex profile.
+- Page capture: when the submitted page is public, requests to private addresses are blocked (listed as `blocked_requests`, with a warning) and a redirect hop into one refuses the capture. The redirected request itself is still made, and DNS rebinding is not covered. Submitted private pages (dev servers) are unrestricted.
+- Reviewers outliving their runner: a watchdog per reviewer checks the runner every second and stops the reviewer group (SIGTERM, then SIGKILL after 5 s) when it is gone; it ignores SIGINT and SIGHUP so it outlives the runner. Checked: a reviewer ignoring SIGTERM stops about 6 s after `rb` is SIGKILLed.
 - The review id is returned after the snapshot; slow pages can exceed client timeouts.
 - Reviewer selection, model and effort follow the config the server started with; only approvals and the reviewer's command are re-read before each round.
 - A rubric's confidentiality is taken from when the review started, not re-read on resubmit.

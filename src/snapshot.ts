@@ -96,6 +96,7 @@ export async function snapshotRound(
     for (const p of captured.pages) {
       if (p.status !== null && p.status >= 400) snap.warnings.push(`${p.url} returned HTTP ${p.status}.`);
       if (p.screenshots.some((s) => s.truncated)) snap.warnings.push(`${p.url} is taller than the screenshot limit; the bottom is cut off.`);
+      if (p.blocked_requests?.length) snap.warnings.push(`${p.url} tried to load ${p.blocked_requests.length} resource(s) from private addresses; they were blocked.`);
     }
   }
   return snap;

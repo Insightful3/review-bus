@@ -3,6 +3,8 @@
 // The review-bus server drives the browser; reviewers only read the resulting files.
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { lookup } from "node:dns/promises";
+import net from "node:net";
 import path from "node:path";
 
 export interface BrowserConfig {
@@ -14,9 +16,47 @@ export interface BrowserConfig {
   max_height: number;
   /** Screenshots are split into tiles of this height so text stays readable for the model. */
   tile_height: number;
+  /** Extra Chrome command-line flags (advanced; tests use --host-resolver-rules). */
+  args: string[];
 }
 
-export const DEFAULT_BROWSER: BrowserConfig = { channel: "chrome", executable_path: null, timeout_seconds: 30, max_height: 16000, tile_height: 1800 };
+export const DEFAULT_BROWSER: BrowserConfig = { channel: "chrome", executable_path: null, timeout_seconds: 30, max_height: 16000, tile_height: 1800, args: [] };
+
+/** Loopback, private, link-local, carrier-grade NAT and unspecified addresses (IPv4 and IPv6). */
+export function isPrivateAddress(ip: string): boolean {
+  const v4 = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+  if (net.isIPv4(v4)) {
+    const [a, b] = v4.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  const v6 = ip.toLowerCase();
+  return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6);
+}
+
+const privateHostCache = new Map<string, Promise<boolean>>();
+
+/** Whether a URL's host is (or resolves to) a private address. Names that do not resolve count as public. */
+export function urlIsPrivate(url: string): Promise<boolean> {
+  let host: string;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:" && u.protocol !== "ws:" && u.protocol !== "wss:") return Promise.resolve(false);
+    host = u.hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return Promise.resolve(false);
+  }
+  if (net.isIP(host)) return Promise.resolve(isPrivateAddress(host));
+  if (host === "localhost" || host.endsWith(".localhost")) return Promise.resolve(true);
+  let cached = privateHostCache.get(host);
+  if (!cached) {
+    cached = lookup(host, { all: true }).then(
+      (addrs) => addrs.some((a) => isPrivateAddress(a.address)),
+      () => false,
+    );
+    privateHostCache.set(host, cached);
+  }
+  return cached;
+}
 
 const VIEWPORTS = [
   { name: "desktop", width: 1366, height: 900, isMobile: false },
@@ -37,6 +77,8 @@ export interface PageInfo {
   broken_links: { href: string; status: number | string }[];
   links_checked: number;
   console_errors: string[];
+  /** Requests a public page made to private addresses, which were blocked. */
+  blocked_requests: string[];
   screenshots: { viewport: string; file: string; width: number; y: number; height: number; page_height: number; truncated: boolean }[];
   text_file: string;
 }
@@ -83,6 +125,7 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
       headless: true,
       // Playwright turns Chrome's own sandbox off by default; pages can be untrusted.
       chromiumSandbox: true,
+      args: cfg.args,
       ...(cfg.executable_path ? { executablePath: cfg.executable_path } : cfg.channel ? { channel: cfg.channel } : {}),
     });
   } catch (err) {
@@ -111,6 +154,26 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
           colorScheme: "light",
           reducedMotion: "reduce",
         });
+        // A public page must not reach private addresses (your machine, your network) and get their
+        // content captured and sent to reviewers. Direct requests are blocked. Redirect hops are not
+        // visible to request routing, so a redirect into a private address refuses the capture.
+        // A submitted page that is itself private (a local dev server) is not restricted.
+        const blocked: string[] = [];
+        const redirectChecks: Promise<string | null>[] = [];
+        if (!(await urlIsPrivate(url))) {
+          await ctx.route("**/*", async (route) => {
+            const target = route.request().url();
+            if (await urlIsPrivate(target)) {
+              if (!blocked.includes(target)) blocked.push(target);
+              return route.abort("blockedbyclient");
+            }
+            return route.continue();
+          });
+          ctx.on("request", (req) => {
+            const from = req.redirectedFrom();
+            if (from) redirectChecks.push(urlIsPrivate(req.url()).then((p) => (p ? `${from.url()} -> ${req.url()}` : null)));
+          });
+        }
         const page = await ctx.newPage();
         const consoleErrors: string[] = [];
         page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text().slice(0, 300)));
@@ -152,6 +215,12 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
           window.scrollTo(0, 0);
         }, cfg.max_height), "scrolling to load images");
         await page.waitForTimeout(300);
+        const intoPrivate = (await Promise.all(redirectChecks)).filter((x): x is string => x !== null);
+        if (intoPrivate.length) {
+          throw new Error(
+            `${url} redirected into a private address (${intoPrivate[0]}). Page capture stopped, so nothing from that address is sent to reviewers.`,
+          );
+        }
         const fullHeight = await within(page.evaluate(() => document.documentElement.scrollHeight), "measuring the page");
         const height = Math.min(fullHeight, cfg.max_height);
         const shots: PageInfo["screenshots"] = [];
@@ -221,6 +290,7 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
             headings: facts.headings,
             images_missing_alt: facts.images_missing_alt,
             broken_links: broken,
+            blocked_requests: [],
             links_checked: toCheck.length,
             console_errors: [],
             screenshots: [],
@@ -228,6 +298,7 @@ export async function capturePages(urls: string[], reviewDir: string, round: num
           };
         }
         info.screenshots.push(...shots);
+        for (const b of blocked) if (!info.blocked_requests.includes(b)) info.blocked_requests.push(b);
         for (const e of consoleErrors) if (!info.console_errors.includes(e)) info.console_errors.push(e);
         await ctx.close();
       }

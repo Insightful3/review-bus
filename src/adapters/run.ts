@@ -8,6 +8,27 @@ export interface ProcResult {
 }
 
 /**
+ * Watchdog for one reviewer process group: checks every second whether the runner still exists. When
+ * the runner is gone (killed, crashed: the watchdog is re-parented), it sends the group SIGTERM, then
+ * SIGKILL after 5 s. It exits as soon as the group is gone. It ignores SIGINT and SIGHUP, which a
+ * terminal sends to the runner's group on Ctrl-C or when it closes, so it outlives the runner.
+ */
+const WATCHDOG = `
+const [runner, group] = process.argv.slice(1).map(Number);
+process.on("SIGINT", () => {});
+process.on("SIGHUP", () => {});
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const tick = setInterval(() => {
+  if (!alive(-group)) process.exit(0);
+  if (process.ppid !== runner || !alive(runner)) {
+    clearInterval(tick);
+    try { process.kill(-group, "SIGTERM"); } catch {}
+    setTimeout(() => { try { process.kill(-group, "SIGKILL"); } catch {} process.exit(0); }, 5000);
+  }
+}, 1000);
+`;
+
+/**
  * Runs a command with the prompt on stdin. Never uses a shell.
  * The reviewer runs in its own process group, so a cancel or timeout stops everything it started
  * (a CLI's own helper processes too): SIGTERM to the group, then SIGKILL after 5 s if anything is
@@ -29,6 +50,13 @@ export function runProcess(
       stdio: ["pipe", "pipe", "pipe"],
       detached: true, // own process group, see killTree
     });
+    // A reviewer in its own process group would outlive a runner that is killed outright (SIGKILL,
+    // a crash): nothing would stop it. A small watchdog in the runner's group stops it then.
+    if (child.pid) {
+      spawn(process.execPath, ["-e", WATCHDOG, String(process.pid), String(child.pid)], { stdio: "ignore" })
+        .on("error", () => {})
+        .unref();
+    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;

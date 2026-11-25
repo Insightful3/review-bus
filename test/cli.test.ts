@@ -177,3 +177,30 @@ test("a reviewer that ignores SIGTERM is still stopped by a cancel", async () =>
   assert.equal(alive(), false, "the reviewer should be killed after SIGTERM is ignored");
   await exited;
 });
+
+test("reviewers stop when their runner is killed outright", async () => {
+  const cfg = JSON.parse(readFileSync(configFile, "utf8"));
+  cfg.adapters.orphan = { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs"), "--ignore-term", "--sleep=60000"] };
+  writeFileSync(configFile, JSON.stringify(cfg));
+  const child = spawn(process.execPath, [RB, "submit", FIXTURE, "--rubric", "proposal", "--intent", "x", "--reviewer", "orphan"], { env });
+  let err = "";
+  child.stderr.on("data", (d) => (err += d));
+  while (!/rv_[0-9a-z]{26}/.test(err)) await new Promise((r) => setTimeout(r, 50));
+  const id = idFrom(err);
+  process.env.REVIEW_BUS_CONFIG = configFile;
+  const pidFile = path.join(new Engine(loadConfig()).store.roundDir(id, 1), "reviewer.pid");
+  while (!existsSync(pidFile)) await new Promise((r) => setTimeout(r, 50));
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  const alive = () => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  child.kill("SIGKILL"); // no cleanup code in the runner gets to run
+  const until = Date.now() + 12_000;
+  while (alive() && Date.now() < until) await new Promise((r) => setTimeout(r, 200));
+  assert.equal(alive(), false, "the watchdog should stop a reviewer (even one ignoring SIGTERM) after its runner died");
+});

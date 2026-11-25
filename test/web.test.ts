@@ -69,6 +69,10 @@ before(async () => {
   tmp = mkdtempSync(path.join(os.tmpdir(), "review-bus-web-"));
   // Serve whatever folder the URL names under tmp (each test has its own repo).
   server = http.createServer((req, res) => {
+    if (req.url?.endsWith("/redirect-private")) {
+      res.writeHead(302, { location: `${base}/site-public/private.html` }).end();
+      return;
+    }
     if (req.url?.endsWith("/redirect-out")) {
       res.writeHead(302, { location: "http://example.invalid/elsewhere" }).end();
       return;
@@ -98,7 +102,8 @@ before(async () => {
       storage: { documents: path.join(tmp, "reviews") },
       default_reviewers: ["fake"],
       adapters: { fake, codex: { type: "codex", command: path.join(ROOT, "test/fake-codex.mjs"), timeout_seconds: 60 } },
-      browser: { timeout_seconds: 5 },
+      // public.test resolves to this test server inside Chrome only: review-bus sees a public name.
+      browser: { timeout_seconds: 5, args: ["--host-resolver-rules=MAP public.test 127.0.0.1"] },
     }),
   );
   client = new Client({ name: "web-author", version: "0.0.0" });
@@ -480,4 +485,45 @@ test("no git changes but pages given: the pages are reviewed with a warning; wai
   // Without pages there is nothing to review: still an error.
   const none = await call("review_submit", { artifact: { git: { repo, mode: "base", base: "main" } }, rubric: "webpage", intent: "x" });
   assert.match(none.text, /No changes to review/);
+});
+
+test("a public page cannot reach private addresses: requests are blocked, a redirect into one stops the capture", { skip: !hasChrome && "Google Chrome not installed" }, async (t) => {
+  if (!hasChrome) return t.skip("Google Chrome not installed");
+  const repo = newRepo("site-public");
+  const port = new URL(base).port;
+  writeFileSync(path.join(repo, "private.html"), "<!doctype html><title>Private</title><p>PRIVATE-ADMIN-PANEL</p>");
+  // A public page that pulls an image and a fetch from this machine.
+  writeFileSync(
+    path.join(repo, "page.html"),
+    `<!doctype html><html lang="en"><title>Public</title><body><p>Hello</p><img src="${base}/site-public/private.html" alt="x"><script>fetch("http://localhost:${port}/site-public/private.html").catch(()=>{})</script></body></html>`,
+  );
+  const publicUrl = `http://public.test:${port}/site-public/page.html`;
+  const { json, text } = await call("review_submit", { pages: [publicUrl], rubric: "webpage", intent: "x", wait_seconds: 10 });
+  assert.ok(json, text);
+  const page = snapshotOf(json.review_id).pages[0];
+  assert.deepEqual(page.blocked_requests.sort(), [`${base}/site-public/private.html`, `http://localhost:${port}/site-public/private.html`].sort());
+  assert.match(snapshotOf(json.review_id).warnings.join(" "), /tried to load 2 resource\(s\) from private addresses; they were blocked/);
+  assert.doesNotMatch(readFileSync(path.join(reviewDir(json.review_id), page.text_file), "utf8"), /PRIVATE-ADMIN-PANEL/);
+
+  // A public page that redirects into a private address: no capture at all.
+  const redirected = await call("review_submit", { pages: [`http://public.test:${port}/redirect-private`], rubric: "webpage", intent: "x" });
+  assert.match(redirected.text, /redirected into a private address .*Page capture stopped/);
+
+  // The same pages submitted as local (your dev server) are not restricted.
+  const local = await call("review_submit", { pages: [`${base}/site-public/page.html`], rubric: "webpage", intent: "x", wait_seconds: 10 });
+  assert.ok(local.json, local.text);
+  assert.deepEqual(snapshotOf(local.json.review_id).pages[0].blocked_requests, []);
+});
+
+test("private address classification", async () => {
+  const { isPrivateAddress, urlIsPrivate } = await import("../src/pages.js");
+  for (const ip of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:192.168.0.1"]) {
+    assert.equal(isPrivateAddress(ip), true, ip);
+  }
+  for (const ip of ["8.8.8.8", "172.32.0.1", "100.128.0.1", "2606:4700::1111"]) assert.equal(isPrivateAddress(ip), false, ip);
+  assert.equal(await urlIsPrivate("http://localhost:4321/"), true);
+  assert.equal(await urlIsPrivate("http://app.localhost/"), true);
+  assert.equal(await urlIsPrivate("http://[::1]:8080/"), true);
+  assert.equal(await urlIsPrivate("http://public.test/"), false); // does not resolve: public
+  assert.equal(await urlIsPrivate("data:text/plain,x"), false);
 });

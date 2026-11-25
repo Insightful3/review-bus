@@ -45,6 +45,7 @@ const Config = z.object({
       timeout_seconds: z.number().positive().default(DEFAULT_BROWSER.timeout_seconds),
       max_height: z.number().int().positive().default(DEFAULT_BROWSER.max_height),
       tile_height: z.number().int().positive().default(DEFAULT_BROWSER.tile_height),
+      args: z.array(z.string()).default(DEFAULT_BROWSER.args),
     })
     .default(DEFAULT_BROWSER),
   // Optional: a cheap model groups duplicate findings across reviewers. Without it, conservative

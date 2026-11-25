@@ -52,7 +52,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 | `rubric_paths` | Extra folders with rubric files. Later folders override earlier ones by rubric name. This repo's `rubrics/` always comes first |
 | `storage.documents` | Where reviews are stored (default `~/.review-bus/reviews`) |
 | `author_vendors` | Maps MCP client names to vendors. `claude-code` and `codex-mcp-client` are built in |
-| `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px) |
+| `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px), `args` (extra Chrome flags) |
 | `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`. Without it, only near-identical findings are merged |
 | `max_wait_seconds` | Longest a tool call waits before returning (default 50, under the usual 60 second client timeout) |
 | `max_wait_with_progress_seconds` | Longest a call waits when the client shows progress, like Claude Code (default 900) |
@@ -254,6 +254,8 @@ rv_<id>/
 
 - Reviewers are read-only and can read only their review folder. Codex runs under a permission profile that allows reading the round folder and the system paths common tools need, and denies everything else: the rest of your home folder, other reviews, its own login token and the temp folders. It also runs without your Codex config's MCP servers, ChatGPT apps, plugins, hooks, browser or computer use, or web access. Claude runs with `--restricted`, which confines its Read, Grep and Glob tools to the review folder. Codex permission profiles are beta, so after upgrading Codex run `npm run check:isolation`: it checks with canary files that a reviewer can read its folder and nothing private.
 - review-bus does not write to the reviewed repo: the reviewers' copy is made with a temporary index (`git read-tree` and `git checkout-index`) and `git apply` inside the review folder.
+- If the process running a review is killed outright, a small watchdog stops its reviewers within seconds, so they do not keep running and spending tokens.
+- Page capture: a public page cannot load resources from private addresses (localhost, `10.x`, `192.168.x` and so on); they are blocked and listed. A public page that redirects into a private address is not captured at all.
 - Several sessions and `rb` can use the same reviews at once: every change to a review holds a lock shared by all processes, and a cancel from any of them stops the reviewers (the whole process group, forcefully if they ignore the polite signal).
 - Approvals (`allowed_reviewers`) are read from the config file again before each new round and merge, so revoking a reviewer takes effect without restarting sessions.
 - Custom `command` reviewers run with your own permissions, like any program you run: review-bus does not sandbox them. Use them for tests and scripts you trust; the Codex and Claude adapters are the read-only ones.
@@ -265,9 +267,8 @@ rv_<id>/
 
 Found when review-bus reviewed itself with Codex, and not fixed yet:
 
-- **Reviewer reads, what is left.** Codex and Claude reviewers are confined to their review folder (see Security). Not covered: custom `command` reviewers (they run with your permissions), system files that tools need (for example `/etc`), and Codex's image viewer tool, which was not tested outside the folder.
-- **Page redirects.** A public page you submit can redirect the headless browser to a private page your machine can reach (a local server, an intranet), and that page would be captured.
-- **Crashed runners.** If the process running a review is killed outright, its reviewers can keep running until their own timeout.
+- **Reviewer reads, what is left.** Codex and Claude reviewers are confined to their review folder, Codex's image viewer included (see Security). Not covered: custom `command` reviewers (they run with your permissions) and system files that tools need (for example `/etc`).
+- **Private addresses from public pages, what is left.** A public page cannot load anything from a private address (your machine, your network), and a redirect into one stops the capture. But that one redirected request is still made before the capture stops, and a name that resolves differently for Chrome than for review-bus (DNS rebinding) is not caught. Pages you submit from your own dev server are not restricted.
 - **Changing a reviewer's type or vendor while a session is open.** Approvals and the command are read again before each round, but which default reviewer is picked and its model and effort still follow the config the session started with. Start a new session after such a change.
 - **A rubric made confidential during a resubmit** is checked with the rules it had when the review started.
 - **Slow pages and the review ID.** `review_submit` returns the review ID only after the snapshot is taken, so a very slow page can take longer than the client waits.

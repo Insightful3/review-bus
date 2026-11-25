@@ -34,6 +34,7 @@ function pageSection(p: PageInfo): string {
 - Headings: ${p.headings.length ? "\n" + p.headings.map((h) => `  - ${h}`).join("\n") : "(none)"}
 - Images without alt text: ${p.images_missing_alt.length}${p.images_missing_alt.length ? ` (${p.images_missing_alt.slice(0, 10).join(", ")})` : ""}
 - Internal links checked: ${p.links_checked}, broken: ${p.broken_links.length ? p.broken_links.map((b) => `${b.href} (${b.status})`).join(", ") : "none"}
+- Requests to private addresses blocked: ${p.blocked_requests?.length ? p.blocked_requests.slice(0, 10).join(", ") : "none"}
 - Console errors: ${p.console_errors.length ? "\n" + p.console_errors.map((e) => `  - ${e}`).join("\n") : "none"}
 - Visible text: ${p.text_file}
 - Screenshots:
