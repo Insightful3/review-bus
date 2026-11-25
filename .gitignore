@@ -8,3 +8,10 @@ review-bus.config.json
 !test/fixtures/**/*.docx
 !test/fixtures/**/*.pdf
 .DS_Store
+
+# Stray images saved into the repo root (keep project images in a folder)
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
