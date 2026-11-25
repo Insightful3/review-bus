@@ -225,7 +225,7 @@ Reviewers rate each finding by impact (`critical`, `high`, `medium`, `low`) and 
 | Medium | block | block | advisory | advisory |
 | Low | advisory | advisory | advisory | advisory |
 
-A finding without a failure scenario is advisory. At most 5 findings block per round, highest risk first. At `stage: draft` only critical findings block.
+A finding without a failure scenario is advisory. A finding that challenges one of the author's stated assumptions blocks only if it is high or critical. At most 5 findings block per round, highest risk first. At `stage: draft` only critical findings block.
 
 ## Where results go
 

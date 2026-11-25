@@ -103,7 +103,7 @@ Default matrix (impact × likelihood → blocks?):
 Rules:
 
 - A finding with no `failure_scenario` is advisory, whatever the reviewer said.
-- `assumption_challenge: true` findings are always shown, never blocking on their own.
+- `assumption_challenge: true` findings are always shown. High and critical ones go through the matrix like any finding and can block (decided 25 Nov 2026 after a real contract review where "no governing law", raised as a challenge to the author's "Slovenian law", came out advisory). Medium and low ones never block on their own.
 - Max blocking findings per round: 5 (highest risk first; the rest become advisory).
 - `stage: draft` uses a lighter matrix (only critical blocks).
 - Duplicate findings across reviewers (same location, similar claim) are merged; `agreement` counts the reviewers and `also_raised_by` keeps the other versions. The highest-risk version is kept. Word-based matching only merges near-identical findings: on real Codex and Claude reviews of the same proposal it caught 1 of 5 shared problems, and lowering its thresholds would merge unrelated findings. So `merge_with` in config names a cheap model (for example Claude Haiku, low effort) that groups findings by meaning; its answer is validated (every id at most once, never two findings from one reviewer in a group) and on any failure the word-based rules are used and the round records why. For a rubric with `allowed_reviewers`, the merge model runs only if it is on that list, because it sees the quotes. Merging happens before the policy decides what blocks.

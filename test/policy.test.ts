@@ -27,11 +27,20 @@ test("default matrix", () => {
   }
 });
 
-test("no failure scenario is advisory, assumption challenge never blocks", () => {
+test("no failure scenario is advisory", () => {
+  assert.deepEqual(computeBlocking([f("critical", "certain", { failure_scenario: null })], opts), [false]);
+});
+
+test("assumption challenges block only when high or critical, then by the matrix", () => {
+  const ac = (impact: PolicyInput["impact"], likelihood: PolicyInput["likelihood"]) => f(impact, likelihood, { assumption_challenge: true });
   assert.deepEqual(
-    computeBlocking([f("critical", "certain", { failure_scenario: null }), f("critical", "certain", { assumption_challenge: true })], opts),
-    [false, false],
+    computeBlocking([ac("critical", "remote"), ac("high", "possible"), ac("high", "remote"), ac("medium", "certain"), ac("low", "certain")], opts),
+    [true, true, false, false, false],
   );
+  // Real case: missing governing law, raised as a challenge to "Slovenian law".
+  assert.deepEqual(computeBlocking([ac("high", "possible")], { ...opts, high_blocks_always: true }), [true]);
+  // At stage draft only critical blocks, challenges included.
+  assert.deepEqual(computeBlocking([ac("critical", "likely"), ac("high", "certain")], { ...opts, stage: "draft" }), [true, false]);
 });
 
 test("draft stage only blocks critical", () => {

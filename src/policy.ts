@@ -56,7 +56,9 @@ export function severityOf(f: PolicyInput): "blocker" | "major" | "minor" | "inf
 
 function blocksByMatrix(f: PolicyInput, opts: PolicyOptions): boolean {
   if (!f.failure_scenario || !f.failure_scenario.trim()) return false;
-  if (f.assumption_challenge) return false;
+  // Challenges to the author's assumptions block only when high or critical (then the matrix
+  // decides as for any finding); medium and low ones stay advisory.
+  if (f.assumption_challenge && f.impact !== "high" && f.impact !== "critical") return false;
   if (opts.high_blocks_always && opts.stage !== "draft" && (f.impact === "high" || f.impact === "critical")) {
     return true;
   }

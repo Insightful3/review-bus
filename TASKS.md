@@ -29,7 +29,7 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] Mark running rounds `failed` after a restart; late results from an old round do not change state
 - [x] `report.md` keeps earlier rounds with the author's answers
 
-## Slice 3: widen (done, one decision open)
+## Slice 3: widen (done)
 
 - [x] Claude adapter (`claude -p ... --restricted`), fake `claude` in tests; real run with Codex as the author over MCP and Claude reviewing (SPEC 11.3)
 - [x] Git snapshots: uncommitted, base, commit; patch + `git archive` copy (nothing written to the author's repo)
@@ -41,7 +41,7 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] Per-rubric `allowed_reviewers`
 - [x] Client timeouts: waits capped at `max_wait_seconds` (default 50), `review_submit` tells the agent to poll `review_wait`
 - [x] Several server processes share storage: rounds record their runner; others leave a live runner's review alone
-- [ ] Policy: a high-impact finding marked `assumption_challenge` never blocks (real run: missing governing law was advisory). Decide whether high and critical assumption challenges should block
+- [x] Policy: high and critical assumption challenges block (by the matrix); medium and low stay advisory
 - [x] `related` documents (for example the accepted proposal for a contract), compared for price, scope and timeline
 - [x] Rubrics: `code`, `client-email`, `linkedin-post`, `sop`, `plan`
 - [x] CLI `rb`: submit, status, show, list, respond, signoff, cancel
