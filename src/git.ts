@@ -40,6 +40,8 @@ export interface GitInfo {
   insertions: number;
   deletions: number;
   notes: string[];
+  /** Submodule pointers after the change (path, commit), from git's own index or tree. */
+  gitlinks?: { path: string; sha: string }[];
 }
 
 
@@ -174,8 +176,10 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
   let baseSha: string;
   let patch: Buffer;
   let files: ChangedFile[];
+  let afterRef: string | null = headSha; // the tree after the change; null: the index (uncommitted)
 
   if (spec.mode === "uncommitted") {
+    afterRef = null;
     baseSha = headSha;
     baseRef = "HEAD";
     patch = gitBuf(root, [...PATCH, "HEAD"]);
@@ -210,7 +214,18 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     baseRef = `${commitSha.slice(0, 12)}^`;
     patch = gitBuf(root, [...PATCH, baseSha, commitSha]);
     files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", "--no-relative", baseSha, commitSha]));
+    afterRef = commitSha;
   }
+  // Every submodule pointer after the change, unchanged ones included (a .gitmodules edit still
+  // needs them): from the index for uncommitted work, else from the reviewed commit's tree.
+  const gitlinks = (afterRef ? git(root, ["ls-tree", "-r", "-z", afterRef]) : git(root, ["ls-files", "-s", "-z"]))
+    .split("\0")
+    .filter((e) => e.startsWith("160000 "))
+    .map((e) => {
+      const [meta, p] = [e.slice(0, e.indexOf("\t")), e.slice(e.indexOf("\t") + 1)];
+      const sha = meta.split(" ").find((x) => /^[0-9a-f]{40,64}$/.test(x))!;
+      return { path: p, sha };
+    });
   if (!patch.toString("latin1").trim()) throw new NoChangesError(`No changes to review in ${root} (mode ${spec.mode}${baseRef ? ` vs ${baseRef}` : ""}).`);
 
   const rdir = path.join(reviewDir, `r${round}`);
@@ -244,7 +259,7 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
   // Decoded only for the prompt and counts; the stored patch and the tree keep the exact bytes.
   const text = patch.toString("utf8");
   return {
-    info: { repo_root: root, mode: spec.mode, base_ref: baseRef, base_sha: baseSha, head_sha: headSha, branch, patch_file: patchFile, tree_dir: treeDir, files, ...countLines(text), notes },
+    info: { repo_root: root, mode: spec.mode, base_ref: baseRef, base_sha: baseSha, head_sha: headSha, branch, patch_file: patchFile, tree_dir: treeDir, files, ...countLines(text), notes, gitlinks },
     patch: text,
     sha256,
   };

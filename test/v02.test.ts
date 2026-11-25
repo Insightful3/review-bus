@@ -1449,3 +1449,163 @@ test("refreshing the inbox records a missed pull deadline", async () => {
   assert.equal(r.rounds[0].reviewers[0].status, "failed");
   assert.match(r.rounds[0].reviewers[0].error, /no answer by the deadline/);
 });
+
+// ---- Fresh review #2, round 3 ----
+
+test("dispatch checks the same rubric the prompt was built from, as configured at that moment", async () => {
+  const d1 = path.join(tmp, "rubrics-d1");
+  const d2 = path.join(tmp, "rubrics-d2");
+  mkdirSync(d1, { recursive: true });
+  mkdirSync(d2, { recursive: true });
+  writeFileSync(path.join(d1, "swap2.md"), RUBRIC.replace("confidential: true\n", ""));
+  writeFileSync(path.join(d2, "swap2.md"), RUBRIC);
+  const bin = path.join(tmp, "slow-bin3");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(path.join(bin, "pdftotext"), "#!/bin/sh\nsleep 1\necho 'Slow PDF text'\n", { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  writeConfig({ rubric_paths: [d1] });
+  try {
+    const e = new Engine(loadConfig());
+    const pending = e.submit(
+      { artifact: { path: path.join(ROOT, "test/fixtures/proposal-bluefin.pdf") }, pages: [], rubric: "swap2", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+      PERSON,
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    writeConfig({ rubric_paths: [d1, d2] }); // the confidential copy takes over while the snapshot runs
+    const review = await pending;
+    await e.settled(review.id);
+    const run = e.get(review.id).rounds[0].reviewers[0];
+    assert.equal(run.status, "failed");
+    assert.match(run.error!, /confidential/);
+  } finally {
+    process.env.PATH = oldPath;
+    writeConfig();
+  }
+});
+
+test("resubmitting follows the round cap the last round ran under", async () => {
+  const e = new Engine(loadConfig()); // max_rounds 3
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, PERSON, 10);
+  await e.settled(review.id);
+  assert.equal(e.get(review.id).state, "changes_requested");
+  writeConfig({ policy: { max_blocking: 5, max_rounds: 1 } }); // lowered while the review is open
+  const other = new Engine(loadConfig());
+  const answers = other.get(review.id).rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+  await other.respond(review.id, answers, { resubmit: true });
+  await other.settled(review.id);
+  assert.equal(other.get(review.id).rounds.length, 2);
+  writeConfig();
+});
+
+test("a post waiting for a busy review's lock does not block the event loop", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const work = engine.claim(review.id, "person", { by: "Ana", client: null });
+  const sleeper = spawn("sleep", ["30"]);
+  const lock = path.join(tmp, "reviews", review.id, ".lock");
+  mkdirSync(lock);
+  writeFileSync(path.join(lock, "owner"), JSON.stringify({ pid: sleeper.pid, host: os.hostname(), token: "other", at: Date.now() }));
+  let ticks = 0;
+  const timer = setInterval(() => ticks++, 10);
+  try {
+    const posting = engine.post(review.id, "person", work.token, { output: { verdict: "approve", summary: "ok", findings: [] } });
+    // post() reads the review first (no lock needed), then waits for the lock.
+    await new Promise((r) => setTimeout(r, 500));
+    assert.ok(ticks >= 20, `only ${ticks} ticks while the post waited for the lock`);
+    execFileSync("rm", ["-rf", lock]); // the other process lets go
+    const done = await posting;
+    assert.equal(done.state, "approved");
+  } finally {
+    clearInterval(timer);
+    sleeper.kill();
+  }
+});
+
+test("refreshing the inbox finishes a round whose finisher died", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  await engine.settled(review.id);
+  const file = path.join(tmp, "reviews", review.id, "review.json");
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  Object.assign(saved, { state: "in_review" });
+  Object.assign(saved.rounds[0], { finished_at: null, findings: [], finalizing: { pid: 999999, host: os.hostname(), started_at: new Date().toISOString() } });
+  writeFileSync(file, JSON.stringify(saved));
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  await (await fetch(`${base}inbox`, { headers: { cookie } })).text();
+  await engine.settled(review.id);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).state, "changes_requested");
+});
+
+test("codex-review keeps unchanged submodule pointers when only .gitmodules changes", async () => {
+  const g = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "protocol.file.allow=always", ...args], { cwd });
+  const lib = path.join(tmp, "sub2-lib");
+  const app = path.join(tmp, "sub2-app");
+  mkdirSync(lib);
+  mkdirSync(app);
+  writeFileSync(path.join(lib, "a"), "1\n");
+  g(lib, "init", "-q");
+  g(lib, "add", ".");
+  g(lib, "commit", "-q", "-m", "one");
+  g(app, "init", "-q");
+  g(app, "submodule", "add", "-q", lib, "lib");
+  g(app, "commit", "-q", "-m", "base");
+  const pinned = g(app, "rev-parse", "HEAD:lib").toString().trim();
+  writeFileSync(path.join(app, ".gitmodules"), readFileSync(path.join(app, ".gitmodules"), "utf8") + "\tbranch = main\n");
+  const review = await engine.submit(
+    { artifact: { git: { repo: app, mode: "uncommitted" } }, pages: [], rubric: "code", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" },
+    PERSON,
+    30,
+  );
+  await engine.settled(review.id);
+  const run = engine.get(review.id).rounds[0].reviewers[0];
+  assert.equal(run.status, "done", run.error ?? "");
+  const scratch = path.join(tmp, "reviews", review.id, "r1", "native.native");
+  const entry = execFileSync("git", ["ls-files", "-s", "lib"], { cwd: scratch, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } }).toString();
+  assert.match(entry, new RegExp(`^160000 ${pinned} `));
+});
+
+test("empty front matter (adjacent delimiters) is valid, LF and CRLF", () => {
+  const dir = path.join(tmp, "rubrics-empty-fm");
+  mkdirSync(dir, { recursive: true });
+  const body = RUBRIC.slice(RUBRIC.indexOf("# Acme"));
+  writeFileSync(path.join(dir, "lf.md"), "---\n---\n" + body);
+  writeFileSync(path.join(dir, "crlf.md"), "---\r\n---\r\n" + body);
+  for (const n of ["lf", "crlf"]) {
+    assert.deepEqual(checkRubricPath(path.join(dir, `${n}.md`))[0].problems, []);
+    assert.deepEqual(loadRubric(n, [dir]).meta, {});
+  }
+});
+
+test("rb submit reports a review canceled before its first round instead of crashing", { skip: !existsSync("/Applications/Google Chrome.app") && "Google Chrome not installed" }, async () => {
+  const slow = http.createServer((_req, res) => setTimeout(() => res.end("<title>slow</title>"), 4000));
+  await new Promise<void>((r) => slow.listen(0, "127.0.0.1", () => r()));
+  const url = `http://127.0.0.1:${(slow.address() as import("node:net").AddressInfo).port}/`;
+  writeConfig({ snapshot_wait_seconds: 0 });
+  try {
+    const before = new Set(execFileSync("ls", [path.join(tmp, "reviews")]).toString().split("\n"));
+    const child = spawn(process.execPath, [path.join(ROOT, "dist/src/cli.js"), "submit", "--page", url, "--rubric", "webpage", "--intent", "x"], { env: { ...process.env, REVIEW_BUS_CONFIG: configFile } });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d));
+    let id = "";
+    await waitUntil(() => {
+      id = execFileSync("ls", [path.join(tmp, "reviews")]).toString().split("\n").find((d) => d && !before.has(d)) ?? "";
+      return Boolean(id) && existsSync(path.join(tmp, "reviews", id, "review.json"));
+    });
+    new Engine(loadConfig()).cancel(id);
+    const code = await new Promise<number>((r) => child.on("exit", (c) => r(c ?? 0)));
+    assert.doesNotMatch(stderr, /TypeError/);
+    assert.equal(code, 2, stderr);
+  } finally {
+    slow.closeAllConnections();
+    slow.close();
+    writeConfig();
+  }
+});

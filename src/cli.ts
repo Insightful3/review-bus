@@ -122,7 +122,14 @@ async function follow(engine: Engine, id: string): Promise<Review> {
   const reported = new Set<string>();
   const t0 = Date.now();
   let review = engine.get(id);
-  console.error(review.state === "submitted" ? `rb: ${id} taking the snapshot (rendering pages)` : `rb: ${id} round ${review.rounds.length}, reviewers: ${review.rounds.at(-1)!.reviewers.map((r) => r.label).join(", ")}`);
+  const round = review.rounds.at(-1);
+  console.error(
+    review.state === "submitted"
+      ? `rb: ${id} taking the snapshot (rendering pages)`
+      : round
+        ? `rb: ${id} round ${round.n}, reviewers: ${round.reviewers.map((r) => r.label).join(", ")}`
+        : `rb: ${id} ${review.state} before its first round`,
+  );
   while (isActive(review.state) && !interrupted && !onlyPullLeft(review)) {
     await engine.waitFor(id, 5);
     review = engine.get(id);

@@ -364,7 +364,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     },
   );
 
-  const status = (review: Review) => ({ ...statusPayload(review), max_rounds: engine.config.policy.max_rounds });
+  const status = (review: Review) => ({ ...statusPayload(review), max_rounds: (review.rounds.at(-1)?.policy ?? engine.config.policy).max_rounds });
 
   server.registerTool(
     "review_status",

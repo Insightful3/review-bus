@@ -24,7 +24,7 @@ export interface ReviewJob {
   /** Claude only: "read" (Read, Grep, Glob) for reviews, "none" for tasks that need no files. */
   tools?: "read" | "none";
   /** Git rounds: the reviewers' copy of the project and the patch (absolute paths). Needed by codex-review. */
-  git?: { tree: string; patch: string };
+  git?: { tree: string; patch: string; gitlinks?: { path: string; sha: string }[] };
 }
 
 /** The CLI's JSON answer before validation, plus what it reported about itself. */
@@ -313,7 +313,10 @@ async function prepareScratch(job: ReviewJob, native: string, deadline: number):
   // where its .gitignore matches), plus the changed submodule pointers, which the copy holds only as
   // empty folders. Reversing the patch through the index then gives the base, gitlinks included.
   await git(["add", "-A", "-f"]);
-  for (const g of gitlinksAfter(patch)) await git(["update-index", "--add", "--cacheinfo", `160000,${g.sha},${g.path}`]);
+  // Every submodule pointer the snapshot recorded (unchanged ones too), then the patch's, which win.
+  const links = new Map((job.git!.gitlinks ?? []).map((g) => [g.path, g.sha]));
+  for (const g of gitlinksAfter(patch)) links.set(g.path, g.sha);
+  for (const [p, sha] of links) await git(["update-index", "--add", "--cacheinfo", `160000,${sha},${p}`]);
   if (patch.length) await git(["apply", "-R", "--index", "--whitespace=nowarn", "-"], patch);
   await git(["commit", "-q", "--allow-empty", "-m", "base"]);
   // --index: the change is staged too, so new files that .gitignore matches are still part of it.

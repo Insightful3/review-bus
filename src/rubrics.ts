@@ -25,12 +25,13 @@ function parseFrontMatter(raw: string): { meta: Record<string, unknown>; body: s
   // Some editors start UTF-8 files with a byte order mark; the header must still be recognised.
   const text = raw.replace(/^\uFEFF/, "");
   // Delimiters may carry trailing spaces or tabs; the closing one must be a line of its own.
-  const m = text.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
+  // An empty block (the two delimiters on adjacent lines) is valid and has no settings.
+  const m = text.match(/^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)?---[ \t]*(?:\r?\n|$)/);
   // An unclosed header would be read as body text, and a confidential: true in it silently ignored.
   if (!m && /^---[ \t]*\r?\n/.test(text)) throw new Error("the front matter has no closing --- line");
   if (!m) return { meta: {}, body: text };
   const meta: Record<string, unknown> = {};
-  for (const [i, line] of m[1].split(/\r?\n/).entries()) {
+  for (const [i, line] of (m[1] ?? "").split(/\r?\n/).entries()) {
     if (!line.trim() || line.trimStart().startsWith("#")) continue;
     const kv = line.match(/^([A-Za-z0-9_]+)\s*:\s*(.*)$/);
     // Flat key: value lines only. An indented or malformed line is an error, not skipped: skipping

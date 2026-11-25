@@ -152,21 +152,10 @@ export class Store {
    * only ever removes a lock that holds its own token. fn must be synchronous and must not lock again.
    */
   withLock<T>(id: string, fn: () => T): T {
-    const dir = this.dir(id);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const lock = path.join(dir, ".lock");
-    const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
+    const { lock, token } = this.lockPaths(id);
     const deadline = Date.now() + 15_000;
     const pause = new Int32Array(new SharedArrayBuffer(4));
-    for (;;) {
-      try {
-        mkdirSync(lock);
-        writeFileSync(path.join(lock, "owner"), JSON.stringify({ pid: process.pid, host: os.hostname(), token, at: Date.now() }));
-        break;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      }
-      this.takeOverIfStale(lock);
+    while (!this.tryLock(lock, token)) {
       if (Date.now() > deadline) throw new Error(`Review ${id} is locked by another process; try again.`);
       Atomics.wait(pause, 0, 0, 20);
     }
@@ -175,6 +164,53 @@ export class Store {
     } finally {
       if (readOwner(lock)?.token === token) rmSync(lock, { recursive: true, force: true });
     }
+  }
+
+  /**
+   * Like withLock, but waits for a held lock without blocking the event loop: for requests served by
+   * a long-running process (rb serve), where one busy review must not stall every other request.
+   */
+  async withLockAsync<T>(id: string, fn: () => T): Promise<T> {
+    const { lock, token } = this.lockPaths(id);
+    const deadline = Date.now() + 15_000;
+    while (!this.tryLock(lock, token)) {
+      if (Date.now() > deadline) throw new Error(`Review ${id} is locked by another process; try again.`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    try {
+      return fn();
+    } finally {
+      if (readOwner(lock)?.token === token) rmSync(lock, { recursive: true, force: true });
+    }
+  }
+
+  /** updateAsync: update() through withLockAsync. */
+  updateAsync(id: string, fn: (review: Review) => void): Promise<Review> {
+    return this.withLockAsync(id, () => {
+      const review = this.load(id);
+      fn(review);
+      this.save(review);
+      return review;
+    });
+  }
+
+  private lockPaths(id: string): { lock: string; token: string } {
+    const dir = this.dir(id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return { lock: path.join(dir, ".lock"), token: `${process.pid}.${randomBytes(6).toString("hex")}` };
+  }
+
+  /** One attempt: takes the lock, or clears it if stale and reports false. */
+  private tryLock(lock: string, token: string): boolean {
+    try {
+      mkdirSync(lock);
+      writeFileSync(path.join(lock, "owner"), JSON.stringify({ pid: process.pid, host: os.hostname(), token, at: Date.now() }));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    this.takeOverIfStale(lock);
+    return false;
   }
 
   /** Removes the lock only if it is stale, and only one process at a time may try. */

@@ -396,7 +396,9 @@ export class Engine {
     if (review.state === "escalated") throw new Error(`Review ${id} is escalated after ${round.n} rounds. A person decides with rb signoff.`);
     if (!RESUBMITTABLE.includes(review.state)) throw new Error(`Review ${id} is ${review.state}; submit a new review instead of resubmitting.`);
     if (unanswered.length) throw new Error(`Answer every blocking finding before resubmitting. Unanswered: ${unanswered.join(", ")}.`);
-    if (round.n >= this.config.policy.max_rounds) throw new Error(`Review ${id} has used all ${this.config.policy.max_rounds} rounds.`);
+    // The cap the last round ran under decides, as it decided between escalated and changes_requested.
+    const maxRounds = (round.policy ?? this.config.policy).max_rounds;
+    if (round.n >= maxRounds) throw new Error(`Review ${id} has used all ${maxRounds} rounds.`);
     const rubric = loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs);
     // Approvals can change between rounds: check the reviewers against the config on disk now (SPEC 9).
     const current = this.currentConfig();
@@ -650,7 +652,16 @@ export class Engine {
     const round = review.rounds.find((r) => r.n === n)!;
     const reviewDir = this.store.dir(id);
     const roundDir = this.store.roundDir(id, n);
-    const rubric = loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs);
+    // One read of the config and one rubric for both the prompt and the approval check at dispatch:
+    // the rubric folders may change while a slow snapshot runs, and the two must not disagree.
+    let current: Config | Error;
+    try {
+      current = this.currentConfig();
+    } catch (err) {
+      current = err as Error;
+    }
+    const paths = current instanceof Error ? this.config : current;
+    const rubric = loadRubric(review.request.rubric, paths.rubric_paths, paths.rubric_packs);
     const snap = round.snapshot;
     const text = snap.markdown_file ? readFileSync(path.join(reviewDir, snap.markdown_file), "utf8") : null;
     const images = screenshotFiles(snap).map((f) => path.join(reviewDir, f));
@@ -668,7 +679,7 @@ export class Engine {
       }
     }, 1000);
     try {
-      await this.finishRound(id, n, review, round, prompt, images, roundDir, signal);
+      await this.finishRound(id, n, review, round, prompt, images, roundDir, signal, current, rubric.meta);
     } finally {
       clearInterval(watcher);
     }
@@ -683,15 +694,19 @@ export class Engine {
     images: string[],
     roundDir: string,
     signal: AbortSignal,
+    current: Config | Error,
+    rubricMeta: Record<string, unknown>,
   ): Promise<void> {
     // Last check before anything leaves the machine: approvals and reviewer definitions as they
     // are on disk right now, from the same read (a reviewer repointed to another provider runs as
-    // configured now, not as configured when this server started).
+    // configured now, not as configured when this server started), and the rubric the prompt was
+    // built from: confidential if it was when submitted or is now.
     let dispatchError: (name: string) => string | null;
     let adapterFor: (name: string) => Config["adapters"][string] | undefined = () => undefined;
     try {
-      const current = this.currentConfig();
-      const allowed = this.allowedReviewers(review.request.rubric, this.metaNow(review, current), current);
+      if (current instanceof Error) throw new Error(`Could not re-read the config, so nothing was sent: ${current.message}`);
+      const meta = { ...review.rubric_meta, confidential: review.rubric_meta.confidential === true || rubricMeta.confidential === true };
+      const allowed = this.allowedReviewers(review.request.rubric, meta, current);
       adapterFor = (name) => current.adapters[name];
       dispatchError = (name) =>
         !current.adapters[name]
@@ -726,7 +741,11 @@ export class Engine {
               outDir: roundDir,
               images,
               git: round.snapshot.git
-                ? { tree: path.join(this.store.dir(id), round.snapshot.git.tree_dir), patch: path.join(this.store.dir(id), round.snapshot.git.patch_file) }
+                ? {
+                  tree: path.join(this.store.dir(id), round.snapshot.git.tree_dir),
+                  patch: path.join(this.store.dir(id), round.snapshot.git.patch_file),
+                  gitlinks: round.snapshot.git.gitlinks,
+                }
                 : undefined,
               model: run.model_requested,
               effort: run.effort_requested,
@@ -876,9 +895,12 @@ export class Engine {
     for (const d of dirs) {
       try {
         let r: Review = JSON.parse(await readFile(path.join(this.store.root, d, "review.json"), "utf8"));
-        // A pull reviewer past its deadline: record it now, so a listing never shows expired work as waiting.
-        const overdue = r.state === "in_review" && (r.rounds.at(-1)?.reviewers ?? []).some((x) => x.adapter === "pull" && (x.status === "waiting" || x.status === "running") && x.deadline && Date.parse(x.deadline) < Date.now());
-        if (overdue) r = this.get(r.id);
+        // A pull reviewer past its deadline, or a round whose answers are all in but which nobody is
+        // finishing: settle it now (get does both), so a listing never shows a stale state.
+        const rd = r.rounds.at(-1);
+        const overdue = r.state === "in_review" && (rd?.reviewers ?? []).some((x) => x.adapter === "pull" && (x.status === "waiting" || x.status === "running") && x.deadline && Date.parse(x.deadline) < Date.now());
+        const unfinished = r.state === "in_review" && rd && !rd.finished_at && roundSettled(rd);
+        if (overdue || unfinished) r = this.get(r.id);
         out.push(r);
       } catch {
         /* no review.json yet, or mid-write */
@@ -991,7 +1013,8 @@ export class Engine {
     this.get(id); // records a missed deadline first, so a late answer is refused below
     let n = 0;
     let finish = false;
-    this.store.update(id, (r) => {
+    // Waits for the lock without blocking the server (rb serve answers other requests meanwhile).
+    await this.store.updateAsync(id, (r) => {
       if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; the answer was not recorded.`);
       const round = r.rounds.at(-1)!;
       const run = round.reviewers.find((x) => x.name === reviewer);
