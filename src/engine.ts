@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -60,6 +60,8 @@ function processAlive(pid: number): boolean {
   }
 }
 
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
   const y = Buffer.from(b);
@@ -95,6 +97,8 @@ export interface ClaimedWork {
   /** For people: the brief and the rubric on their own (the prompt has them too). */
   rubric: string;
   rubric_text: string;
+  /** Git reviews: the full patch, relative to the review folder (the prompt cuts large diffs). */
+  patch_file: string | null;
   intent: string;
   assumptions: string[];
   criteria: string[];
@@ -161,7 +165,14 @@ export class Engine {
         void outcome.then((err) => err && this.recordPrepareError(id, err));
       } else if (first) {
         await tracked;
-        rmSync(this.store.dir(id), { recursive: true, force: true });
+        // A cancel recorded meanwhile (another process) is kept: only an untouched review is removed.
+        let canceled = false;
+        try {
+          canceled = this.store.load(id).state === "canceled";
+        } catch {
+          /* already gone */
+        }
+        if (!canceled) rmSync(this.store.dir(id), { recursive: true, force: true });
         throw first;
       }
     } else {
@@ -223,7 +234,19 @@ export class Engine {
         r.history.push({ at: t, event: "note", detail: `round ${n} document is unchanged since round ${prev.n}` });
       }
       r.request.artifact = review.request.artifact;
-      r.rounds.push({ n, started_at: t, finished_at: null, runner: { pid: process.pid, host: os.hostname(), started_at: t }, snapshot, reviewers: runs, findings: [] });
+      // The runner's clock starts when reviewers are dispatched, not when the snapshot started
+      // (page capture can be long): other processes judge an old runner as gone by this time.
+      const dispatched = now();
+      r.rounds.push({
+        n,
+        started_at: t,
+        finished_at: null,
+        runner: { pid: process.pid, host: os.hostname(), started_at: dispatched },
+        policy: { ...this.config.policy },
+        snapshot,
+        reviewers: runs,
+        findings: [],
+      });
       r.state = "in_review";
       r.history.push({ at: t, event: "round_started", detail: `round ${n}` });
     };
@@ -713,7 +736,7 @@ export class Engine {
     const raised = outputs.flatMap(({ run, output }) => output.findings.map((finding) => ({ finding, reviewer: run.label })));
     const policy: PolicyOptions = {
       stage: review.request.stage,
-      max_blocking: this.config.policy.max_blocking,
+      max_blocking: (round.policy ?? this.config.policy).max_blocking,
       high_blocks_always: review.rubric_meta.high_blocks_always === true,
     };
     const { merged, merge } = await this.merge(raised, review.request.rubric, review.rubric_meta, roundDir, signal, (f) => wouldBlock(f, policy));
@@ -827,11 +850,12 @@ export class Engine {
       const run = round.reviewers.find((x) => x.name === reviewer);
       if (!run || run.adapter !== "pull") throw new Error(`Review ${id} round ${round.n} has no pull reviewer "${reviewer}".`);
       if (run.status !== "waiting") throw new Error(`Reviewer "${reviewer}" of review ${id} is ${run.status === "running" ? `already claimed by ${run.claim?.by}` : run.status}.`);
+      if (run.deadline && Date.parse(run.deadline) < Date.now()) throw new Error(`Reviewer "${reviewer}" of review ${id} is past its deadline (${run.deadline}).`);
       const allowed = this.allowedReviewers(r.request.rubric, r.rubric_meta, current);
       if (allowed && !allowed.includes(reviewer)) throw new Error(`Reviewer "${reviewer}" is no longer approved for ${r.request.rubric}. Nothing was sent.`);
       run.status = "running";
       run.started_at = now();
-      run.claim = { by: who.by.trim(), client: who.client, at: now(), token };
+      run.claim = { by: who.by.trim(), client: who.client, at: now(), token_sha256: sha256(token) };
       r.history.push({ at: now(), event: "claimed", detail: `${reviewer} by ${who.by.trim()}${who.client ? ` (${who.client})` : ""}` });
       n = round.n;
     });
@@ -855,6 +879,7 @@ export class Engine {
       output_schema: reviewerOutputJsonSchema(),
       rubric: review.request.rubric,
       rubric_text: rubricText,
+      patch_file: round.snapshot.git?.patch_file ?? null,
       intent: review.request.intent,
       assumptions: review.request.assumptions,
       criteria: review.request.criteria,
@@ -889,7 +914,7 @@ export class Engine {
       if (!run || run.adapter !== "pull") throw new Error(`Review ${id} round ${round.n} has no pull reviewer "${reviewer}".`);
       if (run.status === "failed" && run.error?.startsWith("no answer by the deadline")) throw new Error(`Reviewer "${reviewer}" missed its deadline (${run.deadline}); the answer was not recorded.`);
       if (run.deadline && Date.parse(run.deadline) < Date.now()) throw new Error(`Reviewer "${reviewer}" missed its deadline (${run.deadline}); the answer was not recorded.`);
-      if (run.status !== "running" || !run.claim || !safeEqual(run.claim.token, token)) {
+      if (run.status !== "running" || !run.claim || !safeEqual(run.claim.token_sha256, sha256(token))) {
         throw new Error(`No claim of "${reviewer}" on review ${id} round ${round.n} matches this token. Claim it first (review_claim).`);
       }
       n = round.n;
@@ -1035,7 +1060,7 @@ export class Engine {
     const someFailed = round.reviewers.some((r: ReviewerRun) => r.status === "failed");
     if (!openBlocking && someFailed) return "failed";
     if (!openBlocking) return review.rubric_meta.require_signoff === true ? "awaiting_signoff" : "approved";
-    if (round.n >= this.config.policy.max_rounds) return "escalated";
+    if (round.n >= (round.policy ?? this.config.policy).max_rounds) return "escalated";
     return "changes_requested";
   }
 }

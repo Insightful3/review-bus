@@ -78,7 +78,8 @@ export interface ReviewerRun {
   status: "pending" | "waiting" | "running" | "done" | "failed";
   /** Pull reviewers: when the answer is due, and who claimed the work (the token authorizes the answer). */
   deadline?: string;
-  claim?: { by: string; client: string | null; at: string; token: string } | null;
+  /** Only a SHA-256 of the claim token is stored; the claimant holds the token. */
+  claim?: { by: string; client: string | null; at: string; token_sha256: string } | null;
   verdict: string | null;
   summary: string | null;
   error: string | null;
@@ -114,6 +115,8 @@ export interface Round {
   snapshot: Snapshot;
   reviewers: ReviewerRun[];
   findings: Finding[];
+  /** The blocking policy the round was started with: whoever finishes the round applies this one. */
+  policy?: { max_blocking: number; max_rounds: number };
   /** The process merging the findings and deciding the state, once every reviewer has finished. */
   finalizing?: { pid: number; host: string; started_at: string } | null;
   /** How duplicates across reviewers were merged. */

@@ -671,3 +671,82 @@ test("a release from an old page does not drop a newer claim; pull-only status s
   assert.throws(() => engine.release(review.id, "person", "Ana", oldAt), /claimed again since \(by Bo\)/);
   assert.equal(engine.get(review.id).rounds[0].reviewers[0].claim!.by, "Bo");
 });
+
+// ---- Fixes from Codex's third review round ----
+
+test("behind a TLS proxy, posts from the configured public origin are accepted", async () => {
+  writeConfig({ http: { port: 0, token_file: path.join(tmp, "http-token"), public_origin: "https://reviews.example.com" } });
+  const e = new Engine(loadConfig());
+  const s = await startHttp(e, { port: 0, host: "127.0.0.1" });
+  try {
+    const { port } = new URL(s.url);
+    const status = (headers: Record<string, string>) =>
+      new Promise<number>((resolve) => {
+        const req = http.request({ host: "127.0.0.1", port, path: "/inbox/login", method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...headers } }, (r) => resolve(r.statusCode ?? 0));
+        req.end(new URLSearchParams({ token }).toString());
+      });
+    assert.equal(await status({ host: "reviews.example.com", origin: "https://reviews.example.com" }), 303);
+    assert.equal(await status({ host: "reviews.example.com", origin: "https://evil.example.com" }), 403);
+  } finally {
+    await s.close();
+    writeConfig();
+  }
+});
+
+test("review.json is readable by its owner only and holds no claim token; the policy is frozen per round", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const work = engine.claim(review.id, "person", { by: "Ana", client: null });
+  const file = path.join(tmp, "reviews", review.id, "review.json");
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  const text = readFileSync(file, "utf8");
+  assert.ok(!text.includes(work.token));
+  assert.match(text, /"token_sha256"/);
+  assert.deepEqual(JSON.parse(text).rounds[0].policy, { max_blocking: 5, max_rounds: 3 });
+  const done = await engine.post(review.id, "person", work.token, { output: { verdict: "approve", summary: "ok", findings: [] } });
+  assert.equal(done.state, "approved");
+});
+
+test("a rubric with a byte order mark keeps its front matter", () => {
+  const dir = path.join(tmp, "packs", "bom");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "contract.md"), "﻿" + RUBRIC);
+  assert.deepEqual(checkRubricPath(path.join(dir, "contract.md"))[0].problems, []);
+  assert.equal(loadRubric("contract", [dir]).meta.confidential, true);
+});
+
+test("a claim after the deadline is refused", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }, { name: "quick" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  await new Promise((r) => setTimeout(r, 1300));
+  assert.throws(() => engine.claim(review.id, "quick", { by: "Late", client: null }), /deadline|failed|nothing to claim/);
+  await engine.settled(review.id);
+});
+
+test("the inbox serves a git review's full patch as plain text", async () => {
+  const repo = path.join(tmp, "repo3");
+  mkdirSync(repo);
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd: repo });
+  writeFileSync(path.join(repo, "a.html"), "<p>a</p>\n");
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-q", "-m", "a");
+  writeFileSync(path.join(repo, "a.html"), "<script>alert(1)</script>\n");
+  const review = await engine.submit(
+    { artifact: { git: { repo, mode: "uncommitted" } }, pages: [], rubric: "code", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  const patch = await fetch(`${base}inbox/review/${review.id}/file/r1/change.patch`, { headers: { cookie } });
+  assert.equal(patch.status, 200);
+  assert.match(patch.headers.get("content-type")!, /^text\/plain/);
+  assert.match(await patch.text(), /alert\(1\)/);
+});

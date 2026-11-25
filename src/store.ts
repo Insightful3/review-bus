@@ -106,7 +106,8 @@ export class Store {
     const tmp = path.join(dir, `review.json.${suffix}.tmp`);
     // Flushed to disk before the rename, and the folder after it, so a confirmed save survives a
     // power cut. (Round files are not flushed one by one; a lost snapshot fails its round.)
-    const fd = openSync(tmp, "w");
+    // Readable by the owner only: review state can name confidential work.
+    const fd = openSync(tmp, "w", 0o600);
     try {
       writeFileSync(fd, JSON.stringify(review, null, 2)); // writes every byte, or throws
       fsyncSync(fd);

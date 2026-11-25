@@ -21,7 +21,9 @@ export interface RubricPack {
 
 const NAME = /^[a-z0-9][a-z0-9-]*$/;
 
-function parseFrontMatter(text: string): { meta: Record<string, unknown>; body: string } {
+function parseFrontMatter(raw: string): { meta: Record<string, unknown>; body: string } {
+  // Some editors start UTF-8 files with a byte order mark; the header must still be recognised.
+  const text = raw.replace(/^\uFEFF/, "");
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   // An unclosed header would be read as body text, and a confidential: true in it silently ignored.
   if (!m && /^---\r?\n/.test(text)) throw new Error("the front matter has no closing --- line");

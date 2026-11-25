@@ -69,3 +69,5 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] Web inbox (SPEC 8c): waiting work, decisions, recent reviews, report and screenshots, person reviews with a findings form, release, sign-off; checked in a browser, phone width included
 - [x] Rubric packs (SPEC 7a): `rubric_packs`, `pack/rubric`, approvals fall back to the base name, `rb rubrics`, `rb rubric-check`, `review_rubrics`
 - [x] `server.ts` starts stdio only as the entry point (rb serve imports it)
+- [x] Codex reviewed v0.2 with review-bus itself, 3 rounds (rv_01m89x5tve51aaxs476b8eygjf): 16 blocking findings fixed with tests; escalated at the round cap, a person decides
+- [ ] Open advisories from round 3: the page snapshot timer can still exceed a plain call's budget at the edges (f7); a claim can be saved when the inbox fails to render it (f9); a retried CLI or MCP release without claimed_at can drop a newer claim (f10); submodule pointers in codex-review (f12); a submit task's reply can lose the pull-only hint (f13)

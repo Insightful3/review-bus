@@ -72,8 +72,11 @@ const Config = z.object({
       allow_remote: z.boolean().default(false),
       // Extra Host header values to accept (a name you reach this machine by); loopback names are always accepted.
       allowed_hosts: z.array(z.string()).default([]),
+      // Behind a TLS proxy: the address people open, for example "https://reviews.example.com".
+      // Browser posts must come from this origin (or from the server's own address).
+      public_origin: z.string().url().nullable().default(null),
     })
-    .default({ host: "127.0.0.1", port: 7777, token_file: "~/.review-bus/http-token", allow_remote: false, allowed_hosts: [] }),
+    .default({ host: "127.0.0.1", port: 7777, token_file: "~/.review-bus/http-token", allow_remote: false, allowed_hosts: [], public_origin: null }),
   // A review with pages is saved first and its pages rendered in the background. review_submit waits
   // this long for the snapshot, so a page that does not load is still an error on submit; a slower
   // capture returns the review id (state submitted) and the snapshot goes on in the background.

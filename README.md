@@ -51,7 +51,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 | `allowed_reviewers` | Per rubric, the reviewers you approve for that kind of content. Required for confidential rubrics such as `contract-b2b` |
 | `rubric_paths` | Extra folders with rubric files. Later folders override earlier ones by rubric name. This repo's `rubrics/` always comes first |
 | `rubric_packs` | Folders of rubrics shared as one unit (for example one client's), named `pack/rubric` |
-| `http` | For `rb serve`: `host` (default `127.0.0.1`), `port` (7777), `token_file` (`~/.review-bus/http-token`), `allow_remote` (false), `allowed_hosts` |
+| `http` | For `rb serve`: `host` (default `127.0.0.1`), `port` (7777), `token_file` (`~/.review-bus/http-token`), `allow_remote` (false), `allowed_hosts`, `public_origin` (behind a TLS proxy) |
 | `snapshot_wait_seconds` | How long `review_submit` waits for page screenshots before returning the review id (default 10) |
 | `storage.documents` | Where reviews are stored (default `~/.review-bus/reviews`) |
 | `author_vendors` | Maps MCP client names to vendors. `claude-code` and `codex-mcp-client` are built in |
@@ -204,7 +204,7 @@ claude mcp add --transport http review-bus http://127.0.0.1:7777/mcp --header "A
 
 Open `http://rb.localhost:7777/inbox` (or `http://127.0.0.1:7777/inbox`) and paste the token once. The browser then keeps a session for 12 hours, until `rb serve` restarts. The session cookie is not the token, and on `rb.localhost` it is not sent to other services you run on `localhost` or `127.0.0.1`, which share cookies regardless of port. The inbox shows work waiting for pull reviewers, reviews waiting for your decision and recent reviews. A person can claim a pull reviewer's work there (the page shows the brief, the rubric, the work and the screenshots, then a form for findings), release a claim, and sign off reviews that await sign-off or were escalated. Times are shown in UTC.
 
-`rb serve` only listens on this machine. To listen on another address, set `http.allow_remote: true` and put TLS in front of it, since the token travels with every request. Requests that name another host (DNS rebinding) or come from another site's page are refused.
+`rb serve` only listens on this machine. To listen on another address, set `http.allow_remote: true` and put TLS in front of it, since the token travels with every request. Behind a TLS proxy, set `http.public_origin` to the address people open (for example `https://reviews.example.com`), so the inbox accepts their form posts. For git reviews the inbox links the full patch, since the work shown on the page is cut at 120,000 characters. Requests that name another host (DNS rebinding) or come from another site's page are refused.
 
 ## Use it from the command line
 
@@ -324,7 +324,7 @@ rv_<id>/
 - Whatever you submit is sent to the reviewer's vendor (OpenAI for Codex, Anthropic for Claude). Mark rubrics for confidential material with `confidential: true` and list approved reviewers in `allowed_reviewers`.
 - Content under review is treated as data. Reviewer instructions come only from the rubric and the prompt.
 - `rb serve` listens on `127.0.0.1` only unless `http.allow_remote` is set, needs the token for `/mcp` and the inbox, and refuses requests with another `Host` or `Origin` (DNS rebinding, other sites' pages). The inbox keeps a random session id in an `HttpOnly`, `SameSite=Strict` cookie (never the token), and pages are served with a strict Content Security Policy. The inbox serves only files review-bus wrote and recorded in a round's snapshot (the Markdown, related documents, screenshots), never through a symlink, so never `review.json`. Browser posts must come from the inbox's own origin, port included. A bad request cannot stop the server.
-- Pull reviewer claim tokens are compared in constant time and never appear in results, reports, the inbox's review pages or the `REVIEW_BUS_LOG` file. An answer after the deadline is refused.
+- Review state files (`review.json`, `report.md`) are readable by you only. Pull reviewer claim tokens are stored only as a SHA-256 hash, compared in constant time, and never appear in results, reports, the inbox's review pages or the `REVIEW_BUS_LOG` file. An answer after the deadline is refused.
 - git variables in review-bus's environment (`GIT_DIR`, `GIT_INDEX_FILE` and the rest, as set inside a git hook) are removed before any git call and from every reviewer's environment, so they cannot point git at another repository.
 - `codex-review` builds its scratch git repo inside the round folder, with your global and system git config ignored and filters and line-ending conversion switched off.
 - Every agent session starts its own review-bus server. A review records which process runs it, so other sessions leave a running review alone and only mark it failed once that process is gone.

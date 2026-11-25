@@ -182,6 +182,7 @@ export function renderClaimPage(engine: Engine, work: ClaimedWork, by: string): 
 <h2>What the author wants</h2><p>${esc(work.intent)}</p>${list("The author's assumptions", work.assumptions)}${list("Criteria", work.criteria)}
 <details class="card"><summary>Rubric: ${esc(work.rubric)}</summary><div class="report">${esc(work.rubric_text)}</div></details>
 ${doc ? `<h2>The work</h2><div class="card report">${esc(doc)}</div>` : ""}
+${work.patch_file ? `<p><a href="/inbox/review/${esc(work.review_id)}/file/${work.patch_file.split("/").map(encodeURIComponent).join("/")}">The full change (patch)</a>: the text above is cut at 120,000 characters for large changes.</p>` : ""}
 ${images.map((f) => `<img class="shot" loading="lazy" alt="Screenshot" src="/inbox/review/${esc(work.review_id)}/file/${f.split("/").map(encodeURIComponent).join("/")}">`).join("")}
 <details class="card"><summary>Everything an agent reviewer gets (instructions, related documents, the change)</summary><div class="report">${esc(work.prompt)}</div></details>
 <h2>Your answer</h2>

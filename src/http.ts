@@ -72,15 +72,19 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
   const hostOk = (req: http.IncomingMessage) => {
     const host = (req.headers.host ?? "").toLowerCase();
     const names = [...LOOPBACK, ...cfg.allowed_hosts].map((h) => h.toLowerCase());
+    // A TLS proxy may pass on the public host name, on the default port.
+    if (cfg.public_origin && host === new URL(cfg.public_origin).host.toLowerCase()) return true;
     return names.some((n) => host === `${n}:${port}` || host === `[${n}]:${port}` || host === n);
   };
   // A browser's Origin must be this very server (host and port): SameSite cookies ignore ports, so a
   // page on another port of the same host could otherwise post to the inbox with the session.
+  const publicOrigin = cfg.public_origin ? new URL(cfg.public_origin).origin : null;
   const originOk = (req: http.IncomingMessage) => {
     const origin = req.headers.origin;
     if (!origin) return true;
     try {
       const u = new URL(origin);
+      if (publicOrigin && u.origin === publicOrigin) return true;
       return u.protocol === "http:" && u.host.toLowerCase() === (req.headers.host ?? "").toLowerCase();
     } catch {
       return false;
@@ -225,6 +229,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           const recorded = new Set(
             review.rounds.flatMap((rd) => [
               rd.snapshot.markdown_file,
+              rd.snapshot.git?.patch_file,
               ...(rd.snapshot.related ?? []).map((x) => x.markdown_file),
               ...(rd.snapshot.pages ?? []).flatMap((p) => p.screenshots.map((s) => s.file)),
             ]),
@@ -241,6 +246,7 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
             send(res, 404, "Not found", "text/plain");
             return;
           }
+          // Text is served as plain text, never as HTML, whatever it contains.
           send(res, 200, readFileSync(file) as unknown as string, rel.endsWith(".png") ? "image/png" : "text/plain; charset=utf-8");
           return;
         }
