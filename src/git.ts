@@ -9,7 +9,9 @@ import { expandHome } from "./config.js";
 
 export const GitSpec = z.object({
   repo: z.string().describe("Path to the git repository"),
-  mode: z.enum(["uncommitted", "base", "commit"]).describe("uncommitted: working tree vs HEAD; base: branch vs base; commit: one commit"),
+  mode: z
+    .enum(["uncommitted", "base", "commit", "all"])
+    .describe("uncommitted: working tree vs HEAD; base: branch vs base; commit: one commit; all: the whole project at HEAD"),
   base: z.string().optional().describe("For mode base: the base branch (default origin/HEAD, then main, then master)"),
   commit: z.string().optional().describe("For mode commit: the commit to review (default HEAD)"),
 });
@@ -116,6 +118,13 @@ export function snapshotGit(spec: GitSpec, reviewDir: string, round: number): { 
     const commits = git(root, ["rev-list", "--count", `${baseSha}..${headSha}`]).trim();
     notes.push(`${commits} commit(s) on ${branch ?? "HEAD"} since ${baseRef}.`);
     if (git(root, ["status", "--porcelain"]).trim()) notes.push("The working tree has uncommitted changes; they are not part of this review (mode base reviews commits).");
+  } else if (spec.mode === "all") {
+    // The whole project at HEAD, as if every file were new (committed files only).
+    baseSha = EMPTY_TREE;
+    baseRef = null;
+    patch = git(root, ["diff", "--binary", "--no-color", "--no-ext-diff", EMPTY_TREE, headSha]);
+    files = parseNameStatus(git(root, ["diff", "--name-status", "--no-color", EMPTY_TREE, headSha]));
+    if (git(root, ["status", "--porcelain"]).trim()) notes.push("The working tree has uncommitted changes; they are not part of this review (mode all reviews HEAD).");
   } else {
     const commitSha = tryRev(root, spec.commit ?? "HEAD");
     if (!commitSha) throw new Error(`Commit "${spec.commit}" not found in ${root}.`);

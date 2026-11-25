@@ -133,7 +133,7 @@ A branch against its base, plus the rendered pages from a running dev server:
 }
 ```
 
-Git modes: `uncommitted` (working tree against HEAD, including new files), `base` (the commits on your branch since it left `base`; the default base is `origin/HEAD`, then `main`), `commit` (one commit, default HEAD). Start the dev server yourself before submitting pages; review-bus never runs your project's code.
+Git modes: `uncommitted` (working tree against HEAD, including new files), `base` (the commits on your branch since it left `base`; the default base is `origin/HEAD`, then `main`), `commit` (one commit, default HEAD), `all` (the whole project at HEAD, to review a codebase rather than a change). Lockfile and binary diffs are left out of the prompt; reviewers can still read those files. Start the dev server yourself before submitting pages; review-bus never runs your project's code.
 
 ### Waiting and timeouts
 

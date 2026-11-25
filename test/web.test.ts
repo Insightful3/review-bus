@@ -285,3 +285,30 @@ test("a page server that is not running gives a clear error and leaves no half-m
   assert.deepEqual([saved.state, saved.rounds.length, saved.rounds[0].findings[0].response.status], ["changes_requested", 1, "accepted"]);
   assert.ok(!existsSync(path.join(reviewDir(id), "r2")));
 });
+
+test("mode all reviews the whole project at HEAD; lockfile and binary diffs stay out of the prompt", async () => {
+  const repo = newRepo("site-all");
+  writeFileSync(path.join(repo, "package-lock.json"), JSON.stringify({ lockfileVersion: 3, packages: { big: "x".repeat(5000) } }));
+  writeFileSync(path.join(repo, "logo.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3, 0, 255]));
+  sh(repo, "add", ".");
+  sh(repo, "commit", "-q", "-m", "lock and logo");
+  writeFileSync(path.join(repo, "about.html"), "uncommitted edit");
+
+  const { json, text } = await call("review_submit", { artifact: { git: { repo, mode: "all" } }, rubric: "code", intent: "x", wait_seconds: 30 });
+  assert.ok(json, text);
+  const g = snapshotOf(json.review_id).git;
+  assert.deepEqual([g.mode, g.base_ref], ["all", null]);
+  assert.deepEqual(g.files.map((f: { path: string }) => f.path).sort(), ["about.html", "index.html", "logo.png", "package-lock.json"]);
+  assert.ok(g.files.every((f: { status: string }) => f.status === "A"));
+  assert.match(g.notes.join(" "), /uncommitted changes; they are not part of this review/);
+
+  const dir = reviewDir(json.review_id);
+  // The tree is HEAD: the committed about.html, the binary logo intact.
+  assert.match(readFileSync(path.join(dir, "r1/tree/about.html"), "utf8"), /Fictional/);
+  assert.deepEqual([...readFileSync(path.join(dir, "r1/tree/logo.png"))], [0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3, 0, 255]);
+  const change = readFileSync(path.join(dir, "r1/change.md"), "utf8");
+  assert.match(change, /Mode: all \(the whole project at HEAD/);
+  assert.match(change, /lockfile and binary diffs left out of this prompt \(the files are in tree\/\): (logo\.png, package-lock\.json|package-lock\.json, logo\.png)/);
+  assert.doesNotMatch(change, /xxxxxxxxxx/);
+  assert.match(change, /diff --git a\/index\.html b\/index\.html/);
+});

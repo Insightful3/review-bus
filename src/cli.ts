@@ -15,7 +15,7 @@ const USAGE = `rb: submit work for review by other agents, and answer the findin
 
 Usage:
   rb submit <file> --rubric <name> --intent <text> [options]
-  rb submit --git <repo> [--mode uncommitted|base|commit] [--base <branch>] [--commit <sha>] --rubric <name> --intent <text> [options]
+  rb submit --git <repo> [--mode uncommitted|base|commit|all] [--base <branch>] [--commit <sha>] --rubric <name> --intent <text> [options]
   rb submit --page <url> [--page <url>...] --rubric webpage --intent <text> [options]
   rb status <review_id>
   rb show <review_id>
@@ -127,7 +127,7 @@ async function main() {
       let artifact: { path?: string; git?: GitSpec } | null = null;
       if (v.git) {
         const mode = (v.mode ?? "uncommitted") as GitSpec["mode"];
-        if (!["uncommitted", "base", "commit"].includes(mode)) fail(`bad --mode "${mode}"`);
+        if (!["uncommitted", "base", "commit", "all"].includes(mode)) fail(`bad --mode "${mode}"`);
         artifact = { git: { repo: v.git, mode, ...(v.base ? { base: v.base } : {}), ...(v.commit ? { commit: v.commit } : {}) } };
       } else if (pos[0]) {
         artifact = { path: path.resolve(pos[0]) };
