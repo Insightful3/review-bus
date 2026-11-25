@@ -1,0 +1,397 @@
+// v0.2: pull reviewers, MCP over HTTP with a token, the web inbox, rubric packs, the review id
+// before slow page capture, and Codex's native review pass (with a fake codex).
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { after, before, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { loadConfig } from "../src/config.js";
+import { Engine } from "../src/engine.js";
+import { startHttp } from "../src/http.js";
+import { checkRubricPath, listRubrics, loadRubric } from "../src/rubrics.js";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const FIXTURE = path.join(ROOT, "test/fixtures/proposal-bluefin.md");
+const PERSON = { client: "rb", vendor: null, vendor_source: "person" as const };
+
+let tmp: string;
+let configFile: string;
+let engine: Engine;
+let base: string; // http://127.0.0.1:<port>/
+let token: string;
+let closeHttp: () => Promise<void>;
+let client: Client;
+
+type ToolResult = { isError?: boolean; content: { type: string; text: string }[] };
+
+const RUBRIC = `---
+confidential: true
+require_signoff: true
+---
+# Acme contract
+
+## Purpose
+
+Check an Acme contract.
+
+## What to check
+
+- Price.
+
+## Out of scope
+
+- Style.
+
+## Impact anchors
+
+- critical: wrong price.
+- high: missing law.
+- medium: unclear term.
+- low: style.
+`;
+
+function writeConfig(extra: Record<string, unknown> = {}) {
+  const fake = { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs")], timeout_seconds: 30 };
+  writeFileSync(
+    configFile,
+    JSON.stringify({
+      rubric_paths: [],
+      rubric_packs: [path.join(tmp, "packs", "acme-pack")],
+      storage: { documents: path.join(tmp, "reviews") },
+      default_reviewers: ["fake"],
+      allowed_reviewers: { "contract-b2b": ["fake", "person"] },
+      http: { port: 0, token_file: path.join(tmp, "http-token") },
+      adapters: {
+        fake,
+        person: { type: "pull" },
+        quick: { type: "pull", timeout_seconds: 1 },
+        gemini_only: { type: "pull", claim_clients: ["gemini-cli"] },
+        native: { type: "codex-review", command: path.join(ROOT, "test/fake-codex.mjs"), timeout_seconds: 30 },
+      },
+      ...extra,
+    }),
+  );
+  process.env.REVIEW_BUS_CONFIG = configFile;
+}
+
+async function call(name: string, args: Record<string, unknown>) {
+  const res = (await client.callTool({ name, arguments: args })) as ToolResult;
+  const blocks = res.content.map((c) => c.text).filter((t) => t.trim().startsWith("{"));
+  return { res, text: res.content[0]?.text ?? "", json: res.isError ? null : JSON.parse(blocks.find((b) => b.includes('"review_id"')) ?? blocks[0] ?? "null") };
+}
+
+async function waitUntil(check: () => boolean, ms = 15000) {
+  const until = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > until) throw new Error("timed out waiting");
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+before(async () => {
+  tmp = mkdtempSync(path.join(os.tmpdir(), "review-bus-v02-"));
+  const pack = path.join(tmp, "packs", "acme-pack");
+  mkdirSync(pack, { recursive: true });
+  writeFileSync(path.join(pack, "pack.json"), JSON.stringify({ name: "acme", description: "Acme's rubrics", version: "1.0.0" }));
+  writeFileSync(path.join(pack, "contract-b2b.md"), RUBRIC);
+  configFile = path.join(tmp, "config.json");
+  writeConfig();
+  engine = new Engine(loadConfig());
+  const started = await startHttp(engine, { port: 0, host: "127.0.0.1" });
+  base = started.url;
+  closeHttp = started.close;
+  token = readFileSync(path.join(tmp, "http-token"), "utf8").trim();
+  client = new Client({ name: "http-author", version: "0.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}mcp`), { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
+});
+
+after(async () => {
+  await client?.close();
+  await closeHttp?.();
+  await engine?.idle();
+});
+
+test("the token file is created readable only by its owner; /mcp refuses requests without it", async () => {
+  assert.equal(statSync(path.join(tmp, "http-token")).mode & 0o777, 0o600);
+  const none = await fetch(`${base}mcp`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(none.status, 401);
+  const wrong = await fetch(`${base}mcp`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer nope" }, body: "{}" });
+  assert.equal(wrong.status, 401);
+});
+
+test("a request naming another host (DNS rebinding) is refused", async () => {
+  const port = new URL(base).port;
+  const res = await new Promise<number>((resolve) => {
+    const req = http.request({ host: "127.0.0.1", port, path: "/inbox", headers: { host: `evil.example:${port}` } }, (r) => resolve(r.statusCode ?? 0));
+    req.end();
+  });
+  assert.equal(res, 403);
+  const origin = await fetch(`${base}inbox`, { headers: { origin: "https://evil.example" }, redirect: "manual" });
+  assert.equal(origin.status, 403);
+});
+
+test("rb serve refuses to listen beyond this machine unless allow_remote is set", async () => {
+  await assert.rejects(startHttp(engine, { port: 0, host: "0.0.0.0" }), /allow_remote/);
+});
+
+test("over HTTP: a pull reviewer claims the work and posts; the last answer finishes the round", async () => {
+  const doc = path.join(tmp, "proposal.md");
+  writeFileSync(doc, readFileSync(FIXTURE, "utf8"));
+  const sub = await call("review_submit", { artifact: doc, rubric: "proposal", intent: "Win the Bluefin project.", reviewers: ["fake", "person"], wait_seconds: 20 });
+  assert.equal(sub.res.isError, undefined, sub.text);
+  const id = sub.json.review_id;
+  // The wait stops once only the pull reviewer is left, instead of running out the clock.
+  const status = (await call("review_status", { review_id: id })).json;
+  assert.equal(status.state, "in_review");
+  assert.deepEqual(
+    status.reviewers.map((r: { name: string; status: string }) => [r.name, r.status]),
+    [
+      ["fake", "done"],
+      ["person", "waiting"],
+    ],
+  );
+
+  const pending = (await call("review_pending", { reviewer: "person" })).json.pending;
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].review_id, id);
+
+  const claimed = (await client.callTool({ name: "review_claim", arguments: { review_id: id, reviewer: "person", by: "Ana" } })) as ToolResult;
+  assert.notEqual(claimed.isError, true, claimed.content[0].text);
+  const work = JSON.parse(claimed.content[0].text);
+  assert.match(claimed.content[1].text, /<document>/);
+  assert.equal(JSON.parse(claimed.content[2].text).type, "object");
+  assert.ok(work.token && work.files.some((f: string) => f.endsWith("artifact.md")));
+  // Nobody else can claim it now, and a wrong token cannot post.
+  assert.match((await call("review_claim", { review_id: id, reviewer: "person", by: "Bo" })).text, /already claimed by Ana/);
+  const output = {
+    verdict: "changes_requested",
+    summary: "Person review.",
+    findings: [
+      {
+        claim: "The go-live date is before the pilot ends.",
+        failure_scenario: "The client plans the launch on a date the pilot cannot meet.",
+        evidence: "Timeline section.",
+        location: { path: null, line_start: null, line_end: null, section: "Timeline", quote: null },
+        likelihood: "likely",
+        impact: "high",
+        suggested_fix: null,
+        assumption_challenge: false,
+        confidence: 0.8,
+      },
+    ],
+  };
+  assert.match((await call("review_post", { review_id: id, reviewer: "person", token: "x".repeat(32), output })).text, /No claim .* matches this token/);
+  const bad = await call("review_post", { review_id: id, reviewer: "person", token: work.token, output: { verdict: "maybe" } });
+  assert.match(bad.text, /does not match the reviewer output schema/);
+
+  const posted = await call("review_post", { review_id: id, reviewer: "person", token: work.token, output, model: "human" });
+  assert.notEqual(posted.res.isError, true, posted.text);
+  assert.equal(posted.json.state, "changes_requested");
+  const result = (await call("review_result", { review_id: id, include_advisory: true })).json;
+  assert.ok(result.findings.some((f: { reviewer: string; claim: string }) => f.reviewer.startsWith("person:human") && /go-live/.test(f.claim)));
+  // The claim token never shows in results or the report.
+  assert.ok(!JSON.stringify(result).includes(work.token));
+  assert.ok(!readFileSync(path.join(tmp, "reviews", id, "report.md"), "utf8").includes(work.token));
+  assert.match(readFileSync(path.join(tmp, "reviews", id, "report.md"), "utf8"), /Claimed by Ana \(http-author\)/);
+});
+
+test("a pull reviewer that misses its deadline fails, and the round finishes without it", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }, { name: "quick" }], stage: "pre-merge" },
+    PERSON,
+    10,
+  );
+  await new Promise((r) => setTimeout(r, 1500));
+  engine.get(review.id); // notices the missed deadline
+  await engine.settled(review.id);
+  const done = engine.get(review.id);
+  assert.equal(done.state, "changes_requested");
+  const quick = done.rounds[0].reviewers.find((r) => r.name === "quick")!;
+  assert.equal(quick.status, "failed");
+  assert.match(quick.error!, /no answer by the deadline/);
+});
+
+test("claim_clients: only the named MCP clients may claim for that reviewer", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "gemini_only" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  assert.throws(() => engine.claim(review.id, "gemini_only", { by: "Someone", client: "claude-code" }), /accepts claims only from gemini-cli/);
+  const work = engine.claim(review.id, "gemini_only", { by: "Gemini", client: "gemini-cli" });
+  const after = await engine.post(review.id, "gemini_only", work.token, { decline: "Out of my depth." });
+  assert.equal(after.state, "failed"); // the only reviewer declined
+  assert.match(after.rounds[0].reviewers[0].error!, /declined by Gemini: Out of my depth/);
+});
+
+test("a server restart does not fail a round that only waits for a pull reviewer", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const fresh = new Engine(loadConfig()); // another process with no running job
+  assert.equal(fresh.get(review.id).state, "in_review");
+  const work = fresh.claim(review.id, "person", { by: "Ana", client: null });
+  const done = await fresh.post(review.id, "person", work.token, { output: { verdict: "approve", summary: "Fine.", findings: [] } });
+  assert.equal(done.state, "approved");
+});
+
+test("web inbox: login, list, a person reviews as a pull reviewer, then signs off", async () => {
+  const login = await fetch(`${base}inbox`, { redirect: "manual" });
+  assert.equal(login.status, 303);
+  assert.equal(login.headers.get("location"), "/inbox/login");
+  const wrong = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token: "nope" }), redirect: "manual" });
+  assert.equal(wrong.status, 401);
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  assert.equal(ok.status, 303);
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  assert.match(ok.headers.get("set-cookie")!, /HttpOnly; SameSite=Strict/);
+  const get = (p: string) => fetch(`${base}${p}`, { headers: { cookie }, redirect: "manual" });
+  const post = (p: string, form: URLSearchParams) => fetch(`${base}${p}`, { method: "POST", headers: { cookie }, body: form, redirect: "manual" });
+
+  // A confidential pack rubric that requires sign-off, reviewed by a person only.
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "acme/contract-b2b", intent: "Sign the Acme deal.", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  const inbox = await (await get("inbox")).text();
+  assert.match(inbox, new RegExp(review.id));
+  assert.match(inbox, /Waiting for a reviewer/);
+  const reviewPage = await get(`inbox/review/${review.id}`);
+  assert.match(reviewPage.headers.get("content-security-policy")!, /default-src 'none'/);
+  assert.match(await reviewPage.text(), /Review this as person/);
+
+  const claimPage = await (await post(`inbox/claim/${review.id}/person/start`, new URLSearchParams({ by: "Ana <script>" }))).text();
+  assert.ok(!claimPage.includes("Ana <script>"), "names are escaped");
+  const claimToken = claimPage.match(/name="claim_token" value="([0-9a-f]+)"/)![1];
+  const answer = new URLSearchParams({ claim_token: claimToken, verdict: "approve", summary: "Looks right.", decline: "" });
+  for (const [k, v] of Object.entries({ f_claim: "", f_impact: "medium", f_likelihood: "likely", f_failure: "", f_evidence: "", f_section: "", f_quote: "", f_fix: "", f_challenge: "no" })) answer.append(k, v);
+  const sent = await post(`inbox/claim/${review.id}/person/post`, answer);
+  assert.equal(sent.status, 303);
+  assert.equal(engine.get(review.id).state, "awaiting_signoff");
+
+  // review.json (claim tokens) is never served; screenshots and Markdown of a round are.
+  assert.equal((await get(`inbox/review/${review.id}/file/review.json`)).status, 404);
+  assert.equal((await get(`inbox/review/${review.id}/file/r1/..%2F..%2Freview.json`)).status, 404);
+  assert.equal((await get(`inbox/review/${review.id}/file/r1/artifact.md`)).status, 200);
+
+  const signed = await post(`inbox/review/${review.id}/signoff`, new URLSearchParams({ by: "Ana", note: "Checked." }));
+  assert.equal(signed.status, 303);
+  const final = engine.get(review.id);
+  assert.equal(final.state, "approved");
+  assert.equal(final.signoff?.by, "Ana");
+});
+
+test("rubric packs: pack/name loads from the pack; approvals fall back to the base name", async () => {
+  const r = loadRubric("acme/contract-b2b", engine.config.rubric_paths, engine.config.rubric_packs);
+  assert.match(r.body, /Acme contract/);
+  assert.throws(() => loadRubric("nope/contract-b2b", engine.config.rubric_paths, engine.config.rubric_packs), /pack "nope" is not in rubric_packs/);
+  assert.throws(() => loadRubric("../x", engine.config.rubric_paths, engine.config.rubric_packs), /Invalid rubric name/);
+  const names = listRubrics(engine.config.rubric_paths, engine.config.rubric_packs).map((x) => x.name);
+  assert.ok(names.includes("acme/contract-b2b") && names.includes("contract-b2b") && names.includes("proposal"));
+  // Not approved by name or base name: refused.
+  await assert.rejects(
+    engine.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "acme/contract-b2b", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "quick" }], stage: "pre-merge" }, PERSON),
+    /not approved/,
+  );
+});
+
+test("review_rubrics lists plain and pack rubrics with their purpose", async () => {
+  const { json } = await call("review_rubrics", {});
+  const acme = json.rubrics.find((r: { name: string }) => r.name === "acme/contract-b2b");
+  assert.deepEqual([acme.pack, acme.confidential, acme.require_signoff, acme.purpose], ["acme", true, true, "Check an Acme contract."]);
+  assert.equal(acme.file, undefined);
+});
+
+test("rb rubric-check finds what would make a rubric work badly", () => {
+  const dir = path.join(tmp, "packs", "bad-pack");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "good.md"), RUBRIC);
+  writeFileSync(path.join(dir, "bad.md"), "---\neffort: huge\nconfidential: yes\nconfidental: true\n---\n# Bad\n\n## Purpose\n\nX — y.\n\n## Impact anchors\n\n- critical: x\n");
+  const results = checkRubricPath(dir);
+  assert.deepEqual(results.find((x) => x.file.endsWith("good.md"))!.problems, []);
+  const problems = results.find((x) => x.file.endsWith("bad.md"))!.problems.join("\n");
+  for (const p of [/missing section "## What to check"/, /lack "high:"/, /em dash/, /effort "huge"/, /confidential must be true or false/, /unknown front matter key "confidental"/]) assert.match(problems, p);
+  const cli = spawnSync(process.execPath, [path.join(ROOT, "dist/src/cli.js"), "rubric-check", dir], { encoding: "utf8" });
+  assert.equal(cli.status, 2);
+  assert.match(cli.stdout, /FAIL .*bad\.md/);
+  // Every rubric this repo ships passes.
+  assert.ok(checkRubricPath(path.join(ROOT, "rubrics")).every((x) => x.problems.length === 0), JSON.stringify(checkRubricPath(path.join(ROOT, "rubrics")).filter((x) => x.problems.length)));
+});
+
+test("pages: a capture slower than snapshot_wait_seconds returns the id; its failure shows on the review", async () => {
+  writeConfig({ snapshot_wait_seconds: 0 });
+  const slow = new Engine(loadConfig());
+  // Nothing listens on port 9 (discard): the capture fails, after submit has returned.
+  const review = await slow.submit({ artifact: null, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  assert.equal(review.state, "submitted");
+  assert.equal(review.rounds.length, 0);
+  await slow.settled(review.id);
+  const failed = slow.get(review.id);
+  assert.equal(failed.state, "failed");
+  assert.match(failed.notes.join(" "), /The snapshot failed/);
+  // With the default wait, the same quick failure is an error on submit, and nothing is kept.
+  writeConfig();
+  const quick = new Engine(loadConfig());
+  const before = existsSync(path.join(tmp, "reviews")) ? execFileSync("ls", [path.join(tmp, "reviews")]).toString() : "";
+  await assert.rejects(
+    quick.submit({ artifact: null, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON),
+    /127\.0\.0\.1:9/,
+  );
+  assert.equal(execFileSync("ls", [path.join(tmp, "reviews")]).toString(), before);
+});
+
+test("a review still taking its snapshot is failed by another process only when its process is gone", async () => {
+  writeConfig({ snapshot_wait_seconds: 0 });
+  const a = new Engine(loadConfig());
+  const review = await a.submit({ artifact: null, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  // Pretend the process taking the snapshot died.
+  const file = path.join(tmp, "reviews", review.id, "review.json");
+  await a.settled(review.id);
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  Object.assign(saved, { state: "submitted", preparing: { pid: 999999, host: os.hostname(), started_at: new Date().toISOString() } });
+  writeFileSync(file, JSON.stringify(saved));
+  const b = new Engine(loadConfig());
+  const got = b.get(review.id);
+  assert.equal(got.state, "failed");
+  assert.match(got.history.at(-1)!.detail!, /snapshot was being taken when the server stopped/);
+  writeConfig();
+});
+
+test("codex-review: Codex's native review runs in a scratch repo built from the snapshot; a second pass makes findings", async () => {
+  const repo = path.join(tmp, "repo");
+  mkdirSync(repo);
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { cwd: repo });
+  writeFileSync(path.join(repo, "index.html"), "<h1>Hi</h1>\n");
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-q", "-m", "base");
+  writeFileSync(path.join(repo, "index.html"), "<h1>Hello</h1>\n");
+  writeFileSync(path.join(repo, "new.txt"), "new file\n");
+  const before = execFileSync("git", ["status", "--porcelain"], { cwd: repo }).toString();
+  const review = await engine.submit(
+    { artifact: { git: { repo, mode: "uncommitted" } }, pages: [], rubric: "code", intent: "Greet.", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" },
+    PERSON,
+    30,
+  );
+  await engine.settled(review.id);
+  const done = engine.get(review.id);
+  const run = done.rounds[0].reviewers[0];
+  assert.equal(run.status, "done", run.error ?? "");
+  assert.ok(done.rounds[0].findings.length >= 1);
+  const native = readFileSync(path.join(tmp, "reviews", review.id, "r1", "native.native.md"), "utf8");
+  assert.match(native, /\(2 changed\)/); // both the edit and the new file are uncommitted in the scratch repo
+  // The author's repo is untouched.
+  assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: repo }).toString(), before);
+  // A document cannot go to codex-review.
+  const doc = await engine.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "native" }], stage: "pre-merge" }, PERSON, 10);
+  await engine.settled(doc.id);
+  assert.match(engine.get(doc.id).rounds[0].reviewers[0].error!, /git changes only/);
+});

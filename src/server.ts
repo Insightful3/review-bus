@@ -10,13 +10,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
-import { Engine } from "./engine.js";
+import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import { GitSpec } from "./git.js";
 import { ReviewerSpec, Vendor } from "./settings.js";
 import { describeArtifact } from "./snapshot.js";
+import { listRubrics } from "./rubrics.js";
 import { renderSummary } from "./store.js";
 import type { AuthorInfo, Review } from "./types.js";
 
@@ -71,9 +73,14 @@ function statusPayload(review: Review) {
     state: review.state,
     round: round?.n ?? 0,
     max_rounds: null as number | null,
-    reviewers: (round?.reviewers ?? []).map((r) => ({ name: r.name, label: r.label, status: r.status })),
+    reviewers: (round?.reviewers ?? []).map((r) => ({
+      name: r.name,
+      label: r.label,
+      status: r.status,
+      ...(r.adapter === "pull" ? { pull: true, deadline: r.deadline ?? null, claimed_by: r.claim?.by ?? null } : {}),
+    })),
     done: round?.reviewers.filter((r) => r.status === "done" || r.status === "failed").length ?? 0,
-    pending: round?.reviewers.filter((r) => r.status === "pending" || r.status === "running").length ?? 0,
+    pending: round?.reviewers.filter((r) => r.status === "pending" || r.status === "running" || r.status === "waiting").length ?? 0,
     counts: {
       blocking: blocking.length,
       advisory: (round?.findings.length ?? 0) - blocking.length,
@@ -95,7 +102,8 @@ function errorReply(err: unknown) {
 /** What a tool returns now, and (for a task call) what it resolves to once the review is done. */
 interface Outcome {
   now: CallToolResult;
-  later?: Promise<CallToolResult>;
+  /** Only called for task calls: plain calls never start a background wait. */
+  later?: () => Promise<CallToolResult>;
 }
 
 /** Task results stay available this long; a task's lifetime counts from creation in the SDK store. */
@@ -138,7 +146,11 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
 
   /** Resolves once the review's current round is over, wherever it runs. */
   const untilDone = async (id: string) => {
-    while (engine.get(id).state === "in_review") await engine.waitFor(id, 30);
+    while (isActive(engine.get(id).state)) {
+      await engine.waitFor(id, 30);
+      // waitFor returns at once while only pull reviewers are left (they may take days): poll slowly.
+      if (onlyPullLeft(engine.get(id))) await new Promise((r) => setTimeout(r, 5000));
+    }
     return engine.get(id);
   };
 
@@ -155,11 +167,14 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
   }
 
   const progressText = (id: string, startedAt: number) => {
-    const round = engine.get(id).rounds.at(-1);
+    const review = engine.get(id);
+    if (review.state === "submitted") return `Taking the snapshot (rendering pages) (${Math.round((Date.now() - startedAt) / 1000)} s)`;
+    const round = review.rounds.at(-1);
     const runs = round?.reviewers ?? [];
     const done = runs.filter((r) => r.status === "done" || r.status === "failed").length;
     const running = runs.filter((r) => r.status === "running").map((r) => r.label);
-    return `Round ${round?.n ?? 0}: ${done} of ${runs.length} reviewer(s) done${running.length ? `; still working: ${running.join(", ")}` : ""} (${Math.round((Date.now() - startedAt) / 1000)} s)`;
+    const waiting = runs.filter((r) => r.status === "waiting").map((r) => r.name);
+    return `Round ${round?.n ?? 0}: ${done} of ${runs.length} reviewer(s) done${running.length ? `; still working: ${running.join(", ")}` : ""}${waiting.length ? `; waiting for pull reviewer(s) to claim: ${waiting.join(", ")}` : ""} (${Math.round((Date.now() - startedAt) / 1000)} s)`;
   };
 
   const registerTaskTool = <Shape extends Record<string, z.ZodTypeAny>>(
@@ -185,9 +200,9 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
               const startedAt = Date.now();
               const until = startedAt + seconds * 1000;
               let step = 0;
-              while (Date.now() < until && engine.get(id).state === "in_review") {
+              while (Date.now() < until && isActive(engine.get(id).state) && !onlyPullLeft(engine.get(id))) {
                 await engine.waitFor(id, Math.min(10, (until - Date.now()) / 1000));
-                if (engine.get(id).state !== "in_review") break;
+                if (!isActive(engine.get(id).state) || onlyPullLeft(engine.get(id))) break;
                 await extra
                   .sendNotification({ method: "notifications/progress", params: { progressToken, progress: ++step, message: progressText(id, startedAt) } })
                   .catch(() => {});
@@ -202,7 +217,8 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
             outcome = { now: errorReply(err) };
           }
           if (asTask && outcome.later) {
-            void outcome.later
+            void outcome
+              .later()
               .catch((err) => errorReply(err))
               .then((result) => extra.taskStore.storeTaskResult(task.taskId, "completed", result))
               .catch((err) => console.error(`review-bus: could not complete task ${task.taskId}: ${(err as Error).message}`));
@@ -288,11 +304,14 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
       );
       await ctx.wait(submitted.id, args.wait_seconds);
       const review = engine.get(submitted.id);
-      if (review.state !== "in_review") return { now: reply(review, false) };
-      const next = "Reviewers are working. Call review_wait with this review_id until state is not in_review, then review_result.";
+      if (!isActive(review.state)) return { now: reply(review, false) };
+      const next =
+        review.state === "submitted"
+          ? "The snapshot (page screenshots) is being taken. Call review_wait with this review_id until state is neither submitted nor in_review, then review_result."
+          : "Reviewers are working. Call review_wait with this review_id until state is not in_review, then review_result.";
       return {
         now: { content: [{ type: "text" as const, text: JSON.stringify({ review_id: review.id, state: review.state, next }) }] },
-        later: untilDone(review.id).then((r) => reply(r, false)),
+        later: () => untilDone(review.id).then((r) => reply(r, false)),
       };
     },
   );
@@ -344,7 +363,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     },
     async (args, ctx) => {
       engine.get(args.review_id); // validates the id
-      if (ctx.asTask) return { now: jsonReply(status(engine.get(args.review_id))), later: untilDone(args.review_id).then((r) => jsonReply(status(r))) };
+      if (ctx.asTask) return { now: jsonReply(status(engine.get(args.review_id))), later: () => untilDone(args.review_id).then((r) => jsonReply(status(r))) };
       const waited = await ctx.wait(args.review_id, args.seconds);
       return { now: jsonReply({ ...status(engine.get(args.review_id)), waited_seconds: waited, ...(waited < args.seconds ? { wait_capped: true } : {}) }) };
     },
@@ -380,7 +399,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
       const review = args.resubmit ? engine.get(args.review_id) : responded.review;
       const unanswered = responded.unanswered;
       if (review.state === "in_review") {
-        return { now: jsonReply({ ...status(review), unanswered }), later: untilDone(review.id).then((r) => reply(r, false)) };
+        return { now: jsonReply({ ...status(review), unanswered }), later: () => untilDone(review.id).then((r) => reply(r, false)) };
       }
       const r = reply(review, false);
       r.content.push({ type: "text" as const, text: JSON.stringify({ unanswered }) });
@@ -435,6 +454,98 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     },
   );
 
+  server.registerTool(
+    "review_rubrics",
+    {
+      description:
+        "The rubrics you can name in review_submit, with their purpose: plain names (proposal, contract-b2b, code, ...) and rubric packs as pack/rubric. " +
+        "confidential rubrics only go to reviewers approved for them; require_signoff rubrics end with a person's sign-off.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const rubrics = listRubrics(engine.config.rubric_paths, engine.config.rubric_packs).map(({ file: _file, ...r }) => r);
+        return jsonReply({ rubrics });
+      } catch (err) {
+        return errorReply(err);
+      }
+    },
+  );
+
+  // Pull reviewers (SPEC 8b): a person or another agent fetches the work and posts the answer.
+  server.registerTool(
+    "review_pending",
+    {
+      description:
+        "Work waiting for pull reviewers (reviewers configured with type pull, for example a person or an agent in another tool): " +
+        "review id, round, reviewer name, rubric, intent, deadline. Claim one with review_claim.",
+      inputSchema: { reviewer: z.string().optional().describe("Only this pull reviewer's work") },
+    },
+    async (args) => {
+      try {
+        return jsonReply({ pending: engine.pending(args.reviewer) });
+      } catch (err) {
+        return errorReply(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "review_claim",
+    {
+      description:
+        "Claim a pull reviewer's work on a review. Returns the reviewer prompt (rubric, intent, the work or where to find it, output rules), " +
+        "the files, the JSON Schema of the answer and a token. Review read-only, then send the answer with review_post. " +
+        "Never review work you submitted yourself.",
+      inputSchema: {
+        review_id: z.string(),
+        reviewer: z.string().describe("The pull reviewer's name from config"),
+        by: z.string().describe("Who is reviewing: the person's name, or the agent and model"),
+      },
+    },
+    async (args) => {
+      try {
+        const work = engine.claim(args.review_id, args.reviewer, { by: args.by, client: server.server.getClientVersion()?.name ?? null });
+        const { prompt, output_schema, ...rest } = work;
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(rest, null, 2) },
+            { type: "text" as const, text: prompt },
+            { type: "text" as const, text: JSON.stringify(output_schema) },
+          ],
+        };
+      } catch (err) {
+        return errorReply(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "review_post",
+    {
+      description:
+        "Send a pull reviewer's answer: output (verdict, summary, findings in the schema review_claim returned), or decline with a reason. " +
+        "Needs the token from review_claim. The last answer of a round finishes it.",
+      inputSchema: {
+        review_id: z.string(),
+        reviewer: z.string(),
+        token: z.string(),
+        output: z.record(z.string(), z.unknown()).optional().describe("Reviewer output JSON: {verdict, summary, findings}"),
+        decline: z.string().optional().describe("Instead of output: why you cannot review this"),
+        model: z.string().optional().describe("The model that reviewed, if an agent (recorded on the findings)"),
+      },
+    },
+    async (args) => {
+      try {
+        if (!args.output === !args.decline) throw new Error("Give either output or decline.");
+        const review = await engine.post(args.review_id, args.reviewer, args.token, { output: args.output, decline: args.decline, model: args.model });
+        return jsonReply(status(review));
+      } catch (err) {
+        return errorReply(err);
+      }
+    },
+  );
+
   return { server, trackTaskRequests, taskStore };
 }
 
@@ -451,7 +562,12 @@ async function main() {
   };
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only as the entry point (review-bus, npm start): rb serve imports createServer from here, and a
+// stdio server started on import would read rb's stdin.
+const entry = process.argv[1] ? realpathSync(process.argv[1]) : "";
+if (entry === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

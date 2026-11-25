@@ -232,6 +232,10 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
       ? `- Author: a person (${a.client})`
       : `- Author: ${a.vendor ?? "unknown vendor"}${a.client ? ` (${a.client})` : ""}${a.vendor_source === "declared" ? ", declared" : ""}`,
   );
+  if (!round) {
+    if (review.state === "submitted") lines.push("- Taking the snapshot (rendering pages).");
+    if (review.notes.length) lines.push("", "## Notes", "", ...review.notes.map((n) => `- ${n}`));
+  }
   if (round) {
     const snap = round.snapshot;
     lines.push(`- Round ${round.n}, snapshot sha256 ${snap.sha256.slice(0, 12)}${snap.converter && snap.converter !== "none" ? `, converted with ${snap.converter}` : ""}`);
@@ -260,6 +264,9 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
     for (const r of round.reviewers) {
       lines.push(`- ${r.label} (${r.adapter}, ${r.vendor}): ${r.status}${r.verdict ? `, ${r.verdict}` : ""}`);
       lines.push(`  - Model ${settingNote(r.model, r.model_reported, r.model_source)}; effort ${settingNote(r.effort, r.effort_reported, r.effort_source)}`);
+      if (r.adapter === "pull") {
+        lines.push(r.claim ? `  - Claimed by ${r.claim.by}${r.claim.client ? ` (${r.claim.client})` : ""} on ${r.claim.at}` : `  - Not claimed yet; due ${r.deadline ?? "?"}`);
+      }
       if (r.summary) lines.push(`  - ${r.summary}`);
       if (r.error) lines.push(`  - Error: ${r.error}`);
     }

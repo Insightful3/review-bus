@@ -1,3 +1,4 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,8 +8,10 @@ import { buildPrompt, screenshotFiles } from "./prompt.js";
 import { applyGroups, MERGE_SCHEMA, mergeFindings, mergePrompt, type CanBlock, type Merged, type Raised } from "./merge.js";
 import { runStructured } from "./adapters/index.js";
 import { computeBlocking, severityOf, wouldBlock, type PolicyOptions } from "./policy.js";
-import { loadRubric } from "./rubrics.js";
+import { baseName, loadRubric } from "./rubrics.js";
 import { describeArtifact, snapshotRound } from "./snapshot.js";
+import { checkPageUrl } from "./pages.js";
+import { ReviewerOutput, reviewerOutputJsonSchema } from "./spec/reviewer-output.js";
 import { newReviewId, Store } from "./store.js";
 import { checkEffort, resolveModelEffort, reviewerLabel, type ReviewerSpec } from "./settings.js";
 import type { AuthorInfo, Finding, FindingResponse, Review, ReviewRequest, ReviewerRun, ReviewState, Round } from "./types.js";
@@ -23,8 +26,64 @@ export interface ResponseInput {
 const FINAL: ReviewState[] = ["approved", "canceled"];
 /** States from which the author may start the next round. */
 const RESUBMITTABLE: ReviewState[] = ["changes_requested", "failed"];
+/** States in which work is still going on: the snapshot is being taken, or reviewers are working. */
+export const ACTIVE: ReviewState[] = ["submitted", "in_review"];
+export const isActive = (state: ReviewState) => ACTIVE.includes(state);
+/** The review waits only for pull reviewers (a person or another agent), which can take days. */
+export const onlyPullLeft = (review: Review) => {
+  const rd = review.rounds.at(-1);
+  return review.state === "in_review" && Boolean(rd) && waitingOnPull(rd!);
+};
 
 const now = () => new Date().toISOString();
+
+/** Every reviewer of the round has finished (answered, failed, declined or missed its deadline). */
+function roundSettled(rd: Round): boolean {
+  return rd.reviewers.every((x) => x.status === "done" || x.status === "failed");
+}
+
+/** Only pull reviewers are still out; nobody needs to be running for the round to go on. */
+function waitingOnPull(rd: Round): boolean {
+  return (
+    !rd.finished_at &&
+    rd.reviewers.some((x) => x.adapter === "pull" && (x.status === "waiting" || x.status === "running")) &&
+    rd.reviewers.every((x) => x.adapter === "pull" || x.status === "done" || x.status === "failed")
+  );
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+export interface PendingWork {
+  review_id: string;
+  round: number;
+  reviewer: string;
+  status: "waiting" | "claimed";
+  claimed_by: string | null;
+  deadline: string | null;
+  rubric: string;
+  intent: string;
+  stage: string;
+  artifact: string;
+  submitted_at: string;
+}
+
+export interface ClaimedWork {
+  review_id: string;
+  round: number;
+  reviewer: string;
+  /** Pass it to review_post. */
+  token: string;
+  deadline: string | null;
+  round_dir: string;
+  /** The work: the document as Markdown or the change, the project copy, screenshots, related documents. */
+  files: string[];
+  prompt: string;
+  output_schema: Record<string, unknown>;
+}
 
 
 export class Engine {
@@ -39,7 +98,7 @@ export class Engine {
   }
 
   async submit(req: ReviewRequest, author: AuthorInfo, waitSeconds = 0): Promise<Review> {
-    const rubric = loadRubric(req.rubric, this.config.rubric_paths);
+    const rubric = loadRubric(req.rubric, this.config.rubric_paths, this.config.rubric_packs);
     // Approvals as they are on disk now: a session may have started before one was revoked.
     const allowed = this.allowedReviewers(req.rubric, rubric.meta, this.currentConfig());
     const { specs, notes } = this.pickReviewers(req.reviewers, author, allowed);
@@ -59,13 +118,67 @@ export class Engine {
       rounds: [],
       history: [{ at: t, event: "submitted", detail: `${describeArtifact(req)} with rubric ${req.rubric}` }],
     };
-    await this.startRound(review, runs, true);
+    if (req.pages.length) {
+      // Rendering pages can take longer than a client waits for a tool call: save the review first
+      // and take the snapshot in the background. A snapshot that fails within
+      // snapshot_wait_seconds is an error on submit as before (nothing is kept); after that the
+      // caller gets the review id, and a later snapshot error shows as a failed review.
+      req.pages.forEach(checkPageUrl);
+      if (req.artifact?.path && req.artifact.git) throw new Error("Give either a document path or a git change, not both.");
+      review.preparing = { pid: process.pid, host: os.hostname(), started_at: t };
+      this.store.withLock(id, () => this.store.save(review));
+      const outcome: Promise<unknown> = this.startRound(review, runs, "prepared").then(
+        () => null,
+        (err: unknown) => err ?? new Error("snapshot failed"),
+      );
+      // Waiters get a promise that settles when the round (not just the snapshot) is over.
+      const tracked: Promise<void> = outcome
+        .then(() => (this.running.get(id) !== tracked ? this.running.get(id) : undefined))
+        .finally(() => {
+          if (this.running.get(id) === tracked) this.running.delete(id);
+        });
+      this.running.set(id, tracked);
+      const TIMEOUT = Symbol("timeout");
+      let timer: NodeJS.Timeout | undefined;
+      const first = await Promise.race([outcome, new Promise((r) => (timer = setTimeout(r, this.config.snapshot_wait_seconds * 1000, TIMEOUT)))]);
+      clearTimeout(timer);
+      if (first === TIMEOUT) {
+        void outcome.then((err) => err && this.recordPrepareError(id, err));
+      } else if (first) {
+        await tracked;
+        rmSync(this.store.dir(id), { recursive: true, force: true });
+        throw first;
+      }
+    } else {
+      await this.startRound(review, runs, "new");
+    }
     if (waitSeconds > 0) await this.waitFor(id, waitSeconds);
     return this.get(id);
   }
 
-  /** Snapshots the artifact as round n+1, saves, and runs the reviewers in the background. */
-  private async startRound(review: Review, runs: ReviewerRun[], isNew: boolean): Promise<void> {
+  /** The background snapshot of a new review failed: the review fails with the reason. */
+  private recordPrepareError(id: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      this.store.update(id, (r) => {
+        r.preparing = null;
+        if (r.state !== "submitted") return; // canceled meanwhile
+        r.state = "failed";
+        r.history.push({ at: now(), event: "failed", detail: `snapshot: ${message}` });
+        r.notes.push(`The snapshot failed: ${message}`);
+      });
+    } catch (e) {
+      console.error(`review-bus: snapshot of ${id} failed (${message}) and could not be recorded: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Snapshots the artifact as round n+1, saves, and runs the reviewers in the background.
+   * mode "new": the review is saved here for the first time; "prepared": it was saved already (state
+   * submitted, snapshot taken in the background); "resubmit": the next round of an answered review.
+   */
+  private async startRound(review: Review, runs: ReviewerRun[], mode: "new" | "prepared" | "resubmit"): Promise<void> {
+    const isNew = mode === "new";
     const n = review.rounds.length + 1;
     const t = now();
     // Each attempt builds its round in a private staging folder (relative paths stay r<n>/...).
@@ -108,12 +221,14 @@ export class Engine {
         });
       } else {
         // Another process may have changed the review while the snapshot was taken.
+        const expected: ReviewState[] = mode === "prepared" ? ["submitted"] : RESUBMITTABLE;
         this.store.update(review.id, (r) => {
-          if (r.rounds.length !== n - 1 || !RESUBMITTABLE.includes(r.state)) {
+          if (r.rounds.length !== n - 1 || !expected.includes(r.state)) {
             throw new Error(`Review ${review.id} changed while round ${n} was being prepared (now ${r.state}, round ${r.rounds.length}). Nothing was started.`);
           }
           publish();
           addRound(r);
+          r.preparing = null;
         });
       }
     } finally {
@@ -147,6 +262,7 @@ export class Engine {
     let closeRefused: string | null = null;
     // Answers, checks and (without resubmit) closing happen in one locked step.
     const review = this.store.update(id, (r) => {
+      if (r.state === "submitted") throw new Error(`Review ${id} is still being prepared (taking the snapshot). Wait for the result first.`);
       const round = r.rounds.at(-1)!;
       if (r.state === "in_review") throw new Error(`Review ${id} is still in review (round ${round.n}). Wait for the result first.`);
       if (r.state === "canceled") throw new Error(`Review ${id} is canceled.`);
@@ -192,7 +308,7 @@ export class Engine {
     if (!RESUBMITTABLE.includes(review.state)) throw new Error(`Review ${id} is ${review.state}; submit a new review instead of resubmitting.`);
     if (unanswered.length) throw new Error(`Answer every blocking finding before resubmitting. Unanswered: ${unanswered.join(", ")}.`);
     if (round.n >= this.config.policy.max_rounds) throw new Error(`Review ${id} has used all ${this.config.policy.max_rounds} rounds.`);
-    const rubric = loadRubric(review.request.rubric, this.config.rubric_paths);
+    const rubric = loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs);
     // Approvals can change between rounds: check the reviewers against the config on disk now (SPEC 9).
     const current = this.currentConfig();
     const allowed = this.allowedReviewers(review.request.rubric, rubric.meta, current);
@@ -208,7 +324,7 @@ export class Engine {
       if (!review.request.artifact?.path) throw new Error("artifact can only be changed for document reviews; git changes and pages are captured again on resubmit.");
       review.request.artifact = { path: opts.artifact };
     }
-    await this.startRound(review, runs, false);
+    await this.startRound(review, runs, "resubmit");
     if (opts.waitSeconds) await this.waitFor(id, opts.waitSeconds);
     return { review: this.get(id), unanswered: [] };
   }
@@ -261,7 +377,8 @@ export class Engine {
    * A rubric marked `confidential: true` refuses to run until config lists its reviewers.
    */
   private allowedReviewers(rubricName: string, meta: Record<string, unknown>, config: Config = this.config): string[] | null {
-    const list = config.allowed_reviewers[rubricName];
+    // A pack's rubric ("client/contract-b2b") falls back to the approvals for its base name.
+    const list = config.allowed_reviewers[rubricName] ?? config.allowed_reviewers[baseName(rubricName)];
     if (list) return list;
     if (meta.confidential === true) {
       throw new Error(
@@ -368,7 +485,8 @@ export class Engine {
     if (!job) {
       // Running in another process: poll the stored state.
       const until = Date.now() + seconds * 1000;
-      while (Date.now() < until && this.get(id).state === "in_review") await new Promise((r) => setTimeout(r, 500));
+      // Stops early when only pull reviewers are left: a person may answer tomorrow.
+      while (Date.now() < until && isActive(this.get(id).state) && !onlyPullLeft(this.get(id))) await new Promise((r) => setTimeout(r, 500));
       return;
     }
     let timer: NodeJS.Timeout | undefined;
@@ -379,12 +497,20 @@ export class Engine {
   /** Loads a review. A round left in_review with no job in this process was cut off by a restart. */
   get(id: string): Review {
     const review = this.store.load(id);
-    const cutOff = (r: Review) => r.state === "in_review" && !this.running.has(id) && !this.runningElsewhere(r);
-    if (!cutOff(review)) return review;
+    const cutOff = (r: Review) => {
+      if (this.running.has(id)) return false;
+      if (r.state === "submitted") return !this.runningElsewhere(r.preparing);
+      if (r.state !== "in_review") return false;
+      const rd = r.rounds.at(-1);
+      return !rd || (!this.runningElsewhere(rd.runner) && !this.runningElsewhere(rd.finalizing) && !waitingOnPull(rd));
+    };
+    if (!cutOff(review)) return this.expirePull(review);
     return this.store.update(id, (r) => {
       if (!cutOff(r)) return; // changed meanwhile
+      const preparing = r.state === "submitted";
       r.state = "failed";
-      r.history.push({ at: now(), event: "failed", detail: "round was running when the server stopped" });
+      r.preparing = null;
+      r.history.push({ at: now(), event: "failed", detail: preparing ? "the snapshot was being taken when the server stopped" : "round was running when the server stopped" });
     });
   }
 
@@ -393,12 +519,10 @@ export class Engine {
    * latest round. A round older than the longest reviewer timeout plus 10 minutes counts as dead,
    * in case the process id was reused.
    */
-  private runningElsewhere(review: Review): boolean {
-    const round = review.rounds.at(-1);
-    const runner = round?.runner;
-    if (!round || !runner || runner.pid === process.pid) return false;
+  private runningElsewhere(runner: { pid: number; host: string; started_at: string } | null | undefined): boolean {
+    if (!runner || runner.pid === process.pid) return false;
     if (runner.host !== os.hostname()) return true; // shared storage on another machine: cannot check
-    const maxTimeout = Math.max(600, ...Object.values(this.config.adapters).map((a) => a.timeout_seconds));
+    const maxTimeout = Math.max(600, ...Object.values(this.config.adapters).filter((a) => a.type !== "pull").map((a) => a.timeout_seconds));
     if (Date.now() - Date.parse(runner.started_at) > (maxTimeout + 600) * 1000) return false;
     try {
       process.kill(runner.pid, 0); // signal 0 only checks that the process exists
@@ -421,7 +545,7 @@ export class Engine {
     const round = review.rounds.find((r) => r.n === n)!;
     const reviewDir = this.store.dir(id);
     const roundDir = this.store.roundDir(id, n);
-    const rubric = loadRubric(review.request.rubric, this.config.rubric_paths);
+    const rubric = loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs);
     const snap = round.snapshot;
     const text = snap.markdown_file ? readFileSync(path.join(reviewDir, snap.markdown_file), "utf8") : null;
     const images = screenshotFiles(snap).map((f) => path.join(reviewDir, f));
@@ -474,47 +598,88 @@ export class Engine {
       const message = (err as Error).message;
       dispatchError = () => message;
     }
-    const results = await Promise.all(
-      round.reviewers.map(async (run) => {
-        run.status = "running";
-        run.started_at = now();
-        this.saveRun(id, n, run);
-        try {
-          const refused = dispatchError(run.name);
-          if (refused) throw new Error(refused);
-          const res = await runAdapter(adapterFor(run.name)!, {
-            reviewerName: run.name,
-            prompt,
-            cwd: roundDir,
-            outDir: roundDir,
-            images,
-            model: run.model_requested,
-            effort: run.effort_requested,
-            signal,
-          });
-          writeFileSync(path.join(roundDir, `${run.name}.json`), JSON.stringify(res.output, null, 2));
-          // Record what actually ran when the CLI reports it (SPEC 8a).
-          if (res.reportedModel) Object.assign(run, { model: res.reportedModel, model_reported: true });
-          if (res.reportedEffort) Object.assign(run, { effort: res.reportedEffort, effort_reported: true });
-          run.label = reviewerLabel(run.name, run.model, run.effort);
-          run.status = "done";
-          run.verdict = res.output.verdict;
-          run.summary = res.output.summary;
-          return { run, output: res.output };
-        } catch (err) {
-          run.status = "failed";
-          run.error = signal.aborted ? "canceled" : err instanceof Error ? err.message : String(err);
-          return { run, output: null };
-        } finally {
-          run.finished_at = now();
+    // Pull reviewers are not started: they wait until someone claims the work (review_claim).
+    for (const run of round.reviewers.filter((r) => r.adapter === "pull")) {
+      const refused = dispatchError(run.name);
+      Object.assign(run, refused ? { status: "failed", error: refused, finished_at: now() } : { status: "waiting", deadline: this.pullDeadline(run.name) });
+      this.saveRun(id, n, run);
+    }
+    await Promise.all(
+      round.reviewers
+        .filter((r) => r.adapter !== "pull")
+        .map(async (run) => {
+          run.status = "running";
+          run.started_at = now();
           this.saveRun(id, n, run);
-        }
-      }),
+          try {
+            const refused = dispatchError(run.name);
+            if (refused) throw new Error(refused);
+            const res = await runAdapter(adapterFor(run.name)!, {
+              reviewerName: run.name,
+              prompt,
+              cwd: roundDir,
+              outDir: roundDir,
+              images,
+              git: round.snapshot.git
+                ? { tree: path.join(this.store.dir(id), round.snapshot.git.tree_dir), patch: path.join(this.store.dir(id), round.snapshot.git.patch_file) }
+                : undefined,
+              model: run.model_requested,
+              effort: run.effort_requested,
+              signal,
+            });
+            writeFileSync(path.join(roundDir, `${run.name}.json`), JSON.stringify(res.output, null, 2));
+            // Record what actually ran when the CLI reports it (SPEC 8a).
+            if (res.reportedModel) Object.assign(run, { model: res.reportedModel, model_reported: true });
+            if (res.reportedEffort) Object.assign(run, { effort: res.reportedEffort, effort_reported: true });
+            run.label = reviewerLabel(run.name, run.model, run.effort);
+            run.status = "done";
+            run.verdict = res.output.verdict;
+            run.summary = res.output.summary;
+          } catch (err) {
+            run.status = "failed";
+            run.error = signal.aborted ? "canceled" : err instanceof Error ? err.message : String(err);
+          } finally {
+            run.finished_at = now();
+            this.saveRun(id, n, run);
+          }
+        }),
     );
+    if (this.claimFinalize(id, n)) await this.finalize(id, n, signal);
+  }
 
+  /** When a pull reviewer must answer by. */
+  private pullDeadline(name: string): string {
+    const seconds = this.config.adapters[name]?.timeout_seconds ?? 86400;
+    return new Date(Date.now() + seconds * 1000).toISOString();
+  }
+
+  /**
+   * True when every reviewer of round n has finished and this process may finish the round: it
+   * records itself as the finisher under the lock, so only one process merges and decides.
+   */
+  private claimFinalize(id: string, n: number): boolean {
+    let mine = false;
+    this.store.update(id, (r) => {
+      const rd = r.rounds.find((x) => x.n === n);
+      if (!rd || rd.finished_at || !roundSettled(rd)) return;
+      if (rd.finalizing && rd.finalizing.pid !== process.pid && this.runningElsewhere(rd.finalizing)) return;
+      rd.finalizing = { pid: process.pid, host: os.hostname(), started_at: now() };
+      mine = true;
+    });
+    return mine;
+  }
+
+  /** Merges the finished reviewers' findings, applies the policy and sets the review state. */
+  private async finalize(id: string, n: number, signal: AbortSignal): Promise<void> {
+    const review = this.store.load(id);
+    const round = review.rounds.find((r) => r.n === n)!;
+    const roundDir = this.store.roundDir(id, n);
+    const outputs = round.reviewers
+      .filter((run) => run.status === "done")
+      .map((run) => ({ run, output: ReviewerOutput.parse(JSON.parse(readFileSync(path.join(roundDir, `${run.name}.json`), "utf8"))) }));
     // Merge the same finding from several reviewers before the policy decides what blocks.
     // This awaits a model, so it happens before the final reload below (a cancel may land meanwhile).
-    const raised = results.flatMap(({ run, output }) => (output ? output.findings.map((finding) => ({ finding, reviewer: run.label })) : []));
+    const raised = outputs.flatMap(({ run, output }) => output.findings.map((finding) => ({ finding, reviewer: run.label })));
     const policy: PolicyOptions = {
       stage: review.request.stage,
       max_blocking: this.config.policy.max_blocking,
@@ -538,11 +703,11 @@ export class Engine {
     // Apply the results to the latest stored state, under the lock.
     this.store.update(id, (fresh) => {
       const freshRound = fresh.rounds.find((r) => r.n === n);
-      if (!freshRound) return;
-      freshRound.reviewers = round.reviewers;
+      if (!freshRound || freshRound.finished_at) return;
       freshRound.findings = findings;
       freshRound.merge = merge;
       freshRound.finished_at = now();
+      freshRound.finalizing = null;
       // Canceled meanwhile, or a newer round started (after a restart marked this one failed):
       // keep this round's results but leave the review state alone.
       if (fresh.state !== "in_review" || fresh.rounds.at(-1)!.n !== n) return;
@@ -557,6 +722,183 @@ export class Engine {
         detail: `round ${n}: ${findings.filter((f) => f.blocking).length} blocking, ${findings.filter((f) => !f.blocking).length} advisory${failed.length ? `, failed: ${failed.join(", ")}` : ""}, state ${fresh.state}`,
       });
     });
+  }
+
+  /** Runs finalize in the background, tracked like a round so waiters see it. */
+  private finalizeInBackground(id: string, n: number): void {
+    if (this.running.has(id)) return;
+    const abort = new AbortController();
+    this.aborts.set(id, abort);
+    const job = this.finalize(id, n, abort.signal)
+      .catch((err) => this.recordRoundError(id, n, err, abort))
+      .finally(() => {
+        this.running.delete(id);
+        this.aborts.delete(id);
+      });
+    this.running.set(id, job);
+  }
+
+  // ---- Pull reviewers (SPEC 8b): people or agents that fetch the work and post their answer. ----
+
+  /** Pull reviewer work waiting for an answer, oldest first. */
+  pending(reviewer?: string): PendingWork[] {
+    const out: PendingWork[] = [];
+    for (const r of this.list("in_review", 1000)) {
+      const round = r.rounds.at(-1);
+      if (!round) continue;
+      for (const run of round.reviewers) {
+        if (run.adapter !== "pull" || (run.status !== "waiting" && run.status !== "running")) continue;
+        if (reviewer && run.name !== reviewer) continue;
+        out.push({
+          review_id: r.id,
+          round: round.n,
+          reviewer: run.name,
+          status: run.status === "waiting" ? "waiting" : "claimed",
+          claimed_by: run.claim?.by ?? null,
+          deadline: run.deadline ?? null,
+          rubric: r.request.rubric,
+          intent: r.request.intent,
+          stage: r.request.stage,
+          artifact: describeArtifact(r.request),
+          submitted_at: r.created_at,
+        });
+      }
+    }
+    return out.reverse();
+  }
+
+  /**
+   * Claims a pull reviewer's work: returns the reviewer prompt, the files and the answer schema,
+   * plus a token for review_post. Approvals are checked against the config on disk now, and a
+   * reviewer with claim_clients only accepts those MCP clients.
+   */
+  claim(id: string, reviewer: string, who: { by: string; client: string | null }): ClaimedWork {
+    if (!who.by.trim()) throw new Error("Claiming needs a name in by (the person or agent doing the review).");
+    const current = this.currentConfig();
+    const adapter = current.adapters[reviewer];
+    if (!adapter || adapter.type !== "pull") throw new Error(`"${reviewer}" is not a pull reviewer in the config.`);
+    if (adapter.claim_clients.length && !adapter.claim_clients.includes(who.client ?? "")) {
+      throw new Error(`Reviewer "${reviewer}" accepts claims only from ${adapter.claim_clients.join(", ")} (this client: ${who.client ?? "unknown"}).`);
+    }
+    this.get(id);
+    const token = randomBytes(16).toString("hex");
+    let n = 0;
+    const review = this.store.update(id, (r) => {
+      if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; there is nothing to claim.`);
+      const round = r.rounds.at(-1)!;
+      const run = round.reviewers.find((x) => x.name === reviewer);
+      if (!run || run.adapter !== "pull") throw new Error(`Review ${id} round ${round.n} has no pull reviewer "${reviewer}".`);
+      if (run.status !== "waiting") throw new Error(`Reviewer "${reviewer}" of review ${id} is ${run.status === "running" ? `already claimed by ${run.claim?.by}` : run.status}.`);
+      const allowed = this.allowedReviewers(r.request.rubric, r.rubric_meta, current);
+      if (allowed && !allowed.includes(reviewer)) throw new Error(`Reviewer "${reviewer}" is no longer approved for ${r.request.rubric}. Nothing was sent.`);
+      run.status = "running";
+      run.started_at = now();
+      run.claim = { by: who.by.trim(), client: who.client, at: now(), token };
+      r.history.push({ at: now(), event: "claimed", detail: `${reviewer} by ${who.by.trim()}${who.client ? ` (${who.client})` : ""}` });
+      n = round.n;
+    });
+    const round = review.rounds.find((x) => x.n === n)!;
+    const dir = this.store.dir(id);
+    const files = [
+      round.snapshot.markdown_file,
+      round.snapshot.git?.tree_dir,
+      ...screenshotFiles(round.snapshot),
+      ...(round.snapshot.related ?? []).map((x) => x.markdown_file),
+    ].filter((f): f is string => Boolean(f));
+    return {
+      review_id: id,
+      round: n,
+      reviewer,
+      token,
+      deadline: round.reviewers.find((x) => x.name === reviewer)!.deadline ?? null,
+      round_dir: this.store.roundDir(id, n),
+      files: files.map((f) => path.join(dir, f)),
+      prompt: readFileSync(path.join(this.store.roundDir(id, n), "prompt.md"), "utf8"),
+      output_schema: reviewerOutputJsonSchema(),
+    };
+  }
+
+  /**
+   * A pull reviewer's answer: reviewer output JSON (the same shape headless reviewers return), or a
+   * decline with a reason. The last answer of a round finishes it (merge, policy, state).
+   */
+  async post(
+    id: string,
+    reviewer: string,
+    token: string,
+    answer: { output?: unknown; decline?: string; model?: string | null },
+  ): Promise<Review> {
+    let output: ReviewerOutput | null = null;
+    if (!answer.decline) {
+      const parsed = ReviewerOutput.safeParse(answer.output);
+      if (!parsed.success) {
+        throw new Error(`The answer does not match the reviewer output schema: ${parsed.error.issues.slice(0, 5).map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
+      }
+      output = parsed.data;
+    }
+    let n = 0;
+    let finish = false;
+    this.store.update(id, (r) => {
+      if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; the answer was not recorded.`);
+      const round = r.rounds.at(-1)!;
+      const run = round.reviewers.find((x) => x.name === reviewer);
+      if (!run || run.adapter !== "pull") throw new Error(`Review ${id} round ${round.n} has no pull reviewer "${reviewer}".`);
+      if (run.status !== "running" || !run.claim || !safeEqual(run.claim.token, token)) {
+        throw new Error(`No claim of "${reviewer}" on review ${id} round ${round.n} matches this token. Claim it first (review_claim).`);
+      }
+      n = round.n;
+      const t = now();
+      if (output) {
+        writeFileSync(path.join(this.store.roundDir(id, n), `${reviewer}.json`), JSON.stringify(output, null, 2));
+        const model = answer.model?.trim() || null;
+        Object.assign(run, {
+          status: "done",
+          verdict: output.verdict,
+          summary: output.summary,
+          ...(model ? { model, model_reported: true } : {}),
+        });
+        run.label = reviewerLabel(run.name, run.model, run.effort);
+      } else {
+        Object.assign(run, { status: "failed", error: `declined by ${run.claim.by}: ${answer.decline}` });
+      }
+      run.finished_at = t;
+      r.history.push({ at: t, event: output ? "posted" : "declined", detail: `${reviewer} by ${run.claim.by}` });
+      if (roundSettled(round) && !round.finished_at) {
+        round.finalizing = { pid: process.pid, host: os.hostname(), started_at: t };
+        finish = true;
+      }
+    });
+    if (finish) {
+      // Tracked like a round, so this process does not mistake its own finishing for a cut-off round.
+      this.finalizeInBackground(id, n);
+      await this.running.get(id);
+    }
+    return this.get(id);
+  }
+
+  /** Marks pull reviewers that missed their deadline as failed; finishes the round if that was the last one. */
+  private expirePull(review: Review): Review {
+    const round = review.rounds.at(-1);
+    const late = (r: Review) =>
+      r.state === "in_review" &&
+      (r.rounds.at(-1)?.reviewers ?? []).some((x) => x.adapter === "pull" && (x.status === "waiting" || x.status === "running") && x.deadline && Date.parse(x.deadline) < Date.now());
+    if (!round || !late(review)) return review;
+    let finish = false;
+    const updated = this.store.update(review.id, (r) => {
+      if (!late(r)) return;
+      const rd = r.rounds.at(-1)!;
+      for (const x of rd.reviewers) {
+        if (x.adapter === "pull" && (x.status === "waiting" || x.status === "running") && x.deadline && Date.parse(x.deadline) < Date.now()) {
+          Object.assign(x, { status: "failed", error: `no answer by the deadline (${x.deadline})`, finished_at: now() });
+        }
+      }
+      if (roundSettled(rd) && !rd.finished_at && !(rd.finalizing && this.runningElsewhere(rd.finalizing))) {
+        rd.finalizing = { pid: process.pid, host: os.hostname(), started_at: now() };
+        finish = true;
+      }
+    });
+    if (finish) this.finalizeInBackground(review.id, round.n);
+    return updated;
   }
 
   private recordRoundError(id: string, n: number, err: unknown, abort: AbortController): void {

@@ -6,7 +6,7 @@ export const Effort = z.enum(["low", "medium", "high", "xhigh", "max", "ultra"])
 export type Effort = z.infer<typeof Effort>;
 export const Vendor = z.enum(["anthropic", "openai", "other"]);
 export type Vendor = z.infer<typeof Vendor>;
-export type AdapterType = "command" | "codex" | "claude";
+export type AdapterType = "command" | "codex" | "codex-review" | "claude" | "pull";
 
 export type SettingSource = "call" | "rubric" | "stage" | "config" | "cli_default";
 
@@ -18,7 +18,7 @@ export const ReviewerSpec = z.object({
 });
 export type ReviewerSpec = z.infer<typeof ReviewerSpec>;
 
-export const DEFAULT_VENDOR: Record<AdapterType, Vendor> = { claude: "anthropic", codex: "openai", command: "other" };
+export const DEFAULT_VENDOR: Record<AdapterType, Vendor> = { claude: "anthropic", codex: "openai", "codex-review": "openai", command: "other", pull: "other" };
 
 const STAGE_EFFORT: Partial<Record<Stage, Effort>> = { release: "high", draft: "medium" };
 
@@ -60,7 +60,7 @@ export function resolveModelEffort(
 
 /** Throws if the adapter's CLI does not accept this effort. `ultra` exists on Codex only. */
 export function checkEffort(type: AdapterType, effort: Effort | null, reviewer: string): void {
-  if (effort === "ultra" && type !== "codex") {
+  if (effort === "ultra" && type !== "codex" && type !== "codex-review") {
     throw new Error(`Reviewer "${reviewer}" (${type}) does not support effort "ultra". Use low, medium, high, xhigh or max.`);
   }
 }

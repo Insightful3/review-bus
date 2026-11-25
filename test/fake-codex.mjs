@@ -14,6 +14,23 @@ const fail = (msg) => {
 };
 
 if (args[0] !== "exec") fail("expected exec subcommand");
+if (args[1] === "review") {
+  // codex exec review --uncommitted: needs a git repo whose change is uncommitted; answers in text.
+  if (!args.includes("--uncommitted")) fail("expected --uncommitted");
+  if (args.includes("-") || args.includes("--output-schema") || args.includes("--cd")) fail("review takes no prompt, schema or --cd");
+  const cv = args.filter((x, i) => args[i - 1] === "-c");
+  if (!cv.some((x) => x.startsWith("permissions.review-bus.filesystem=")) || !cv.includes('default_permissions="review-bus"')) fail("review needs the read profile");
+  for (const flag of ["--ephemeral", "--ignore-user-config"]) if (!args.includes(flag)) fail(`missing ${flag}`);
+  const out = args[args.indexOf("--output-last-message") + 1];
+  const { execFileSync } = await import("node:child_process");
+  const status = execFileSync("git", ["status", "--porcelain"], { cwd: process.cwd() }).toString();
+  const log = execFileSync("git", ["log", "--oneline"], { cwd: process.cwd() }).toString();
+  if (!status.trim()) fail("no uncommitted change in the review copy");
+  if (log.trim().split("\n").length !== 1) fail("expected exactly one base commit");
+  console.error(`model: ${args[args.indexOf("-m") + 1] ?? "fake-default-model"}\nreasoning effort: medium`);
+  writeFileSync(out, `The change has a problem.\n\nFull review comments:\n\n- [P1] Fake native finding (${status.trim().split("\n").length} changed) — ${process.cwd()}/index.html:1-1\n  Fake explanation.\n`);
+  process.exit(0);
+}
 // Read-restricted profile instead of --sandbox (the two do not combine in Codex).
 if (args.includes("--sandbox")) fail("--sandbox must not be passed with a permission profile");
 const cValues = args.filter((x, i) => args[i - 1] === "-c");
@@ -45,7 +62,7 @@ let prompt = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
-  if (!["<document>", "<diff>", "## Rendered pages"].some((m) => prompt.includes(m))) fail("prompt has no document, diff or pages");
+  if (!["<document>", "<diff>", "## Rendered pages", "<review>"].some((m) => prompt.includes(m))) fail("prompt has no document, diff, pages or review text");
   const images = args.filter((a) => a.startsWith("--image=")).map((a) => a.slice(8));
   for (const img of images) if (!existsSync(img)) fail(`image not found: ${img}`);
   writeFileSync(

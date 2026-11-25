@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { cpSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import type { AdapterConfig } from "../config.js";
 import { ReviewerOutput, reviewerOutputJsonSchema } from "../spec/reviewer-output.js";
@@ -20,6 +21,8 @@ export interface ReviewJob {
   schema?: Record<string, unknown>;
   /** Claude only: "read" (Read, Grep, Glob) for reviews, "none" for tasks that need no files. */
   tools?: "read" | "none";
+  /** Git rounds: the reviewers' copy of the project and the patch (absolute paths). Needed by codex-review. */
+  git?: { tree: string; patch: string };
 }
 
 /** The CLI's JSON answer before validation, plus what it reported about itself. */
@@ -86,36 +89,16 @@ async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> 
   writeFileSync(schemaFile, JSON.stringify(job.schema ?? reviewerOutputJsonSchema(), null, 2));
   const args = [
     "exec",
-    // Read-only AND read-restricted: a permission profile instead of --sandbox read-only (the two do
-    // not combine). Codex's shell may read the round folder (its --cd, the workspace root) and the
-    // platform paths common tools need; everything else is denied, including the rest of the home
-    // folder, other reviews, Codex's own auth.json and the temp folders. Nothing is writable.
-    // Checked on codex-cli 0.172.0 with canary files (permission profiles are beta in Codex).
-    "-c",
-    CODEX_READ_PROFILE,
-    "-c",
-    'default_permissions="review-bus"',
-    "--skip-git-repo-check",
-    "--ephemeral",
+    ...codexIsolation(),
     "--color",
     "never",
-    // Isolation (checked on codex-cli 0.172.0): without these a reviewer inherits the user's
-    // MCP servers (some can run code or control the computer), ChatGPT apps, plugins, hooks,
-    // browser and computer use, and web access, none of which the read-only sandbox covers.
-    // Login still works: auth lives in CODEX_HOME, not in config.toml.
-    "--ignore-user-config",
-    ...["apps", "plugins", "remote_plugin", "computer_use", "browser_use", "browser_use_external", "hooks", "image_generation"].flatMap((f) => ["--disable", f]),
-    "-c",
-    'web_search="disabled"',
     "--cd",
     job.cwd,
     "--output-schema",
     schemaFile,
     "--output-last-message",
     outFile,
-    ...(job.model ? ["-m", job.model] : []),
-    // Codex has no effort flag; this is the config key ~/.codex/config.toml uses.
-    ...(job.effort ? ["-c", `model_reasoning_effort="${job.effort}"`] : []),
+    ...codexModelArgs(job),
     // --image=<file> form: the flag takes several values, so the bare form would swallow the final "-".
     ...(job.images ?? []).map((f) => `--image=${f}`),
     ...cfg.args,
@@ -129,13 +112,120 @@ async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> 
   });
   writeFileSync(path.join(job.outDir, `${job.reviewerName}.log.txt`), `${r.stdout}\n--- stderr ---\n${r.stderr}`);
   if (r.code !== 0 || r.timedOut) throw new Error(describeFailure("codex exec", r));
-  // Codex prints its session header ("model: ...", "reasoning effort: ...") in its log output.
-  const log = `${r.stderr}\n${r.stdout}`;
   return {
     json: parseJson(readFileSync(outFile, "utf8"), "codex exec"),
+    ...codexReported(`${r.stderr}\n${r.stdout}`),
+  };
+}
+
+/** Model and effort flags for codex exec and codex exec review. */
+function codexModelArgs(job: ReviewJob): string[] {
+  return [
+    ...(job.model ? ["-m", job.model] : []),
+    // Codex has no effort flag; this is the config key ~/.codex/config.toml uses.
+    ...(job.effort ? ["-c", `model_reasoning_effort="${job.effort}"`] : []),
+  ];
+}
+
+/** Codex prints its session header ("model: ...", "reasoning effort: ...") in its log output. */
+function codexReported(log: string): { reportedModel: string | null; reportedEffort: string | null } {
+  return {
     reportedModel: log.match(/^model:\s*(\S+)/m)?.[1] ?? null,
     reportedEffort: log.match(/^reasoning effort:\s*(\S+)/m)?.[1] ?? null,
   };
+}
+
+/** Flags that keep a Codex reviewer read-only, read-restricted and isolated from the user's setup. */
+function codexIsolation(): string[] {
+  return [
+    // Read-only AND read-restricted: a permission profile instead of --sandbox read-only (the two do
+    // not combine). Codex's shell may read the round folder (its --cd, the workspace root) and the
+    // platform paths common tools need; everything else is denied, including the rest of the home
+    // folder, other reviews, Codex's own auth.json and the temp folders. Nothing is writable.
+    // Checked on codex-cli 0.172.0 with canary files (permission profiles are beta in Codex).
+    "-c",
+    CODEX_READ_PROFILE,
+    "-c",
+    'default_permissions="review-bus"',
+    "--skip-git-repo-check",
+    "--ephemeral",
+    // Isolation (checked on codex-cli 0.172.0): without these a reviewer inherits the user's
+    // MCP servers (some can run code or control the computer), ChatGPT apps, plugins, hooks,
+    // browser and computer use, and web access, none of which the read-only sandbox covers.
+    // Login still works: auth lives in CODEX_HOME, not in config.toml.
+    "--ignore-user-config",
+    ...["apps", "plugins", "remote_plugin", "computer_use", "browser_use", "browser_use_external", "hooks", "image_generation"].flatMap((f) => ["--disable", f]),
+    "-c",
+    'web_search="disabled"',
+  ];
+}
+
+/** Git with the user's and system config ignored, for the scratch repo codex-review works in. */
+function scratchGit(cwd: string, args: string[], input?: Buffer): void {
+  const r = spawnSync(
+    "git",
+    [
+      "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false",
+      "-c", "user.name=review-bus", "-c", "user.email=review-bus@localhost", "-c", "init.defaultBranch=main",
+      ...args,
+    ],
+    { cwd, input, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, maxBuffer: 64 * 1024 * 1024 },
+  );
+  if (r.status !== 0) throw new Error(`git ${args[0]} in the codex-review copy failed: ${r.stderr.toString().trim().split("\n")[0]}`);
+}
+
+/** Codex's native review priorities, mapped onto the impact scale. */
+const CONVERT_PROMPT = `You convert a code review into structured findings. Below is the text of a review that Codex's built-in code reviewer wrote about a change.
+
+Rules:
+- One finding per review comment. Do not add findings, drop findings or change their meaning.
+- claim: the comment's title, as a plain sentence.
+- failure_scenario: the concrete situation in which the problem shows, taken from the comment. If the comment gives none, write null.
+- evidence: the comment's explanation.
+- location.path: the file path relative to the project folder (drop everything up to and including the folder named "native"). line_start and line_end from the comment, else null. section null. quote null unless the comment quotes code exactly.
+- impact: [P0] critical, [P1] high, [P2] medium, [P3] low; without a priority, medium.
+- likelihood: likely, unless the comment says the problem always happens (certain) or only in rare cases (possible).
+- suggested_fix: the fix the comment suggests, else null.
+- assumption_challenge: false. confidence: 0.7.
+- verdict: changes_requested when there are findings, else approve. summary: the review's overall summary sentence.
+
+<review>
+`;
+
+/**
+ * Codex's native code review (\`codex exec review --uncommitted\`), off by default (SPEC 8). It needs
+ * a git repo, so the adapter builds one inside the round folder: a copy of the reviewers' tree with
+ * the base committed and the change left uncommitted. Nothing touches the author's repo. Its answer
+ * is text (it ignores --output-schema and takes no prompt together with --uncommitted, checked on
+ * codex-cli 0.172.0), so a second, ordinary codex exec pass converts it into findings.
+ */
+async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
+  if (!job.git) throw new Error("codex-review reviews git changes only; use the codex reviewer for documents and pages.");
+  const native = path.join(job.outDir, `${job.reviewerName}.native`);
+  rmSync(native, { recursive: true, force: true });
+  cpSync(job.git.tree, native, { recursive: true });
+  const patch = readFileSync(job.git.patch);
+  scratchGit(native, ["init", "-q"]);
+  // The project's .gitattributes came along with the copy. info/attributes wins over it: no filters
+  // (their commands would come from the user's config when Codex runs git), no line-ending or
+  // encoding conversion, so the scratch repo's diff is exactly the patch. (--attr-source, used for
+  // the author's repo, crashes git 2.54 in a repo without commits.)
+  writeFileSync(path.join(native, ".git", "info", "attributes"), "* -filter -text -ident -working-tree-encoding\n");
+  if (patch.length) scratchGit(native, ["apply", "-R", "--whitespace=nowarn", "-"], patch);
+  scratchGit(native, ["add", "-A"]);
+  scratchGit(native, ["commit", "-q", "--allow-empty", "-m", "base"]);
+  if (patch.length) scratchGit(native, ["apply", "--whitespace=nowarn", "-"], patch);
+
+  const outFile = path.join(job.outDir, `${job.reviewerName}.native.md`);
+  const args = ["exec", "review", "--uncommitted", ...codexIsolation(), "--output-last-message", outFile, ...codexModelArgs(job), ...cfg.args];
+  const r = await runProcess(cfg.command, args, { cwd: native, stdin: "", timeoutMs: cfg.timeout_seconds * 1000, signal: job.signal });
+  writeFileSync(path.join(job.outDir, `${job.reviewerName}.log.txt`), `${r.stdout}\n--- stderr ---\n${r.stderr}`);
+  if (r.code !== 0 || r.timedOut) throw new Error(describeFailure("codex exec review", r));
+  const text = readFileSync(outFile, "utf8").trim();
+  if (!text) throw new Error("codex exec review returned no review text");
+  const converted = await runCodex(cfg, { ...job, reviewerName: `${job.reviewerName}.convert`, prompt: `${CONVERT_PROMPT}${text}\n</review>\n`, images: [], git: undefined });
+  // The review itself is what ran; the conversion is bookkeeping.
+  return { json: converted.json, ...codexReported(`${r.stderr}\n${r.stdout}`) };
 }
 
 /**
@@ -196,6 +286,10 @@ function runRaw(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
       return runCommand(cfg, job);
     case "codex":
       return runCodex(cfg, job);
+    case "codex-review":
+      return runCodexReview(cfg, job);
+    case "pull":
+      throw new Error("pull reviewers are not run by the server; they claim their work (review_claim)");
     case "claude":
       return runClaude(cfg, job);
   }

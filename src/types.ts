@@ -74,7 +74,11 @@ export interface ReviewerRun {
   effort_source: SettingSource;
   effort_requested: Effort | null;
   label: string; // name:model:effort
-  status: "pending" | "running" | "done" | "failed";
+  /** waiting: a pull reviewer nobody has claimed yet; running: started, or claimed by a pull reviewer. */
+  status: "pending" | "waiting" | "running" | "done" | "failed";
+  /** Pull reviewers: when the answer is due, and who claimed the work (the token authorizes the answer). */
+  deadline?: string;
+  claim?: { by: string; client: string | null; at: string; token: string } | null;
   verdict: string | null;
   summary: string | null;
   error: string | null;
@@ -110,6 +114,8 @@ export interface Round {
   snapshot: Snapshot;
   reviewers: ReviewerRun[];
   findings: Finding[];
+  /** The process merging the findings and deciding the state, once every reviewer has finished. */
+  finalizing?: { pid: number; host: string; started_at: string } | null;
   /** How duplicates across reviewers were merged. */
   merge?: { method: "none" | "rules" | "model"; by: string | null; error: string | null };
 }
@@ -131,6 +137,8 @@ export interface Review {
   /** Shown in the result and report, e.g. same-vendor reviewer, unknown author vendor. */
   notes: string[];
   rubric_meta: Record<string, unknown>;
+  /** Set while the first snapshot is taken in the background (pages can take a minute): the process taking it. */
+  preparing?: { pid: number; host: string; started_at: string } | null;
   rounds: Round[];
   signoff?: { by: string; note: string; at: string; from_state: ReviewState };
   history: HistoryEntry[];

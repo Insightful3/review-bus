@@ -93,9 +93,21 @@ after(async () => {
   await client?.close();
 });
 
-test("seven tools are listed; sign-off is not one of them (people use rb signoff)", async () => {
+test("the tools are listed; sign-off is not one of them (people use rb signoff)", async () => {
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((t) => t.name).sort(), ["review_cancel", "review_list", "review_respond", "review_result", "review_status", "review_submit", "review_wait"]);
+  assert.deepEqual(tools.map((t) => t.name).sort(), [
+    "review_cancel",
+    "review_claim",
+    "review_list",
+    "review_pending",
+    "review_post",
+    "review_respond",
+    "review_result",
+    "review_rubrics",
+    "review_status",
+    "review_submit",
+    "review_wait",
+  ]);
 });
 
 /** A person at the terminal: what rb signoff does. */

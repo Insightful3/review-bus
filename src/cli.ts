@@ -4,11 +4,12 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.js";
-import { Engine } from "./engine.js";
+import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import type { GitSpec } from "./git.js";
 import type { Stage } from "./policy.js";
 import { Effort, type ReviewerSpec } from "./settings.js";
 import { renderSummary } from "./store.js";
+import { checkRubricPath, listRubrics } from "./rubrics.js";
 import type { AuthorInfo, Review, ReviewState } from "./types.js";
 
 const USAGE = `rb: submit work for review by other agents, and answer the findings.
@@ -23,6 +24,12 @@ Usage:
   rb respond <review_id> <finding_id>=<accepted|rejected|deferred>[:note] ... [--resubmit] [--artifact <file>]
   rb signoff <review_id> --by <your name> [--note <text>]
   rb cancel <review_id>
+  rb pending [--reviewer <name>]
+  rb claim <review_id> <reviewer> --by <your name>
+  rb post <review_id> <reviewer> --token <token> (--file <answer.json> | --decline <reason>) [--model <model>]
+  rb rubrics
+  rb rubric-check <folder>
+  rb serve [--port 7777] [--host 127.0.0.1]
 
 Submit options:
   --reviewer <name[:model[:effort]]>   repeatable; default: default_reviewers from config
@@ -32,9 +39,12 @@ Submit options:
   --criterion <text>                   repeatable
   --stage draft|pre-merge|release      default pre-merge
 
-submit and respond --resubmit wait until the reviewers finish (Ctrl-C cancels the review).
+submit and respond --resubmit wait until the reviewers finish (Ctrl-C cancels the review), or
+until only pull reviewers are left (then check back with rb status).
+pending, claim and post are for pull reviewers (type "pull" in config): a person or another agent
+fetches the work and answers with reviewer output JSON (claim prints the prompt and the schema).
 Exit codes: 0 approved or awaiting sign-off, 2 changes requested, escalated or failed, 1 error.
-Config: REVIEW_BUS_CONFIG, else ~/.review-bus/config.json, else ./review-bus.config.json.`;
+Config: REVIEW_BUS_CONFIG, else ~/.review-bus/config.json.`;
 
 /** A person at the terminal: no vendor, so no reviewer is filtered out and no note is added. */
 const PERSON: AuthorInfo = { client: "rb", vendor: null, vendor_source: "person" };
@@ -78,11 +88,11 @@ async function follow(engine: Engine, id: string): Promise<Review> {
   const reported = new Set<string>();
   const t0 = Date.now();
   let review = engine.get(id);
-  console.error(`rb: ${id} round ${review.rounds.length}, reviewers: ${review.rounds.at(-1)!.reviewers.map((r) => r.label).join(", ")}`);
-  while (review.state === "in_review" && !interrupted) {
+  console.error(review.state === "submitted" ? `rb: ${id} taking the snapshot (rendering pages)` : `rb: ${id} round ${review.rounds.length}, reviewers: ${review.rounds.at(-1)!.reviewers.map((r) => r.label).join(", ")}`);
+  while (isActive(review.state) && !interrupted && !onlyPullLeft(review)) {
     await engine.waitFor(id, 5);
     review = engine.get(id);
-    for (const r of review.rounds.at(-1)!.reviewers) {
+    for (const r of review.rounds.at(-1)?.reviewers ?? []) {
       if ((r.status === "done" || r.status === "failed") && !reported.has(r.name)) {
         reported.add(r.name);
         console.error(`rb: ${r.label} ${r.status}${r.error ? `: ${r.error}` : ""} (${Math.round((Date.now() - t0) / 1000)} s)`);
@@ -90,6 +100,10 @@ async function follow(engine: Engine, id: string): Promise<Review> {
     }
   }
   if (interrupted) await new Promise(() => {}); // the Ctrl-C handler exits once reviewers stopped
+  if (onlyPullLeft(review)) {
+    const waiting = review.rounds.at(-1)!.reviewers.filter((r) => r.status === "waiting" || r.status === "running").map((r) => r.name);
+    console.error(`rb: waiting for pull reviewer(s) ${waiting.join(", ")}; check back with rb status ${id}`);
+  }
   process.off("SIGINT", onInt);
   return review;
 }
@@ -122,8 +136,26 @@ async function main() {
       artifact: { type: "string" },
       by: { type: "string" },
       note: { type: "string" },
+      token: { type: "string" },
+      file: { type: "string" },
+      decline: { type: "string" },
+      model: { type: "string" },
+      port: { type: "string" },
+      host: { type: "string" },
     },
   });
+  // Checking a rubric needs no config (a pack author may not have one).
+  if (cmd === "rubric-check") {
+    if (!pos[0]) fail("rubric-check needs a rubric file or a pack folder");
+    let bad = 0;
+    for (const { file, problems } of checkRubricPath(path.resolve(pos[0]))) {
+      console.log(`${problems.length ? "FAIL" : "ok  "}  ${file}`);
+      for (const p of problems) console.log(`      ${p}`);
+      if (problems.length) bad++;
+    }
+    process.exitCode = bad ? 2 : 0;
+    return;
+  }
   const engine = new Engine(loadConfig());
   const id = () => pos[0] ?? fail(`${cmd} needs a review_id`);
 
@@ -208,6 +240,48 @@ async function main() {
     case "cancel": {
       const r = engine.cancel(id());
       console.log(`${r.id}  ${r.state}`);
+      return;
+    }
+    case "rubrics": {
+      for (const r of listRubrics(engine.config.rubric_paths, engine.config.rubric_packs)) {
+        const flags = [r.confidential ? "confidential" : null, r.require_signoff ? "sign-off" : null].filter(Boolean).join(", ");
+        console.log(`${r.name.padEnd(28)} ${flags ? `[${flags}] ` : ""}${r.purpose.slice(0, 100)}`);
+        console.log(`${"".padEnd(28)} ${r.file}`);
+      }
+      return;
+    }
+    case "serve": {
+      const { startHttp } = await import("./http.js");
+      const port = Number(v.port ?? engine.config.http.port);
+      const host = v.host ?? engine.config.http.host;
+      const { url } = await startHttp(engine, { port, host });
+      console.error(`rb: review-bus MCP over HTTP at ${url}mcp, inbox at ${url}inbox (token from ${engine.config.http.token_file})`);
+      await new Promise(() => {}); // until Ctrl-C
+      return;
+    }
+    case "pending": {
+      const work = engine.pending(v.reviewer?.[0]);
+      if (!work.length) console.log("No work waiting for pull reviewers.");
+      for (const w of work) {
+        console.log(`${w.review_id}  r${w.round}  ${w.reviewer.padEnd(12)}  ${w.status === "claimed" ? `claimed by ${w.claimed_by}` : "waiting"}  ${w.rubric}  due ${w.deadline?.slice(0, 16).replace("T", " ") ?? "?"}`);
+        console.log(`  ${w.artifact}: ${w.intent}`);
+      }
+      return;
+    }
+    case "claim": {
+      if (!pos[1]) fail("claim needs <review_id> <reviewer>");
+      if (!v.by) fail("claim needs --by <your name>");
+      const work = engine.claim(id(), pos[1], { by: v.by, client: "rb" });
+      console.log(JSON.stringify(work, null, 2));
+      return;
+    }
+    case "post": {
+      if (!pos[1]) fail("post needs <review_id> <reviewer>");
+      if (!v.token) fail("post needs --token (from rb claim)");
+      if (!v.file === !v.decline) fail("post needs either --file <answer.json> or --decline <reason>");
+      const output = v.file ? JSON.parse(readFileSync(path.resolve(v.file), "utf8")) : undefined;
+      const r = await engine.post(id(), pos[1], v.token, { output, decline: v.decline, model: v.model ?? null });
+      console.log(`${r.id}  ${r.state}  round ${r.rounds.length}`);
       return;
     }
     default:
