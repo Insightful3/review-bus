@@ -6,6 +6,15 @@ import type { ClaimedWork, Engine } from "./engine.js";
 import { describeArtifact } from "./snapshot.js";
 import type { Review } from "./types.js";
 
+/** Times are stored in UTC; shown as "2026-11-25 17:45 UTC". */
+const fmt = (iso: string | null | undefined) => (iso ? `${iso.slice(0, 16).replace("T", " ")} UTC` : "");
+
+/** A document path shown as its file name (the full path is in the title attribute). */
+const shortArtifact = (r: Review) => {
+  const full = describeArtifact(r.request);
+  return { full, short: full.startsWith("/") ? path.basename(full) : full };
+};
+
 const esc = (s: unknown) =>
   String(s ?? "")
     .replaceAll("&", "&amp;")
@@ -23,7 +32,9 @@ main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
 a { color: var(--accent); }
 h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 17px; margin: 28px 0 8px; } h3 { font-size: 15px; margin: 18px 0 6px; }
 .muted { color: var(--muted); }
+.scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); }
+td a { overflow-wrap: anywhere; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { font-weight: 600; color: var(--muted); font-size: 13px; }
 .state { font-size: 12px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); white-space: nowrap; }
@@ -34,13 +45,16 @@ th { font-weight: 600; color: var(--muted); font-size: 13px; }
 .msg { background: var(--card); border-left: 3px solid var(--accent); padding: 8px 12px; }
 .err { border-left-color: var(--bad); }
 label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 2px; }
+label > input, label > textarea, label > select { margin-top: 2px; color: var(--fg); }
+fieldset.finding legend { font-size: 13px; color: var(--muted); padding: 0 4px; }
+details.card summary { cursor: pointer; }
 input[type=text], input[type=password], textarea, select { width: 100%; padding: 6px 8px; font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; }
 textarea { min-height: 60px; }
 button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--bg); cursor: pointer; }
 button.secondary { background: transparent; color: var(--accent); }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 640px) { .row { grid-template-columns: 1fr; } table { font-size: 13px; } }
-.finding { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0; }
+.finding { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0; min-width: 0; }
 img.shot { max-width: 100%; border: 1px solid var(--line); margin: 6px 0; }
 `;
 
@@ -66,12 +80,13 @@ function stateBadge(state: string): string {
 }
 
 function reviewRow(r: Review): string {
-  return `<tr><td><a href="/inbox/review/${esc(r.id)}">${esc(r.id)}</a><div class="muted">${esc(describeArtifact(r.request))}</div></td><td>${esc(r.request.rubric)}</td><td>${stateBadge(r.state)}</td><td>r${r.rounds.length}</td><td class="muted">${esc(r.updated_at.slice(0, 16).replace("T", " "))}</td></tr>`;
+  const a = shortArtifact(r);
+  return `<tr><td><a href="/inbox/review/${esc(r.id)}">${esc(r.id)}</a><div class="muted" title="${esc(a.full)}">${esc(a.short)}</div></td><td>${esc(r.request.rubric)}</td><td>${stateBadge(r.state)}</td><td>r${r.rounds.length}</td><td class="muted">${esc(fmt(r.updated_at))}</td></tr>`;
 }
 
 function table(rows: string[], empty: string): string {
   if (!rows.length) return `<p class="muted">${esc(empty)}</p>`;
-  return `<table><thead><tr><th>Review</th><th>Rubric</th><th>State</th><th>Round</th><th>Updated</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  return `<div class="scroll"><table><thead><tr><th>Review</th><th>Rubric</th><th>State</th><th>Round</th><th>Updated</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
 }
 
 export function renderInbox(engine: Engine): string {
@@ -79,12 +94,12 @@ export function renderInbox(engine: Engine): string {
   const pending = engine.pending();
   const decide = reviews.filter((r) => r.state === "awaiting_signoff" || r.state === "escalated");
   const work = pending.length
-    ? `<table><thead><tr><th>Review</th><th>Reviewer</th><th>Rubric</th><th>Status</th><th>Due</th></tr></thead><tbody>${pending
+    ? `<div class="scroll"><table><thead><tr><th>Review</th><th>Reviewer</th><th>Rubric</th><th>Status</th><th>Due</th></tr></thead><tbody>${pending
         .map(
           (w) =>
-            `<tr><td><a href="/inbox/review/${esc(w.review_id)}">${esc(w.review_id)}</a><div class="muted">${esc(w.artifact)}: ${esc(w.intent)}</div></td><td>${esc(w.reviewer)}</td><td>${esc(w.rubric)}</td><td>${esc(w.status === "claimed" ? `claimed by ${w.claimed_by}` : "waiting")}</td><td class="muted">${esc(w.deadline?.slice(0, 16).replace("T", " ") ?? "")}</td></tr>`,
+            `<tr><td><a href="/inbox/review/${esc(w.review_id)}">${esc(w.review_id)}</a><div class="muted" title="${esc(w.artifact)}">${esc(w.artifact.startsWith("/") ? path.basename(w.artifact) : w.artifact)}: ${esc(w.intent)}</div></td><td>${esc(w.reviewer)}</td><td>${esc(w.rubric)}</td><td>${esc(w.status === "claimed" ? `claimed by ${w.claimed_by}` : "waiting")}</td><td class="muted">${esc(fmt(w.deadline))}</td></tr>`,
         )
-        .join("")}</tbody></table>`
+        .join("")}</tbody></table></div>`
     : `<p class="muted">No work waiting for pull reviewers.</p>`;
   return page(
     "Review inbox",
@@ -104,8 +119,16 @@ export function renderReviewPage(engine: Engine, id: string, msg: string | null)
   const claimForms = claimable
     .map(
       (r) => `<form method="post" action="/inbox/claim/${esc(id)}/${esc(r.name)}/start" class="card"><h3>Review this as ${esc(r.name)}</h3>
-<p class="muted">Due ${esc(r.deadline ?? "")}. Claiming shows you the work and the answer form; nobody else can answer for ${esc(r.name)} after that.</p>
+<p class="muted">Due ${esc(fmt(r.deadline))}. Claiming shows you the work and the answer form; nobody else can answer for ${esc(r.name)} after that.</p>
 <label for="by-${esc(r.name)}">Your name</label><input id="by-${esc(r.name)}" name="by" type="text" required><p><button>Claim and review</button></p></form>`,
+    )
+    .join("");
+  const claimed = (round?.reviewers ?? []).filter((r) => r.adapter === "pull" && r.status === "running" && r.claim && review.state === "in_review");
+  const releaseForms = claimed
+    .map(
+      (r) => `<form method="post" action="/inbox/review/${esc(id)}/release/${esc(r.name)}" class="card"><h3>${esc(r.name)} is claimed by ${esc(r.claim!.by)}</h3>
+<p class="muted">Claimed ${esc(fmt(r.claim!.at))}. If that review will not be finished (a closed tab, the wrong person), release the claim so someone else can take it.</p>
+<label>Your name<input type="text" name="by" aria-label="Your name" required></label><p><button class="secondary">Release the claim</button></p></form>`,
     )
     .join("");
   const signoff =
@@ -123,7 +146,7 @@ export function renderReviewPage(engine: Engine, id: string, msg: string | null)
   return page(
     `Review ${id}`,
     `<p><a href="/inbox">Inbox</a></p><h1>${esc(id)} ${stateBadge(review.state)}</h1><p class="muted">${esc(review.request.rubric)}: ${esc(review.request.intent)}</p>
-${msg ? `<p class="msg">${esc(msg)}</p>` : ""}${claimForms}${signoff}
+${msg ? `<p class="msg">${esc(msg)}</p>` : ""}${claimForms}${releaseForms}${signoff}
 <h2>Report</h2><div class="card report">${esc(report)}</div>${gallery}`,
   );
 }
@@ -133,35 +156,44 @@ const LIKELIHOODS = ["certain", "likely", "possible", "remote"];
 
 function findingFields(): string {
   const opt = (values: string[], selected: string) => values.map((v) => `<option${v === selected ? " selected" : ""}>${v}</option>`).join("");
-  return `<div class="finding"><label>Claim: what is wrong</label><input type="text" name="f_claim">
-<div class="row"><div><label>Impact</label><select name="f_impact">${opt(IMPACTS, "medium")}</select></div><div><label>Likelihood</label><select name="f_likelihood">${opt(LIKELIHOODS, "likely")}</select></div></div>
-<label>Failure scenario: when does it cause harm (needed for the finding to block)</label><textarea name="f_failure"></textarea>
-<label>Evidence: why you think so</label><textarea name="f_evidence"></textarea>
-<div class="row"><div><label>Section or file</label><input type="text" name="f_section"></div><div><label>Exact quote (optional)</label><input type="text" name="f_quote"></div></div>
-<label>Suggested fix (optional)</label><textarea name="f_fix"></textarea>
-<label>Challenges an assumption the author stated</label><select name="f_challenge"><option value="no">no</option><option value="yes">yes</option></select></div>`;
+  // Inputs sit inside their labels, so every field is named for screen readers without ids
+  // (rows are cloned from a template).
+  return `<fieldset class="finding"><legend>Finding</legend><label>Claim: what is wrong<input type="text" name="f_claim" aria-label="Claim"></label>
+<div class="row"><label>Impact<select name="f_impact" aria-label="Impact">${opt(IMPACTS, "medium")}</select></label><label>Likelihood<select name="f_likelihood" aria-label="Likelihood">${opt(LIKELIHOODS, "likely")}</select></label></div>
+<label>Failure scenario: when does it cause harm (a finding without one never blocks)<textarea name="f_failure" aria-label="Failure scenario"></textarea></label>
+<label>Evidence: why you think so<textarea name="f_evidence" aria-label="Evidence"></textarea></label>
+<div class="row"><label>Section or file<input type="text" name="f_section" aria-label="Section or file"></label><label>Exact quote (optional)<input type="text" name="f_quote" aria-label="Exact quote"></label></div>
+<label>Suggested fix (optional)<textarea name="f_fix" aria-label="Suggested fix"></textarea></label>
+<label>Challenges an assumption the author stated<select name="f_challenge" aria-label="Challenges an assumption"><option value="no">no</option><option value="yes">yes</option></select></label></fieldset>`;
 }
 
 export function renderClaimPage(engine: Engine, work: ClaimedWork, by: string): string {
   const reviewDir = engine.store.dir(work.review_id);
   const images = work.files.filter((f) => f.endsWith(".png")).map((f) => path.relative(reviewDir, f));
+  const text = (f: string | undefined) => (f && existsSync(f) && f.endsWith(".md") ? readFileSync(f, "utf8") : null);
+  const doc = text(work.files[0]);
+  const list = (title: string, items: string[]) => (items.length ? `<h3>${esc(title)}</h3><ul>${items.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "");
   return page(
     `Review ${work.review_id}`,
     `<p><a href="/inbox/review/${esc(work.review_id)}">Back to the review</a></p>
 <h1>Reviewing ${esc(work.review_id)} as ${esc(work.reviewer)}</h1>
-<p class="muted">Claimed by ${esc(by)}. Due ${esc(work.deadline ?? "")}. Keep this page open until you send the answer: the claim token is in the form.</p>
-<h2>The work and the instructions</h2><div class="card report">${esc(work.prompt)}</div>
+<p class="muted">Claimed by ${esc(by)}. Due ${esc(fmt(work.deadline))}. Keep this page open until you send the answer: the claim token is in the form.</p>
+<h2>What the author wants</h2><p>${esc(work.intent)}</p>${list("The author's assumptions", work.assumptions)}${list("Criteria", work.criteria)}
+<details class="card"><summary>Rubric: ${esc(work.rubric)}</summary><div class="report">${esc(work.rubric_text)}</div></details>
+${doc ? `<h2>The work</h2><div class="card report">${esc(doc)}</div>` : ""}
 ${images.map((f) => `<img class="shot" loading="lazy" alt="Screenshot" src="/inbox/review/${esc(work.review_id)}/file/${f.split("/").map(encodeURIComponent).join("/")}">`).join("")}
+<details class="card"><summary>Everything an agent reviewer gets (instructions, related documents, the change)</summary><div class="report">${esc(work.prompt)}</div></details>
 <h2>Your answer</h2>
 <form method="post" action="/inbox/claim/${esc(work.review_id)}/${esc(work.reviewer)}/post" class="card">
 <input type="hidden" name="claim_token" value="${esc(work.token)}">
-<div class="row"><div><label for="verdict">Verdict</label><select id="verdict" name="verdict"><option value="changes_requested">changes requested</option><option value="approve">approve</option><option value="comment">comment</option></select></div></div>
-<label for="summary">Summary</label><textarea id="summary" name="summary"></textarea>
+<div class="row"><label>Verdict<select name="verdict" aria-label="Verdict"><option value="changes_requested">changes requested</option><option value="approve">approve</option><option value="comment">comment</option></select></label></div>
+<label>Summary<textarea name="summary" aria-label="Summary"></textarea></label>
+<p class="muted">One finding per problem. Leave the claim empty to skip a finding; with no findings, send an approval.</p>
 <div id="findings">${findingFields()}</div>
 <template id="finding-template">${findingFields()}</template>
 <p><button type="button" class="secondary" id="add-finding">Add another finding</button></p>
 <p><button>Send the review</button></p>
-<details><summary>Decline instead</summary><label for="decline">Why you cannot review this</label><textarea id="decline" name="decline"></textarea><p class="muted">With a reason here, the findings above are ignored.</p></details>
+<details><summary>Decline instead</summary><label>Why you cannot review this<textarea name="decline"></textarea></label><p class="muted">With a reason here, the findings above are ignored.</p></details>
 </form>`,
   );
 }

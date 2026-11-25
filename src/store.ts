@@ -253,7 +253,7 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
     }
     const blocking = round.findings.filter((f) => f.blocking);
     const advisory = round.findings.filter((f) => !f.blocking);
-    lines.push(`- Findings: ${blocking.length} blocking, ${advisory.length} advisory`);
+    lines.push(round.finished_at || review.state !== "in_review" ? `- Findings: ${blocking.length} blocking, ${advisory.length} advisory` : "- Findings: not yet, the round is still running");
     const unanswered = blocking.filter((f) => !f.response).length;
     if (blocking.length) lines.push(`- Unanswered blocking findings: ${unanswered}`);
     if (review.signoff) lines.push(`- Signed off by ${review.signoff.by} on ${review.signoff.at}${review.signoff.note ? `: ${review.signoff.note}` : ""}`);
@@ -263,7 +263,11 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
     lines.push("", "## Reviewers", "");
     for (const r of round.reviewers) {
       lines.push(`- ${r.label} (${r.adapter}, ${r.vendor}): ${r.status}${r.verdict ? `, ${r.verdict}` : ""}`);
-      lines.push(`  - Model ${settingNote(r.model, r.model_reported, r.model_source)}; effort ${settingNote(r.effort, r.effort_reported, r.effort_source)}`);
+      if (r.adapter === "pull") {
+        if (r.model_reported) lines.push(`  - Model ${r.model} (given by the reviewer)`);
+      } else {
+        lines.push(`  - Model ${settingNote(r.model, r.model_reported, r.model_source)}; effort ${settingNote(r.effort, r.effort_reported, r.effort_source)}`);
+      }
       if (r.adapter === "pull") {
         lines.push(r.claim ? `  - Claimed by ${r.claim.by}${r.claim.client ? ` (${r.claim.client})` : ""} on ${r.claim.at}` : `  - Not claimed yet; due ${r.deadline ?? "?"}`);
       }

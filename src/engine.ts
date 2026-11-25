@@ -83,6 +83,12 @@ export interface ClaimedWork {
   files: string[];
   prompt: string;
   output_schema: Record<string, unknown>;
+  /** For people: the brief and the rubric on their own (the prompt has them too). */
+  rubric: string;
+  rubric_text: string;
+  intent: string;
+  assumptions: string[];
+  criteria: string[];
 }
 
 
@@ -815,6 +821,11 @@ export class Engine {
       files: files.map((f) => path.join(dir, f)),
       prompt: readFileSync(path.join(this.store.roundDir(id, n), "prompt.md"), "utf8"),
       output_schema: reviewerOutputJsonSchema(),
+      rubric: review.request.rubric,
+      rubric_text: loadRubric(review.request.rubric, this.config.rubric_paths, this.config.rubric_packs).body,
+      intent: review.request.intent,
+      assumptions: review.request.assumptions,
+      criteria: review.request.criteria,
     };
   }
 
@@ -874,6 +885,18 @@ export class Engine {
       await this.running.get(id);
     }
     return this.get(id);
+  }
+
+  /** Gives up a claim (an abandoned browser tab, the wrong person): the work waits for a new claim. */
+  release(id: string, reviewer: string, by: string): Review {
+    this.get(id);
+    return this.store.update(id, (r) => {
+      if (r.state !== "in_review") throw new Error(`Review ${id} is ${r.state}; there is no claim to release.`);
+      const run = r.rounds.at(-1)!.reviewers.find((x) => x.name === reviewer);
+      if (!run || run.adapter !== "pull" || run.status !== "running" || !run.claim) throw new Error(`Reviewer "${reviewer}" of review ${id} is not claimed.`);
+      r.history.push({ at: now(), event: "released", detail: `${reviewer}, claimed by ${run.claim.by}, released by ${by.trim() || "someone"}` });
+      Object.assign(run, { status: "waiting", claim: null, started_at: null });
+    });
   }
 
   /** Marks pull reviewers that missed their deadline as failed; finishes the round if that was the last one. */

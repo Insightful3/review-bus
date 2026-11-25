@@ -101,6 +101,7 @@ test("the tools are listed; sign-off is not one of them (people use rb signoff)"
     "review_list",
     "review_pending",
     "review_post",
+    "review_release",
     "review_respond",
     "review_result",
     "review_rubrics",

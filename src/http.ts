@@ -51,7 +51,7 @@ function readBody(req: http.IncomingMessage, limit = 4 * 1024 * 1024): Promise<s
 const SECURITY_HEADERS = {
   "content-security-policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
   "x-content-type-options": "nosniff",
-  "referrer-policy": "no-referrer",
+  "referrer-policy": "same-origin", // no-referrer would make browsers send "Origin: null" on form posts
   "cache-control": "no-store",
 };
 
@@ -181,6 +181,13 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
           const form = new URLSearchParams(await readBody(req, 64 * 1024));
           engine.signoff(id, form.get("by") ?? "", form.get("note") ?? "");
           res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent("Signed off.")}`, ...SECURITY_HEADERS });
+          res.end();
+          return;
+        }
+        if (req.method === "POST" && parts[2] === "release" && parts[3]) {
+          const form = new URLSearchParams(await readBody(req, 64 * 1024));
+          engine.release(id, parts[3], `${form.get("by") || "someone"} (web inbox)`);
+          res.writeHead(303, { location: `/inbox/review/${encodeURIComponent(id)}?msg=${encodeURIComponent("Claim released.")}`, ...SECURITY_HEADERS });
           res.end();
           return;
         }

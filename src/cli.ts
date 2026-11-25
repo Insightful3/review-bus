@@ -27,6 +27,7 @@ Usage:
   rb pending [--reviewer <name>]
   rb claim <review_id> <reviewer> --by <your name>
   rb post <review_id> <reviewer> --token <token> (--file <answer.json> | --decline <reason>) [--model <model>]
+  rb release <review_id> <reviewer> --by <your name>
   rb rubrics
   rb rubric-check <folder>
   rb serve [--port 7777] [--host 127.0.0.1]
@@ -273,6 +274,12 @@ async function main() {
       if (!v.by) fail("claim needs --by <your name>");
       const work = engine.claim(id(), pos[1], { by: v.by, client: "rb" });
       console.log(JSON.stringify(work, null, 2));
+      return;
+    }
+    case "release": {
+      if (!pos[1]) fail("release needs <review_id> <reviewer>");
+      const r = engine.release(id(), pos[1], v.by ?? "rb");
+      console.log(`${r.id}  ${pos[1]} waits for a new claim`);
       return;
     }
     case "post": {

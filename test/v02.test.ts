@@ -168,6 +168,13 @@ test("over HTTP: a pull reviewer claims the work and posts; the last answer fini
   assert.ok(work.token && work.files.some((f: string) => f.endsWith("artifact.md")));
   // Nobody else can claim it now, and a wrong token cannot post.
   assert.match((await call("review_claim", { review_id: id, reviewer: "person", by: "Bo" })).text, /already claimed by Ana/);
+  // A released claim can be taken again; the old token no longer works.
+  await call("review_release", { review_id: id, reviewer: "person", by: "Ana" });
+  const again = (await client.callTool({ name: "review_claim", arguments: { review_id: id, reviewer: "person", by: "Ana" } })) as ToolResult;
+  const oldToken = work.token;
+  Object.assign(work, JSON.parse(again.content[0].text));
+  assert.notEqual(work.token, oldToken);
+  assert.match((await call("review_post", { review_id: id, reviewer: "person", token: oldToken, output: { verdict: "approve", summary: "x", findings: [] } })).text, /No claim/);
   const output = {
     verdict: "changes_requested",
     summary: "Person review.",

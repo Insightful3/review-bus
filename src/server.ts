@@ -521,6 +521,21 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
   );
 
   server.registerTool(
+    "review_release",
+    {
+      description: "Give up a claim of a pull reviewer's work (you cannot finish it): the work waits for a new claim.",
+      inputSchema: { review_id: z.string(), reviewer: z.string(), by: z.string().describe("Who releases it") },
+    },
+    async (args) => {
+      try {
+        return jsonReply(status(engine.release(args.review_id, args.reviewer, args.by)));
+      } catch (err) {
+        return errorReply(err);
+      }
+    },
+  );
+
+  server.registerTool(
     "review_post",
     {
       description:
