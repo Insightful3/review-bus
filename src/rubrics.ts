@@ -24,9 +24,10 @@ const NAME = /^[a-z0-9][a-z0-9-]*$/;
 function parseFrontMatter(raw: string): { meta: Record<string, unknown>; body: string } {
   // Some editors start UTF-8 files with a byte order mark; the header must still be recognised.
   const text = raw.replace(/^\uFEFF/, "");
-  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  // Delimiters may carry trailing spaces or tabs; the closing one must be a line of its own.
+  const m = text.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
   // An unclosed header would be read as body text, and a confidential: true in it silently ignored.
-  if (!m && /^---\r?\n/.test(text)) throw new Error("the front matter has no closing --- line");
+  if (!m && /^---[ \t]*\r?\n/.test(text)) throw new Error("the front matter has no closing --- line");
   if (!m) return { meta: {}, body: text };
   const meta: Record<string, unknown> = {};
   for (const [i, line] of m[1].split(/\r?\n/).entries()) {

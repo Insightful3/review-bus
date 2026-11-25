@@ -875,7 +875,11 @@ export class Engine {
     const out: Review[] = [];
     for (const d of dirs) {
       try {
-        out.push(JSON.parse(await readFile(path.join(this.store.root, d, "review.json"), "utf8")));
+        let r: Review = JSON.parse(await readFile(path.join(this.store.root, d, "review.json"), "utf8"));
+        // A pull reviewer past its deadline: record it now, so a listing never shows expired work as waiting.
+        const overdue = r.state === "in_review" && (r.rounds.at(-1)?.reviewers ?? []).some((x) => x.adapter === "pull" && (x.status === "waiting" || x.status === "running") && x.deadline && Date.parse(x.deadline) < Date.now());
+        if (overdue) r = this.get(r.id);
+        out.push(r);
       } catch {
         /* no review.json yet, or mid-write */
       }
@@ -1081,6 +1085,10 @@ export class Engine {
     if (review.state !== "in_review" || !run || run.status !== "running" || !run.claim || !safeEqual(run.claim.token_sha256, sha256(token))) {
       throw new Error(`No live claim of "${reviewer}" on review ${id} matches this token.`);
     }
+    // Approval is checked again for every file: the rubric may have become confidential since the claim.
+    const current = this.currentConfig();
+    const allowed = this.allowedReviewers(review.request.rubric, this.metaNow(review, current), current);
+    if (allowed && !allowed.includes(reviewer)) throw new Error(`Reviewer "${reviewer}" is no longer approved for ${review.request.rubric}. Nothing was sent.`);
     // Only the claimed round's files: an earlier round may hold a version the author replaced.
     const found = this.snapshotFile(id, rel, review.rounds.at(-1)!.n);
     if (!found) throw new Error(`${rel} is not a file of this round's snapshot. Use the paths review_claim lists (relative to the review folder).`);

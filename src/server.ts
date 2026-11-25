@@ -10,7 +10,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { appendFileSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
+
+/** Largest file review_file returns in one tool result. */
+const MAX_TOOL_FILE_BYTES = 10 * 1024 * 1024;
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { loadConfig } from "./config.js";
@@ -556,7 +560,12 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     async (args) => {
       try {
         const found = engine.claimedFile(args.review_id, args.reviewer, args.token, args.path);
-        const data = readFileSync(found.file);
+        // Read asynchronously and capped: a tool result is one message, not a download.
+        const size = (await stat(found.file)).size;
+        if (size > MAX_TOOL_FILE_BYTES) {
+          throw new Error(`${args.path} is ${Math.round(size / 1024 / 1024)} MB, over the ${MAX_TOOL_FILE_BYTES / 1024 / 1024} MB a tool result carries. Open it in the inbox (rb serve) instead.`);
+        }
+        const data = await readFile(found.file);
         return found.image
           ? { content: [{ type: "image" as const, data: data.toString("base64"), mimeType: "image/png" }] }
           : { content: [{ type: "text" as const, text: data.toString("utf8") }] };

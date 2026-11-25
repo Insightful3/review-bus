@@ -6,6 +6,8 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import { createReadStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { Engine } from "./engine.js";
@@ -291,7 +293,9 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
             return;
           }
           // Text is served as plain text, never as HTML, whatever it contains.
-          send(res, 200, readFileSync(found.file) as unknown as string, found.image ? "image/png" : "text/plain; charset=utf-8");
+          // Streamed, so a large patch never holds up the server or sits in memory whole.
+          res.writeHead(200, { "content-type": found.image ? "image/png" : "text/plain; charset=utf-8", ...SECURITY_HEADERS });
+          await pipeline(createReadStream(found.file), res);
           return;
         }
       }

@@ -1407,3 +1407,45 @@ test("a cancel from another process stops a slow merge started by the last pull 
   assert.equal(e.get(review.id).state, "canceled");
   writeConfig();
 });
+
+// ---- Fresh review #2, round 2 ----
+
+test("trailing spaces on the front matter delimiters keep the confidential flag", () => {
+  const dir = path.join(tmp, "rubrics-trailing");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "spaced.md"), RUBRIC.replace(/^---\n/, "--- \n").replace("\n---\n# Acme", "\n---\t\n# Acme"));
+  assert.deepEqual(checkRubricPath(path.join(dir, "spaced.md"))[0].problems, []);
+  assert.equal(loadRubric("spaced", [dir]).meta.confidential, true);
+});
+
+test("review_file refuses once the rubric became confidential without approving the reviewer", async () => {
+  const dir = path.join(tmp, "rubrics-file-flip");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "fflip.md"), RUBRIC.replace("confidential: true\n", ""));
+  writeConfig({ rubric_paths: [dir] });
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "fflip", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "person" }], stage: "pre-merge" }, PERSON, 5);
+  const work = e.claim(review.id, "person", { by: "Remote", client: null });
+  assert.ok(e.claimedFile(review.id, "person", work.token, "r1/artifact.md"));
+  writeFileSync(path.join(dir, "fflip.md"), RUBRIC);
+  assert.throws(() => e.claimedFile(review.id, "person", work.token, "r1/artifact.md"), /confidential/);
+  writeConfig();
+});
+
+test("refreshing the inbox records a missed pull deadline", async () => {
+  const review = await engine.submit(
+    { artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "Expiring work", assumptions: [], criteria: [], reviewers: [{ name: "quick" }], stage: "pre-merge" },
+    PERSON,
+    5,
+  );
+  await new Promise((r) => setTimeout(r, 1300));
+  const ok = await fetch(`${base}inbox/login`, { method: "POST", body: new URLSearchParams({ token }), redirect: "manual" });
+  const cookie = ok.headers.get("set-cookie")!.split(";")[0];
+  const page = await (await fetch(`${base}inbox`, { headers: { cookie } })).text();
+  const waiting = page.split("Waiting for a reviewer")[1].split("<h2>")[0];
+  assert.doesNotMatch(waiting, new RegExp(review.id));
+  await engine.settled(review.id);
+  const r = JSON.parse(readFileSync(path.join(tmp, "reviews", review.id, "review.json"), "utf8"));
+  assert.equal(r.rounds[0].reviewers[0].status, "failed");
+  assert.match(r.rounds[0].reviewers[0].error, /no answer by the deadline/);
+});
