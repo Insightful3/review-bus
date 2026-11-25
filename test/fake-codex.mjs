@@ -14,7 +14,12 @@ const fail = (msg) => {
 };
 
 if (args[0] !== "exec") fail("expected exec subcommand");
-if (value("--sandbox") !== "read-only") fail("sandbox must be read-only");
+// Read-restricted profile instead of --sandbox (the two do not combine in Codex).
+if (args.includes("--sandbox")) fail("--sandbox must not be passed with a permission profile");
+const cValues = args.filter((x, i) => args[i - 1] === "-c");
+const profile = cValues.find((x) => x.startsWith("permissions.review-bus.filesystem="));
+if (!profile || !profile.includes('":root"="deny"') || !profile.includes('":workspace_roots"={"."="read"}') || /"write"/.test(profile)) fail(`bad reviewer permission profile: ${profile}`);
+if (!cValues.includes('default_permissions="review-bus"')) fail("profile must be selected with default_permissions");
 for (const flag of ["--skip-git-repo-check", "--ephemeral", "--ignore-user-config"]) if (!args.includes(flag)) fail(`missing ${flag}`);
 for (const feature of ["apps", "plugins", "remote_plugin", "computer_use", "browser_use", "browser_use_external", "hooks", "image_generation"]) {
   if (!args.some((a, i) => a === "--disable" && args[i + 1] === feature)) fail(`feature ${feature} must be disabled`);

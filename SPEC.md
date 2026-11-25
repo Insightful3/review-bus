@@ -140,6 +140,7 @@ Configured in `review-bus.config.json`, not hard-coded. Each adapter: command, a
 - **Codex, documents and code with rubric:** `codex exec` in read-only sandbox, prompt on stdin, `--output-schema <schema.json>`, `-o <out.json>`, working dir = worktree (code) or the review folder (documents).
 - **Codex, native code review (optional):** `codex exec review --uncommitted|--base|--commit --json -o out.md`, then a second pass converts its text into the finding shape. Off by default.
 - **Claude:** `claude -p` with `--output-format json`, `--json-schema <schema>`, `--tools Read,Grep,Glob`, `--permission-prompts none`, `--restricted` (no command tools, user and project settings ignored, file tools confined to the working dir), `--strict-mcp-config`, `--no-session-persistence`, working dir as above. The answer is in `structured_output` of the JSON envelope; `is_error: true` fails the reviewer.
+- **Codex reads are confined:** instead of `--sandbox read-only`, a permission profile passed with `-c` (`permissions.review-bus.filesystem`: `:root` deny, `:minimal` read, temp folders deny, `:workspace_roots` `"."` read; selected with `default_permissions`). The workspace root is the round folder (`--cd`). Nothing is writable. Profiles and `--sandbox` do not combine, which is why `--sandbox` is no longer passed.
 - **Codex as a reviewer is isolated:** `--ignore-user-config` (the user's MCP servers, some of which run code or control the computer, are not loaded; login still works), `--disable` for `apps`, `plugins`, `remote_plugin`, `computer_use`, `browser_use`, `browser_use_external`, `hooks` and `image_generation`, and `-c web_search="disabled"`. Checked on codex-cli 0.172.0 by listing the tools a reviewer can call: without these flags it could reach `node_repl`, `cua_repl` and ChatGPT apps, none of which the read-only sandbox covers. Found by review-bus reviewing itself with Codex.
 - **Codex as the author:** `codex exec` refuses MCP tool calls unless the server's tools are approved. Set `default_tools_approval_mode = "approve"` on the review-bus server (Codex 0.172.0 accepts `auto`, `prompt`, `writes`, `approve`).
 - **Command:** any executable that reads the review prompt on stdin and prints reviewer output JSON on stdout. Used by tests with a fake reviewer.
@@ -228,7 +229,7 @@ Each agent session starts its own server process over stdio, and `rb` runs revie
 
 From review-bus reviewing itself with Codex (4 high-effort passes); open, listed in README:
 
-- Codex's read-only sandbox does not restrict reads: a reviewer can read files outside the snapshot.
+- Reviewer reads: Codex runs under a read-restricted permission profile (round folder plus `:minimal` platform paths; home folder, other reviews, auth and temp folders denied) and Claude under `--restricted` (file tools confined to the round folder), both checked with canaries on 25 Nov 2026. Not covered: `command` reviewers, `:minimal` system paths, and Codex's `view_image` tool outside the folder (untested). `npm run check:isolation` re-checks the Codex profile.
 - Headless page capture follows redirects from a public page to private addresses.
 - Reviewers in their own process group can outlive a runner that is killed outright.
 - The review id is returned after the snapshot; slow pages can exceed client timeouts.

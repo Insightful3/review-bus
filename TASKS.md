@@ -49,7 +49,8 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 
 ## Later
 
-- [ ] Known limits from the self-review (README "Known limits"): reviewer reads outside the snapshot, page redirects to private addresses, reviewers outliving a killed runner.
+- [x] Reviewer reads confined to the review folder: Codex permission profile, Claude --restricted; `npm run check:isolation`
+- [ ] Known limits from the self-review (README "Known limits"): page redirects to private addresses, reviewers outliving a killed runner.
 - [x] Decided (25 Nov 2026): agents with terminal access may run `rb signoff`; no extra confirmation.
 - [ ] Return the review_id before slow page capture (self-review round 2, f10). Trade-off: snapshot errors would then arrive as a failed review, not as an error on review_submit.
 - [ ] Optional `model` for Codex in `~/.review-bus/config.json`: reviewers ignore `~/.codex/config.toml` now, so they use Codex's default model.

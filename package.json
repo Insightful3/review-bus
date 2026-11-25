@@ -14,7 +14,8 @@
   "scripts": {
     "build": "tsc -p . && node dist/src/spec/gen-schema.js",
     "test": "npm run build && node --test dist/test/",
-    "start": "node dist/src/server.js"
+    "start": "node dist/src/server.js",
+    "check:isolation": "npm run build && node scripts/check-isolation.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

@@ -252,7 +252,7 @@ rv_<id>/
 
 ## Security and privacy
 
-- Reviewers are read-only. Codex runs in its read-only sandbox, without your Codex config's MCP servers, ChatGPT apps, plugins, hooks, browser or computer use, or web access (otherwise those would be reachable despite the sandbox). Claude runs with `--restricted` and only the Read, Grep and Glob tools, confined to the review folder. They work on a copy, never on your files or repo.
+- Reviewers are read-only and can read only their review folder. Codex runs under a permission profile that allows reading the round folder and the system paths common tools need, and denies everything else: the rest of your home folder, other reviews, its own login token and the temp folders. It also runs without your Codex config's MCP servers, ChatGPT apps, plugins, hooks, browser or computer use, or web access. Claude runs with `--restricted`, which confines its Read, Grep and Glob tools to the review folder. Codex permission profiles are beta, so after upgrading Codex run `npm run check:isolation`: it checks with canary files that a reviewer can read its folder and nothing private.
 - review-bus does not write to the reviewed repo: the reviewers' copy is made with a temporary index (`git read-tree` and `git checkout-index`) and `git apply` inside the review folder.
 - Several sessions and `rb` can use the same reviews at once: every change to a review holds a lock shared by all processes, and a cancel from any of them stops the reviewers (the whole process group, forcefully if they ignore the polite signal).
 - Approvals (`allowed_reviewers`) are read from the config file again before each new round and merge, so revoking a reviewer takes effect without restarting sessions.
@@ -265,7 +265,7 @@ rv_<id>/
 
 Found when review-bus reviewed itself with Codex, and not fixed yet:
 
-- **Reviewers can read your disk.** Codex's read-only sandbox stops writes, not reads, so a reviewer told to by the work it reviews could open other files on your machine (other reviews, for example) and include them in what it sends to its vendor.
+- **Reviewer reads, what is left.** Codex and Claude reviewers are confined to their review folder (see Security). Not covered: custom `command` reviewers (they run with your permissions), system files that tools need (for example `/etc`), and Codex's image viewer tool, which was not tested outside the folder.
 - **Page redirects.** A public page you submit can redirect the headless browser to a private page your machine can reach (a local server, an intranet), and that page would be captured.
 - **Crashed runners.** If the process running a review is killed outright, its reviewers can keep running until their own timeout.
 - **Changing a reviewer's type or vendor while a session is open.** Approvals and the command are read again before each round, but which default reviewer is picked and its model and effort still follow the config the session started with. Start a new session after such a change.

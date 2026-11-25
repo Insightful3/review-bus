@@ -86,8 +86,15 @@ async function runCodex(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> 
   writeFileSync(schemaFile, JSON.stringify(job.schema ?? reviewerOutputJsonSchema(), null, 2));
   const args = [
     "exec",
-    "--sandbox",
-    "read-only",
+    // Read-only AND read-restricted: a permission profile instead of --sandbox read-only (the two do
+    // not combine). Codex's shell may read the round folder (its --cd, the workspace root) and the
+    // platform paths common tools need; everything else is denied, including the rest of the home
+    // folder, other reviews, Codex's own auth.json and the temp folders. Nothing is writable.
+    // Checked on codex-cli 0.172.0 with canary files (permission profiles are beta in Codex).
+    "-c",
+    CODEX_READ_PROFILE,
+    "-c",
+    'default_permissions="review-bus"',
     "--skip-git-repo-check",
     "--ephemeral",
     "--color",
@@ -195,6 +202,10 @@ function runRaw(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
 }
 
 /** Runs a reviewer and validates its answer against the reviewer output schema. */
+/** The Codex permission profile for reviewers: read the round folder only, write nothing. */
+export const CODEX_READ_PROFILE =
+  'permissions.review-bus.filesystem={":root"="deny", ":minimal"="read", ":slash_tmp"="deny", ":tmpdir"="deny", ":workspace_roots"={"."="read"}}';
+
 export async function runAdapter(cfg: AdapterConfig, job: ReviewJob): Promise<AdapterResult> {
   const r = await runRaw(cfg, job);
   return { output: validateOutput(r.json, cfg.type === "command" ? cfg.command : `${cfg.type} adapter`), reportedModel: r.reportedModel, reportedEffort: r.reportedEffort };
