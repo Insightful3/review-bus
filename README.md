@@ -4,7 +4,33 @@ A review layer for AI agents. An agent submits its work (a document, a code chan
 
 It runs as an MCP server (over stdio, or over HTTP with `rb serve`), so any MCP client can be the author. Claude Code and Codex are both supported as authors and as reviewers, and by default a review always goes to a model from a different vendor than the author. People and agents in other tools can review too: they pick up waiting work and post their answer, from the web inbox, `rb` or MCP.
 
-Status: v0.2, working name. See `SPEC.md` for the design and `TASKS.md` for what is built.
+Status: v0.2. See `SPEC.md` for the design and `TASKS.md` for what is built and what is open.
+
+## Quick start
+
+You need Node.js 22 or newer, git, and the Codex CLI logged in (`npm install -g @openai/codex`, then `codex login`). Claude Code is the author in this example; Codex reviews its work.
+
+1. Install review-bus and copy the example config:
+
+   ```bash
+   npm install -g review-bus
+   mkdir -p ~/.review-bus
+   cp "$(npm root -g)/review-bus/review-bus.config.example.json" ~/.review-bus/config.json
+   ```
+
+2. Connect it to Claude Code:
+
+   ```bash
+   claude mcp add review-bus -s user -e REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- review-bus
+   ```
+
+3. In a Claude Code session inside a git repo, ask:
+
+   > Submit my uncommitted changes to review-bus with the `code` rubric, wait for the result and answer every blocking finding.
+
+Claude Code sends the change, Codex reviews a frozen copy of it read-only, and the findings come back. Claude fixes or answers each blocking one, resubmits, and after at most 3 rounds the review is approved or a person decides. Every review is kept in `~/.review-bus/reviews`, with a readable `report.md`.
+
+For documents, use a document rubric (`proposal`, `contract-b2b`, `client-email`, `linkedin-post`, `plan`, `sop`) and give the file's path, or send the text itself. The rest of this README covers the details: other authors (Codex, the Claude desktop app), people as reviewers, the web inbox, and writing your own rubrics.
 
 ## What it reviews
 
@@ -34,7 +60,7 @@ This installs two commands: `review-bus` (the MCP server) and `rb` (the command 
 From source, to change it or run the tests:
 
 ```bash
-git clone <this repo> review-bus
+git clone https://github.com/Insightful3/review-bus.git
 cd review-bus
 npm install
 npm run build
@@ -45,12 +71,14 @@ The tests use fake reviewers, so they need no model login. With a source checkou
 
 ## Configure
 
-Copy the example config and edit it:
+Copy the example config (from the npm package or a source checkout) and edit it:
 
 ```bash
 mkdir -p ~/.review-bus
-cp review-bus.config.example.json ~/.review-bus/config.json
+cp "$(npm root -g)/review-bus/review-bus.config.example.json" ~/.review-bus/config.json
 ```
+
+The example uses Codex and Claude Code as reviewers, approves both for `contract-b2b`, and looks for your own rubrics in `~/.review-bus/rubrics`. Remove a reviewer you do not have from `default_reviewers`.
 
 The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.json`. It is never read from the current folder: a config names commands to run, and a cloned repo is not a trusted source of commands. Relative paths in it are resolved against the config file's folder.
 
@@ -73,7 +101,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 
 ## Connect an author agent
 
-Point the agent at the built server, `dist/src/server.js`.
+Any MCP client can be the author. These three are tested.
 
 ### Claude Code
 

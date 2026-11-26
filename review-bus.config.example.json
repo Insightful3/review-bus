@@ -1,7 +1,6 @@
 {
   "rubric_paths": [
-    "./rubrics",
-    "../review-bus-private/rubrics"
+    "~/.review-bus/rubrics"
   ],
   "rubric_packs": [],
   "storage": {
@@ -53,17 +52,6 @@
       "effort": "medium",
       "args": [],
       "timeout_seconds": 900
-    },
-    "fake": {
-      "type": "command",
-      "command": "node",
-      "args": [
-        "./test/fake-reviewer.mjs",
-        "{model}",
-        "{effort}"
-      ],
-      "vendor": "other",
-      "timeout_seconds": 30
     },
     "codex-native": {
       "type": "codex-review",

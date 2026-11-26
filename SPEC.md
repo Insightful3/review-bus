@@ -131,7 +131,7 @@ Contract rubric overrides (`contract-b2b`):
 
 Markdown files, each with: purpose, what to check, what is out of scope, impact anchors, policy overrides (front matter).
 
-Rubrics are loaded from several folders, in order, with later folders overriding earlier ones by rubric name. Configured as `rubric_paths` in `review-bus.config.json`, for example `["./rubrics", "../review-bus-private/rubrics"]`. Generic rubrics ship in this repo's `rubrics/`; client-specific and Insightful3 packs live in the private repo.
+Rubrics are loaded from several folders, in order, with later folders overriding earlier ones by rubric name. Configured as `rubric_paths` in `review-bus.config.json`, for example `["~/.review-bus/rubrics", "~/clients/acme/rubrics"]`. Generic rubrics ship in this repo's `rubrics/`, which always comes first; client-specific rubrics live in a private folder of your own.
 
 - `code`: correctness, security, data loss, missing tests for changed behaviour. Out of scope: style the linter handles, naming preferences.
 - `contract-b2b`: parties and registration details, scope and deliverables, price, payment terms and late interest, term and termination, liability cap and exclusions, IP ownership and licence, confidentiality, data protection (DPA needed when personal data is processed), governing law and jurisdiction, defined terms used consistently, numbers and dates consistent across clauses and annexes. Optional `related` artifact: the accepted proposal; any mismatch in price, scope or timeline is high impact. Assumptions should include jurisdiction and language (for example Slovenian law, Slovenian text).
