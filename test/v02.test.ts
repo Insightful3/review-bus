@@ -2,7 +2,7 @@
 // before slow page capture, and Codex's native review pass (with a fake codex).
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -11,7 +11,7 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, vendorOfClient } from "../src/config.js";
 import { Engine } from "../src/engine.js";
 import { startHttp } from "../src/http.js";
 import { gitlinksAfter } from "../src/adapters/index.js";
@@ -1608,4 +1608,76 @@ test("rb submit reports a review canceled before its first round instead of cras
     slow.close();
     writeConfig();
   }
+});
+
+test("text sent inline: removed when the first snapshot fails later, or the review is canceled before its first round", async () => {
+  writeConfig({ snapshot_wait_seconds: 0 });
+  const slow = new Engine(loadConfig());
+  const req = { artifact: { text: { name: "post.md", content: "Confidential draft" } }, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" as const };
+  const failing = await slow.submit(req, PERSON);
+  assert.equal(failing.state, "submitted");
+  assert.ok(existsSync(path.join(tmp, "reviews", failing.id, "source")));
+  await slow.settled(failing.id);
+  assert.equal(slow.get(failing.id).state, "failed");
+  assert.equal(existsSync(path.join(tmp, "reviews", failing.id, "source")), false);
+
+  const canceled = await slow.submit(req, PERSON);
+  slow.cancel(canceled.id);
+  assert.equal(existsSync(path.join(tmp, "reviews", canceled.id, "source")), false);
+  await slow.settled(canceled.id);
+  assert.equal(slow.get(canceled.id).state, "canceled");
+  writeConfig();
+});
+
+test("resubmitting text: a refused name writes nothing; each new version gets a folder of its own", async () => {
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { text: { name: "post.md", content: readFileSync(FIXTURE, "utf8") } }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  await e.settled(review.id);
+  const r1 = e.get(review.id);
+  const answers = r1.rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+  const sources = path.join(tmp, "reviews", review.id, "source");
+  const before = readdirSync(sources).sort();
+  await assert.rejects(e.respond(review.id, answers, { resubmit: true, artifact: { name: "../x.md", content: "y" } }), /plain file name/);
+  assert.deepEqual(readdirSync(sources).sort(), before);
+  await e.respond(review.id, answers, { resubmit: true, artifact: { name: "post.md", content: "Version two of the post." } });
+  await e.settled(review.id);
+  const after2 = readdirSync(sources).sort();
+  assert.equal(after2.length, 2);
+  assert.match(after2[1], /^r2-/);
+  assert.equal(readFileSync(path.join(tmp, "reviews", review.id, "r2/artifact.md"), "utf8").trim(), "Version two of the post.");
+  // Round 1's source is untouched.
+  assert.equal(readFileSync(path.join(sources, "r1/01/post.md"), "utf8"), readFileSync(FIXTURE, "utf8"));
+});
+
+test("REVIEW_BUS_LOG records a text document's name and length, never its content, also for a refused call", async () => {
+  const log = path.join(tmp, "diag.log");
+  process.env.REVIEW_BUS_LOG = log;
+  try {
+    const secret = "SECRET-CONTRACT-TEXT price EUR 99,999";
+    await call("review_submit", { artifact: { name: "c.md", content: secret }, related: [{ name: "p.md", content: secret }], rubric: "proposal", intent: "x", wait_seconds: 5 });
+    await call("review_submit", { artifact: { name: "../bad.md", content: secret }, rubric: "proposal", intent: "x" });
+  } finally {
+    delete process.env.REVIEW_BUS_LOG;
+  }
+  const text = readFileSync(log, "utf8");
+  assert.doesNotMatch(text, /SECRET-CONTRACT-TEXT/);
+  assert.match(text, /"content":"\[37 characters\]"/);
+  assert.equal(statSync(log).mode & 0o777, 0o600);
+});
+
+test("an MCP request over the HTTP size limit gets a 413 with a reason, not a dropped connection", async () => {
+  const body = Buffer.alloc(33 * 1024 * 1024, 0x20);
+  const res = await fetch(`${base}mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}` }, body });
+  assert.equal(res.status, 413);
+  assert.match(await res.text(), /Request too large \(over 32 MB\)\. Send long documents as a path/);
+});
+
+test("the Claude desktop app (chat and Cowork) is recognised as an Anthropic author", () => {
+  const map = loadConfig().author_vendors;
+  assert.equal(vendorOfClient(map, "local-agent-mode-review-bus"), "anthropic");
+  assert.equal(vendorOfClient(map, "claude-code"), "anthropic");
+  assert.equal(vendorOfClient(map, "something-else"), null);
+  // An exact key wins over a prefix, and the longest prefix over a shorter one.
+  assert.equal(vendorOfClient({ "a*": "openai", "ab*": "other", abc: "anthropic" }, "abc"), "anthropic");
+  assert.equal(vendorOfClient({ "a*": "openai", "ab*": "other" }, "abd"), "other");
 });

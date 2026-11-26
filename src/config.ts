@@ -27,8 +27,19 @@ const AdapterConfigIn = z.object({
 });
 export type AdapterConfig = Omit<z.infer<typeof AdapterConfigIn>, "vendor" | "timeout_seconds"> & { vendor: Vendor; timeout_seconds: number };
 
-// MCP clientInfo.name -> vendor. Names checked against Claude Code 2.1.316 and Codex 0.172.0.
-const DEFAULT_AUTHOR_VENDORS: Record<string, Vendor> = { "claude-code": "anthropic", "codex-mcp-client": "openai" };
+// MCP clientInfo.name -> vendor. Names checked against Claude Code 2.1.316 and Codex 0.172.0. A
+// key ending in * matches names starting with the rest: the Claude desktop app (chat and Cowork)
+// connects as "local-agent-mode-<server name>".
+const DEFAULT_AUTHOR_VENDORS: Record<string, Vendor> = { "claude-code": "anthropic", "codex-mcp-client": "openai", "local-agent-mode-*": "anthropic" };
+
+/** The vendor author_vendors gives an MCP client name: an exact key first, then the longest matching prefix*. */
+export function vendorOfClient(map: Record<string, Vendor>, client: string): Vendor | null {
+  if (Object.hasOwn(map, client)) return map[client];
+  const prefixes = Object.keys(map)
+    .filter((k) => k.endsWith("*") && client.startsWith(k.slice(0, -1)))
+    .sort((a, b) => b.length - a.length);
+  return prefixes.length ? map[prefixes[0]] : null;
+}
 
 const Config = z.object({
   rubric_paths: z.array(z.string()).default(["./rubrics"]),

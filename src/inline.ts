@@ -26,19 +26,26 @@ export function inlineName(doc: InlineDoc): string {
 }
 
 /**
- * Writes inline documents into the review folder (source/<sub>/), owner-only, and returns their
- * paths in order. They are then snapshotted like any document. Two documents with the same name get
- * numbered folders so neither overwrites the other.
+ * Writes inline documents into base (a folder the caller has just created for this attempt alone),
+ * one numbered subfolder each, owner-only, and returns their paths in order. Every document is
+ * checked before anything is written; nothing existing is ever overwritten.
  */
-export function writeInline(reviewDir: string, sub: string, docs: InlineDoc[]): string[] {
-  const names = docs.map(inlineName); // every one is checked before anything is written
+export function writeInline(base: string, docs: InlineDoc[]): string[] {
+  const names = docs.map(inlineName);
   return docs.map((doc, i) => {
-    const dir = path.join(reviewDir, "source", sub, String(i + 1).padStart(2, "0"));
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const dir = path.join(base, String(i + 1).padStart(2, "0"));
+    mkdirSync(dir, { mode: 0o700 });
     const file = path.join(dir, names[i]);
-    writeFileSync(file, doc.content, { mode: 0o600 });
+    writeFileSync(file, doc.content, { mode: 0o600, flag: "wx" });
     return file;
   });
+}
+
+/** Replaces inline text with its length, for logs: document bodies never leave the review folder. */
+export function redactInline(value: unknown): unknown {
+  if (isInline(value)) return { name: value.name, content: `[${value.content.length} characters]` };
+  if (Array.isArray(value)) return value.map(redactInline);
+  return value;
 }
 
 export function isInline(x: unknown): x is InlineDoc {

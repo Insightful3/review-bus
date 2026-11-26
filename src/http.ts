@@ -38,15 +38,40 @@ function same(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-function readBody(req: http.IncomingMessage, limit = 4 * 1024 * 1024): Promise<string> {
+/**
+ * The most an MCP request body may be. review_submit takes up to four documents as text of
+ * 1,000,000 characters each; as JSON that is at most 24 MB (6 bytes for an escaped character), so
+ * every call the tool schema accepts fits.
+ */
+export const MCP_BODY_LIMIT = 32 * 1024 * 1024;
+
+export class BodyTooLarge extends Error {
+  constructor(readonly limit: number) {
+    super(`request body larger than ${limit} bytes`);
+  }
+}
+
+/**
+ * Reads a request body up to limit bytes. Past it: with drain (authenticated MCP requests), the
+ * rest is read and dropped up to twice the limit so the client can be answered; otherwise, or
+ * beyond that, the connection is closed.
+ */
+function readBody(req: http.IncomingMessage, limit = 4 * 1024 * 1024, drain = false): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let over = false;
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => {
       size += c.length;
+      if (over) {
+        if (size > 2 * limit) req.destroy();
+        return;
+      }
       if (size > limit) {
-        reject(new Error("request body too large"));
-        req.destroy();
+        over = true;
+        chunks.length = 0;
+        reject(new BodyTooLarge(limit));
+        if (!drain) req.destroy();
       } else chunks.push(c);
     });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
@@ -170,7 +195,17 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
     const sessionId = Array.isArray(sid) ? sid[0] : sid;
     let body: unknown;
     if (req.method === "POST") {
-      const text = await readBody(req);
+      let text: string;
+      try {
+        text = await readBody(req, MCP_BODY_LIMIT, true);
+      } catch (err) {
+        if (!(err instanceof BodyTooLarge)) throw err;
+        const message = `Request too large (over ${Math.round(MCP_BODY_LIMIT / 1024 / 1024)} MB). Send long documents as a path on the server's machine instead of as text.`;
+        // Answered once the body has arrived: a client still sending would miss an earlier reply.
+        if (req.readableEnded) send(res, 413, JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message }, id: null }), "application/json");
+        else req.once("end", () => send(res, 413, JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message }, id: null }), "application/json"));
+        return;
+      }
       try {
         body = JSON.parse(text);
       } catch {

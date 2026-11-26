@@ -17,8 +17,8 @@ import { readFile, stat } from "node:fs/promises";
 const MAX_TOOL_FILE_BYTES = 10 * 1024 * 1024;
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { INLINE_MAX_CHARS } from "./inline.js";
-import { loadConfig } from "./config.js";
+import { INLINE_MAX_CHARS, redactInline } from "./inline.js";
+import { loadConfig, vendorOfClient } from "./config.js";
 import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import { GitSpec } from "./git.js";
 import { ReviewerSpec, Vendor } from "./settings.js";
@@ -165,11 +165,25 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
       // Opt-in diagnostics: which tool calls arrive, and whether as tasks (REVIEW_BUS_LOG=<file>).
       if (process.env.REVIEW_BUS_LOG && m.method) {
         const name = (m.params as { name?: string } | undefined)?.name;
-        // Claim tokens are credentials: never written to the log.
+        // Claim tokens are credentials and documents sent as text may be confidential: neither is
+        // written to the log (only the text's name and length). Logged before validation, so a
+        // refused call is redacted too.
         const params = m.params as { arguments?: Record<string, unknown> } | undefined;
-        const safe = params?.arguments && "token" in params.arguments ? { ...params, arguments: { ...params.arguments, token: "[redacted]" } } : params;
+        const a = params?.arguments;
+        const safe =
+          a && typeof a === "object"
+            ? {
+                ...params,
+                arguments: {
+                  ...a,
+                  ...("token" in a ? { token: "[redacted]" } : {}),
+                  ...("artifact" in a ? { artifact: redactInline(a.artifact) } : {}),
+                  ...("related" in a ? { related: redactInline(a.related) } : {}),
+                },
+              }
+            : params;
         const detail = m.method === "initialize" || m.method === "server/discover" || m.method === "tools/call" || m.method?.startsWith("tasks/") ? { params: safe } : {};
-        appendFileSync(process.env.REVIEW_BUS_LOG, JSON.stringify({ at: new Date().toISOString(), method: m.method, tool: name ?? null, task: Boolean(m.params?.task), ...detail }) + "\n");
+        appendFileSync(process.env.REVIEW_BUS_LOG, JSON.stringify({ at: new Date().toISOString(), method: m.method, tool: name ?? null, task: Boolean(m.params?.task), ...detail }) + "\n", { mode: 0o600 }); // owner-only when created
       }
       deliver?.(message, extra);
     };
@@ -275,7 +289,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
   const detectAuthor = (declared?: Vendor): AuthorInfo => {
     const client = server.server.getClientVersion()?.name ?? null;
     if (declared) return { client, vendor: declared, vendor_source: "declared" };
-    const vendor = client ? (engine.config.author_vendors[client] ?? null) : null;
+    const vendor = client ? vendorOfClient(engine.config.author_vendors, client) : null;
     return { client, vendor, vendor_source: vendor ? "client" : "unknown" };
   };
 

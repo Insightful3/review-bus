@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runAdapter } from "./adapters/index.js";
@@ -188,7 +188,9 @@ export class Engine {
     if (inlineDocs.length) {
       const dir = this.store.ensureDir(id);
       try {
-        const files = writeInline(dir, "r1", inlineDocs);
+        const base = path.join(dir, "source", "r1");
+        mkdirSync(base, { recursive: true, mode: 0o700 });
+        const files = writeInline(base, inlineDocs);
         let i = 0;
         req = {
           ...input,
@@ -222,7 +224,13 @@ export class Engine {
       // snapshot_wait_seconds is an error on submit as before (nothing is kept); after that the
       // caller gets the review id, and a later snapshot error shows as a failed review.
       review.preparing = { pid: process.pid, host: os.hostname(), started_at: t };
-      this.store.withLock(id, () => this.store.save(review));
+      try {
+        this.store.withLock(id, () => this.store.save(review));
+      } catch (err) {
+        // Not saved: no review id was given out, so nothing of it (text sent inline included) stays.
+        if (!existsSync(path.join(this.store.dir(id), "review.json"))) rmSync(this.store.dir(id), { recursive: true, force: true });
+        throw err;
+      }
       const outcome: Promise<unknown> = this.startRound(review, runs, "prepared").then(
         () => null,
         (err: unknown) => err ?? new Error("snapshot failed"),
@@ -274,6 +282,19 @@ export class Engine {
       });
     } catch (e) {
       console.error(`review-bus: snapshot of ${id} failed (${message}) and could not be recorded: ${(e as Error).message}`);
+    }
+    this.dropUnusedSources(id);
+  }
+
+  /**
+   * Text sent inline is kept only for a review that has a round (a resubmit without new text reads
+   * it again). A review whose first snapshot failed or was canceled has none: its text goes.
+   */
+  private dropUnusedSources(id: string): void {
+    try {
+      if (!this.store.load(id).rounds.length) rmSync(path.join(this.store.dir(id), "source"), { recursive: true, force: true });
+    } catch {
+      /* the review is gone */
     }
   }
 
@@ -334,10 +355,16 @@ export class Engine {
     try {
       if (isNew) {
         addRound(review);
-        this.store.withLock(review.id, () => {
-          publish();
-          this.store.save(review);
-        });
+        try {
+          this.store.withLock(review.id, () => {
+            publish();
+            this.store.save(review);
+          });
+        } catch (err) {
+          // Never saved, so no review id was given out: remove everything written for it.
+          if (!existsSync(path.join(reviewDir, "review.json"))) rmSync(reviewDir, { recursive: true, force: true });
+          throw err;
+        }
       } else {
         // Another process may have changed the review while the snapshot was taken.
         const expected: ReviewState[] = mode === "prepared" ? ["submitted"] : RESUBMITTABLE;
@@ -446,16 +473,18 @@ export class Engine {
     let written: string | null = null;
     if (opts.artifact) {
       if (!review.request.artifact?.path) throw new Error("artifact can only be changed for document reviews; git changes and pages are captured again on resubmit.");
-      if (isInline(opts.artifact)) {
-        const sub = `r${round.n + 1}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-        written = path.join(this.store.dir(id), "source", sub);
-        review.request.artifact = { path: writeInline(this.store.ensureDir(id), sub, [opts.artifact])[0], inline: true };
-      } else {
-        review.request.artifact = { path: opts.artifact };
-      }
+      if (!isInline(opts.artifact)) review.request.artifact = { path: opts.artifact };
     }
     // The new round's blocking limit comes from the rubric as it is now (max_blocking may have changed).
     try {
+      if (isInline(opts.artifact)) {
+        inlineName(opts.artifact); // checked before a folder is made
+        // A folder made for this attempt alone (mkdtemp): racing resubmits never share one.
+        const sources = path.join(this.store.ensureDir(id), "source");
+        mkdirSync(sources, { recursive: true, mode: 0o700 });
+        written = mkdtempSync(path.join(sources, `r${round.n + 1}-`));
+        review.request.artifact = { path: writeInline(written, [opts.artifact])[0], inline: true };
+      }
       await this.startRound(review, runs, "resubmit", rubric.meta);
     } catch (err) {
       if (written) rmSync(written, { recursive: true, force: true });
@@ -489,6 +518,7 @@ export class Engine {
       r.history.push({ at: now(), event: "canceled" });
     });
     this.aborts.get(id)?.abort();
+    this.dropUnusedSources(id); // canceled before its first round: text sent inline is not kept
     return review;
   }
 
