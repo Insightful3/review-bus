@@ -31,25 +31,40 @@ export function inlineName(doc: InlineDoc): string {
  * checked before anything is written; nothing existing is ever overwritten.
  */
 export function writeInline(base: string, docs: InlineDoc[]): string[] {
-  const names = docs.map(inlineName);
-  return docs.map((doc, i) => {
-    const dir = path.join(base, String(i + 1).padStart(2, "0"));
-    mkdirSync(dir, { mode: 0o700 });
-    const file = path.join(dir, names[i]);
-    writeFileSync(file, doc.content, { mode: 0o600, flag: "wx" });
-    return file;
+  const files = inlinePaths(base, docs);
+  docs.forEach((doc, i) => {
+    mkdirSync(path.dirname(files[i]), { mode: 0o700 });
+    writeFileSync(files[i], doc.content, { mode: 0o600, flag: "wx" });
   });
+  return files;
 }
 
-/** Replaces inline text with its length, for logs: document bodies never leave the review folder. */
-export function redactInline(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactInline);
-  // Any object with a content key, valid or not: the log is written before the call is validated.
-  if (typeof value === "object" && value !== null && "content" in value) {
-    const { content, ...rest } = value as Record<string, unknown>;
-    return { ...rest, content: typeof content === "string" ? `[${content.length} characters]` : "[redacted]" };
+/** Where writeInline puts each document under base (checks every document, writes nothing). */
+export function inlinePaths(base: string, docs: InlineDoc[]): string[] {
+  return docs.map(inlineName).map((name, i) => path.join(base, String(i + 1).padStart(2, "0"), name));
+}
+
+/**
+ * A log-safe copy of review_submit's or review_respond's artifact: a path or a git change as given,
+ * a document as text by its name and length only. Anything else (a malformed value the schema will
+ * refuse) is replaced whole: the log is written before the call is validated.
+ */
+export function logSafeArtifact(value: unknown): unknown {
+  if (value === undefined || typeof value === "string") return value;
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const v = value as Record<string, unknown>;
+    if (Object.keys(v).length === 1 && "git" in v) return { git: v.git };
+    if ("content" in v || "name" in v) {
+      return { name: typeof v.name === "string" ? v.name.slice(0, 100) : "[redacted]", content: typeof v.content === "string" ? `[${v.content.length} characters]` : "[redacted]" };
+    }
   }
-  return value;
+  return "[redacted]";
+}
+
+/** The same for related: a list of paths and texts; anything else is replaced whole. */
+export function logSafeRelated(value: unknown): unknown {
+  if (value === undefined) return value;
+  return Array.isArray(value) ? value.map(logSafeArtifact) : "[redacted]";
 }
 
 export function isInline(x: unknown): x is InlineDoc {

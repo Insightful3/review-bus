@@ -16,7 +16,7 @@ import { ReviewerOutput, reviewerOutputJsonSchema } from "./spec/reviewer-output
 import { newReviewId, Store } from "./store.js";
 import { checkEffort, resolveModelEffort, reviewerLabel, type ReviewerSpec } from "./settings.js";
 import type { ArtifactRef, AuthorInfo, Finding, FindingResponse, InlineDoc, Review, ReviewRequest, ReviewerRun, ReviewState, Round } from "./types.js";
-import { inlineName, isInline, writeInline } from "./inline.js";
+import { inlineName, inlinePaths, isInline, writeInline } from "./inline.js";
 
 /** What review_submit and rb submit pass in: like ReviewRequest, but a document may come as text. */
 export type SubmitRequest = Omit<ReviewRequest, "artifact" | "related"> & {
@@ -184,25 +184,18 @@ export class Engine {
     const runs = specs.map((spec) => this.planRun(spec, rubric.meta, input.stage));
     const id = newReviewId();
     // Documents sent as text get a file in the review folder and are reviewed like any document.
-    let req: ReviewRequest;
+    // They are written only after the review is saved (below), so a process that stops at any
+    // point leaves either nothing or a review that recovery finds and cleans up.
+    let req: ReviewRequest = input as ReviewRequest;
+    const inlineBase = path.join(this.store.dir(id), "source", "r1");
     if (inlineDocs.length) {
-      const dir = this.store.ensureDir(id);
-      try {
-        const base = path.join(dir, "source", "r1");
-        mkdirSync(base, { recursive: true, mode: 0o700 });
-        const files = writeInline(base, inlineDocs);
-        let i = 0;
-        req = {
-          ...input,
-          artifact: text ? { path: files[i++], inline: true } : (input.artifact as ArtifactRef | null),
-          related: (input.related ?? []).map((r) => (isInline(r) ? files[i++] : r)),
-        };
-      } catch (err) {
-        rmSync(dir, { recursive: true, force: true });
-        throw err;
-      }
-    } else {
-      req = input as ReviewRequest;
+      const files = inlinePaths(inlineBase, inlineDocs);
+      let i = 0;
+      req = {
+        ...input,
+        artifact: text ? { path: files[i++], inline: true } : (input.artifact as ArtifactRef | null),
+        related: (input.related ?? []).map((r) => (isInline(r) ? files[i++] : r)),
+      };
     }
     const t = now();
     const review: Review = {
@@ -218,7 +211,7 @@ export class Engine {
       rounds: [],
       history: [{ at: t, event: "submitted", detail: `${describeArtifact(req)} with rubric ${req.rubric}` }],
     };
-    if (req.pages.length) {
+    if (req.pages.length || inlineDocs.length) {
       // Rendering pages can take longer than a client waits for a tool call: save the review first
       // and take the snapshot in the background. A snapshot that fails within
       // snapshot_wait_seconds is an error on submit as before (nothing is kept); after that the
@@ -230,6 +223,19 @@ export class Engine {
         // Not saved: no review id was given out, so nothing of it (text sent inline included) stays.
         if (!existsSync(path.join(this.store.dir(id), "review.json"))) rmSync(this.store.dir(id), { recursive: true, force: true });
         throw err;
+      }
+      if (inlineDocs.length) {
+        try {
+          mkdirSync(inlineBase, { recursive: true, mode: 0o700 });
+          writeInline(inlineBase, inlineDocs);
+        } catch (err) {
+          // No id was given out yet: the review goes, unless a cancel got there first.
+          this.store.withLock(id, () => {
+            if (this.store.load(id).state !== "canceled") rmSync(this.store.dir(id), { recursive: true, force: true });
+          });
+          this.dropUnusedSources(id);
+          throw err;
+        }
       }
       const outcome: Promise<unknown> = this.startRound(review, runs, "prepared").then(
         () => null,
@@ -292,12 +298,17 @@ export class Engine {
    */
   private dropUnusedSources(id: string): void {
     try {
-      if (this.store.load(id).rounds.length) return;
-      // With no round there is nothing to resubmit: the text and any half-made snapshot go.
-      const dir = this.store.dir(id);
-      for (const f of readdirSync(dir)) {
-        if (f === "source" || f.startsWith(".staging-")) rmSync(path.join(dir, f), { recursive: true, force: true });
-      }
+      // Under the lock: a live process publishes a round and records it in one locked step, so a
+      // round folder seen here with no round recorded is one nobody will record.
+      this.store.withLock(id, () => {
+        if (this.store.load(id).rounds.length) return;
+        // With no round there is nothing to resubmit: the text, any half-made snapshot and a round
+        // folder moved into place by a process that stopped before saving it all go.
+        const dir = this.store.dir(id);
+        for (const f of readdirSync(dir)) {
+          if (f === "source" || f.startsWith(".staging-") || /^r\d+$/.test(f)) rmSync(path.join(dir, f), { recursive: true, force: true });
+        }
+      });
     } catch {
       /* the review is gone */
     }

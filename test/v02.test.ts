@@ -1659,6 +1659,8 @@ test("REVIEW_BUS_LOG records a text document's name and length, never its conten
     // Malformed, refused by the schema: still logged without the text.
     await call("review_submit", { artifact: { content: secret }, rubric: "proposal", intent: "x" });
     await call("review_submit", { artifact: { name: 5, content: secret }, related: [{ content: [secret] }], rubric: "proposal", intent: "x" });
+    await call("review_submit", { artifact: { name: "c.md", content: "x" }, related: { "p.md": { content: secret } }, rubric: "proposal", intent: "x" });
+    await call("review_submit", { artifact: [{ name: "c.md", content: secret }], rubric: "proposal", intent: "x" });
   } finally {
     delete process.env.REVIEW_BUS_LOG;
   }
@@ -1709,11 +1711,14 @@ test("a server that stopped while taking the first snapshot leaves no text or ha
   writeFileSync(path.join(dir, "source/r1/01/post.md"), "Draft");
   mkdirSync(path.join(dir, ".staging-999999-abc/r1"), { recursive: true });
   writeFileSync(path.join(dir, ".staging-999999-abc/r1/artifact.md"), "Draft");
+  // Moved into place, but the process stopped before recording it.
+  mkdirSync(path.join(dir, "r1"), { recursive: true });
+  writeFileSync(path.join(dir, "r1/artifact.md"), "Draft");
   const saved = JSON.parse(readFileSync(path.join(dir, "review.json"), "utf8"));
   Object.assign(saved, { state: "submitted", preparing: { pid: 999999, host: os.hostname(), started_at: new Date().toISOString() } });
   writeFileSync(path.join(dir, "review.json"), JSON.stringify(saved));
   assert.equal(new Engine(loadConfig()).get(review.id).state, "failed");
-  assert.deepEqual(readdirSync(dir).filter((f) => f === "source" || f.startsWith(".staging-")), []);
+  assert.deepEqual(readdirSync(dir).filter((f) => f === "source" || f.startsWith(".staging-") || f === "r1"), []);
   writeConfig();
 });
 
@@ -1751,4 +1756,25 @@ test("an MCP request declaring a length over the limit gets a 413 before its bod
   });
   assert.equal(answer.status, 413);
   assert.match(answer.body, /Request too large/);
+});
+
+test("text is written only after its review is saved, so a stopped process always leaves a review recovery can find", async () => {
+  const e = new Engine(loadConfig());
+  const save = e.store.save.bind(e.store);
+  const atFirstSave: { preparing: boolean; textOnDisk: boolean }[] = [];
+  e.store.save = (r) => {
+    if (!atFirstSave.length) atFirstSave.push({ preparing: Boolean(r.preparing), textOnDisk: existsSync(path.join(tmp, "reviews", r.id, "source")) });
+    save(r);
+  };
+  const review = await e.submit({ artifact: { text: { name: "post.md", content: "Draft" } }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  // Saved first as being prepared by this process, with no text on disk yet.
+  assert.deepEqual(atFirstSave, [{ preparing: true, textOnDisk: false }]);
+  assert.ok(existsSync(path.join(tmp, "reviews", review.id, "source/r1/01/post.md")));
+  await e.settled(review.id);
+  assert.equal(e.get(review.id).state, "approved"); // "Draft" quotes none of the fake reviewer's findings
+});
+
+test("a git change with text fields next to it is refused, not reviewed as the git change", async () => {
+  const { res, text } = await call("review_submit", { artifact: { git: { repo: ROOT, mode: "uncommitted" }, name: "post.md", content: "Draft" }, rubric: "code", intent: "x" });
+  assert.equal(res.isError, true, text);
 });

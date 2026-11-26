@@ -17,7 +17,7 @@ import { readFile, stat } from "node:fs/promises";
 const MAX_TOOL_FILE_BYTES = 10 * 1024 * 1024;
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { INLINE_MAX_CHARS, redactInline } from "./inline.js";
+import { INLINE_MAX_CHARS, logSafeArtifact, logSafeRelated } from "./inline.js";
 import { loadConfig, vendorOfClient } from "./config.js";
 import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import { GitSpec } from "./git.js";
@@ -177,8 +177,8 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
                 arguments: {
                   ...a,
                   ...("token" in a ? { token: "[redacted]" } : {}),
-                  ...("artifact" in a ? { artifact: redactInline(a.artifact) } : {}),
-                  ...("related" in a ? { related: redactInline(a.related) } : {}),
+                  ...("artifact" in a ? { artifact: logSafeArtifact(a.artifact) } : {}),
+                  ...("related" in a ? { related: logSafeRelated(a.related) } : {}),
                 },
               }
             : params;
@@ -305,7 +305,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         "Called as an MCP task, it returns at once and the task completes with the result when the round finishes, or when only pull reviewers are left (waiting_for_pull: check back later with review_status).",
       inputSchema: {
         artifact: z
-          .union([z.string(), z.object({ git: GitSpec }), InlineDocSchema])
+          .union([z.string(), z.object({ git: GitSpec }).strict(), InlineDocSchema])
           .optional()
           .describe(
             'Absolute path to a document on the machine review-bus runs on; or the document as text, {"name": "post.md", "content": "..."} (.md or .txt, ' +
