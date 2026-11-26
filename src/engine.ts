@@ -292,7 +292,12 @@ export class Engine {
    */
   private dropUnusedSources(id: string): void {
     try {
-      if (!this.store.load(id).rounds.length) rmSync(path.join(this.store.dir(id), "source"), { recursive: true, force: true });
+      if (this.store.load(id).rounds.length) return;
+      // With no round there is nothing to resubmit: the text and any half-made snapshot go.
+      const dir = this.store.dir(id);
+      for (const f of readdirSync(dir)) {
+        if (f === "source" || f.startsWith(".staging-")) rmSync(path.join(dir, f), { recursive: true, force: true });
+      }
     } catch {
       /* the review is gone */
     }
@@ -368,14 +373,31 @@ export class Engine {
       } else {
         // Another process may have changed the review while the snapshot was taken.
         const expected: ReviewState[] = mode === "prepared" ? ["submitted"] : RESUBMITTABLE;
-        this.store.update(review.id, (r) => {
-          if (r.rounds.length !== n - 1 || !expected.includes(r.state)) {
-            throw new Error(`Review ${review.id} changed while round ${n} was being prepared (now ${r.state}, round ${r.rounds.length}). Nothing was started.`);
+        let published = false;
+        try {
+          this.store.update(review.id, (r) => {
+            if (r.rounds.length !== n - 1 || !expected.includes(r.state)) {
+              throw new Error(`Review ${review.id} changed while round ${n} was being prepared (now ${r.state}, round ${r.rounds.length}). Nothing was started.`);
+            }
+            publish();
+            published = true;
+            addRound(r);
+            r.preparing = null;
+          });
+        } catch (err) {
+          // Moved into place but not recorded (the save failed): take the round's files back out,
+          // unless another attempt has recorded a round n meanwhile.
+          if (published) {
+            try {
+              this.store.withLock(review.id, () => {
+                if (this.store.load(review.id).rounds.length < n) rmSync(this.store.roundDir(review.id, n), { recursive: true, force: true });
+              });
+            } catch {
+              /* left for the next attempt, which removes an unrecorded round folder before it moves its own */
+            }
           }
-          publish();
-          addRound(r);
-          r.preparing = null;
-        });
+          throw err;
+        }
       }
     } finally {
       dropStaging(); // empty after a successful move; the whole attempt after a failed one
@@ -685,13 +707,17 @@ export class Engine {
       return !this.runningElsewhere(rd.runner) && !this.runningElsewhere(rd.finalizing) && !waitingOnPull(rd);
     };
     if (!cutOff(review)) return this.expirePull(review);
-    return this.store.update(id, (r) => {
+    let preparing = false;
+    const failed = this.store.update(id, (r) => {
       if (!cutOff(r)) return; // changed meanwhile
-      const preparing = r.state === "submitted";
+      preparing = r.state === "submitted";
       r.state = "failed";
       r.preparing = null;
       r.history.push({ at: now(), event: "failed", detail: preparing ? "the snapshot was being taken when the server stopped" : "round was running when the server stopped" });
     });
+    // The process taking the first snapshot is gone: its text and half-made snapshot are not kept.
+    if (preparing) this.dropUnusedSources(id);
+    return failed;
   }
 
   /**

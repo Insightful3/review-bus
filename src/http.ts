@@ -56,6 +56,8 @@ export class BodyTooLarge extends Error {
  * rest is read and dropped up to twice the limit so the client can be answered; otherwise, or
  * beyond that, the connection is closed.
  */
+const tooLarge = () => `Request too large (over ${Math.round(MCP_BODY_LIMIT / 1024 / 1024)} MB). Send long documents as a path on the server's machine instead of as text.`;
+
 function readBody(req: http.IncomingMessage, limit = 4 * 1024 * 1024, drain = false): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -196,11 +198,18 @@ export async function startHttp(engine: Engine, opts: { port: number; host: stri
     let body: unknown;
     if (req.method === "POST") {
       let text: string;
+      // A declared length over the limit is answered at once, before any of the body is read.
+      if (Number(req.headers["content-length"] ?? 0) > MCP_BODY_LIMIT) {
+        res.setHeader("connection", "close");
+        send(res, 413, JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message: tooLarge() }, id: null }), "application/json");
+        req.resume();
+        return;
+      }
       try {
         text = await readBody(req, MCP_BODY_LIMIT, true);
       } catch (err) {
         if (!(err instanceof BodyTooLarge)) throw err;
-        const message = `Request too large (over ${Math.round(MCP_BODY_LIMIT / 1024 / 1024)} MB). Send long documents as a path on the server's machine instead of as text.`;
+        const message = tooLarge();
         // Answered once the body has arrived: a client still sending would miss an earlier reply.
         if (req.readableEnded) send(res, 413, JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message }, id: null }), "application/json");
         else req.once("end", () => send(res, 413, JSON.stringify({ jsonrpc: "2.0", error: { code: -32600, message }, id: null }), "application/json"));

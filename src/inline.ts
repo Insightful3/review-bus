@@ -43,8 +43,12 @@ export function writeInline(base: string, docs: InlineDoc[]): string[] {
 
 /** Replaces inline text with its length, for logs: document bodies never leave the review folder. */
 export function redactInline(value: unknown): unknown {
-  if (isInline(value)) return { name: value.name, content: `[${value.content.length} characters]` };
   if (Array.isArray(value)) return value.map(redactInline);
+  // Any object with a content key, valid or not: the log is written before the call is validated.
+  if (typeof value === "object" && value !== null && "content" in value) {
+    const { content, ...rest } = value as Record<string, unknown>;
+    return { ...rest, content: typeof content === "string" ? `[${content.length} characters]` : "[redacted]" };
+  }
   return value;
 }
 

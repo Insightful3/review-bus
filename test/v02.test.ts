@@ -1656,6 +1656,9 @@ test("REVIEW_BUS_LOG records a text document's name and length, never its conten
     const secret = "SECRET-CONTRACT-TEXT price EUR 99,999";
     await call("review_submit", { artifact: { name: "c.md", content: secret }, related: [{ name: "p.md", content: secret }], rubric: "proposal", intent: "x", wait_seconds: 5 });
     await call("review_submit", { artifact: { name: "../bad.md", content: secret }, rubric: "proposal", intent: "x" });
+    // Malformed, refused by the schema: still logged without the text.
+    await call("review_submit", { artifact: { content: secret }, rubric: "proposal", intent: "x" });
+    await call("review_submit", { artifact: { name: 5, content: secret }, related: [{ content: [secret] }], rubric: "proposal", intent: "x" });
   } finally {
     delete process.env.REVIEW_BUS_LOG;
   }
@@ -1665,11 +1668,24 @@ test("REVIEW_BUS_LOG records a text document's name and length, never its conten
   assert.equal(statSync(log).mode & 0o777, 0o600);
 });
 
-test("an MCP request over the HTTP size limit gets a 413 with a reason, not a dropped connection", async () => {
-  const body = Buffer.alloc(33 * 1024 * 1024, 0x20);
-  const res = await fetch(`${base}mcp`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}` }, body });
-  assert.equal(res.status, 413);
-  assert.match(await res.text(), /Request too large \(over 32 MB\)\. Send long documents as a path/);
+test("a streamed MCP request (no declared length) over the HTTP size limit gets a 413 with a reason, not a dropped connection", async () => {
+  const u = new URL(`${base}mcp`);
+  const answer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const req = http.request(
+      { host: u.hostname, port: u.port, path: u.pathname, method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}`, "transfer-encoding": "chunked" } },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => (body += c));
+        res.on("end", () => resolve({ status: res.statusCode!, body }));
+      },
+    );
+    req.on("error", reject);
+    const chunk = Buffer.alloc(1024 * 1024, 0x20);
+    for (let i = 0; i < 33; i++) req.write(chunk);
+    req.end();
+  });
+  assert.equal(answer.status, 413);
+  assert.match(answer.body, /Request too large \(over 32 MB\)\. Send long documents as a path/);
 });
 
 test("the Claude desktop app (chat and Cowork) is recognised as an Anthropic author", () => {
@@ -1680,4 +1696,59 @@ test("the Claude desktop app (chat and Cowork) is recognised as an Anthropic aut
   // An exact key wins over a prefix, and the longest prefix over a shorter one.
   assert.equal(vendorOfClient({ "a*": "openai", "ab*": "other", abc: "anthropic" }, "abc"), "anthropic");
   assert.equal(vendorOfClient({ "a*": "openai", "ab*": "other" }, "abd"), "other");
+});
+
+test("a server that stopped while taking the first snapshot leaves no text or half-made snapshot behind", async () => {
+  writeConfig({ snapshot_wait_seconds: 0 });
+  const a = new Engine(loadConfig());
+  const review = await a.submit({ artifact: { text: { name: "post.md", content: "Draft" } }, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  await a.settled(review.id);
+  // As a server killed mid-snapshot leaves it: preparing by a dead process, the text and a staging folder on disk.
+  const dir = path.join(tmp, "reviews", review.id);
+  mkdirSync(path.join(dir, "source/r1/01"), { recursive: true });
+  writeFileSync(path.join(dir, "source/r1/01/post.md"), "Draft");
+  mkdirSync(path.join(dir, ".staging-999999-abc/r1"), { recursive: true });
+  writeFileSync(path.join(dir, ".staging-999999-abc/r1/artifact.md"), "Draft");
+  const saved = JSON.parse(readFileSync(path.join(dir, "review.json"), "utf8"));
+  Object.assign(saved, { state: "submitted", preparing: { pid: 999999, host: os.hostname(), started_at: new Date().toISOString() } });
+  writeFileSync(path.join(dir, "review.json"), JSON.stringify(saved));
+  assert.equal(new Engine(loadConfig()).get(review.id).state, "failed");
+  assert.deepEqual(readdirSync(dir).filter((f) => f === "source" || f.startsWith(".staging-")), []);
+  writeConfig();
+});
+
+test("a resubmitted round whose save fails is taken back out: no unrecorded round folder stays", async () => {
+  const e = new Engine(loadConfig());
+  const review = await e.submit({ artifact: { text: { name: "post.md", content: readFileSync(FIXTURE, "utf8") } }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  await e.settled(review.id);
+  const answers = e.get(review.id).rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+  const save = e.store.save.bind(e.store);
+  e.store.save = (r) => {
+    if (r.rounds.length === 2) throw new Error("disk full");
+    save(r);
+  };
+  await assert.rejects(e.respond(review.id, answers, { resubmit: true, artifact: { name: "post.md", content: "Version two" } }), /disk full/);
+  e.store.save = save;
+  const dir = path.join(tmp, "reviews", review.id);
+  assert.equal(existsSync(path.join(dir, "r2")), false);
+  assert.deepEqual(readdirSync(path.join(dir, "source")), ["r1"]); // the attempt's text is gone too
+  assert.equal(e.get(review.id).rounds.length, 1);
+});
+
+test("an MCP request declaring a length over the limit gets a 413 before its body is read", async () => {
+  const u = new URL(`${base}mcp`);
+  const answer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const req = http.request(
+      { host: u.hostname, port: u.port, path: u.pathname, method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}`, "content-length": String(100 * 1024 * 1024) } },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => (body += c));
+        res.on("end", () => resolve({ status: res.statusCode!, body }));
+      },
+    );
+    req.on("error", reject);
+    req.write("{");
+  });
+  assert.equal(answer.status, 413);
+  assert.match(answer.body, /Request too large/);
 });
