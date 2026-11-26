@@ -94,6 +94,9 @@ after(async () => {
 });
 
 test("the tools are listed; sign-off is not one of them (people use rb signoff)", async () => {
+  // The server reports the version in package.json, not a number written into the code.
+  const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  assert.deepEqual(client.getServerVersion(), { name: "review-bus", version: pkg.version });
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
     "review_cancel",

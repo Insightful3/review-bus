@@ -185,8 +185,14 @@ async function main() {
       model: { type: "string" },
       port: { type: "string" },
       host: { type: "string" },
+      help: { type: "boolean", short: "h" },
     },
   });
+  // rb submit --help (or -h after any command) shows the help instead of running the command.
+  if (v.help) {
+    console.log(USAGE);
+    return;
+  }
   // Checking a rubric needs no config (a pack author may not have one).
   if (cmd === "rubric-check") {
     if (!pos[0]) fail("rubric-check needs a rubric file or a pack folder");

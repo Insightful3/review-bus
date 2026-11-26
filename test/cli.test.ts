@@ -42,6 +42,12 @@ const idFrom = (s: string) => s.match(/rv_[0-9a-z]{26}/)![0];
 test("help and bad input", () => {
   assert.equal(rb("--help").code, 0);
   assert.match(rb("--help").out, /rb submit <file>/);
+  // --help or -h after a command shows the help and runs nothing, even with other arguments missing.
+  for (const args of [["submit", "--help"], ["submit", FIXTURE, "-h"], ["respond", "--help"], ["rubric-check", "-h"]]) {
+    const h = rb(...args);
+    assert.deepEqual([h.code, h.err], [0, ""], args.join(" "));
+    assert.match(h.out, /rb submit <file>/, args.join(" "));
+  }
   const noRubric = rb("submit", FIXTURE, "--intent", "x");
   assert.deepEqual([noRubric.code, noRubric.err.trim()], [1, "rb: submit needs --rubric"]);
   assert.equal(rb("bogus").code, 1);

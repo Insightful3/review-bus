@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-11-26)
+
+- `rb <command> --help` (or `-h`) shows the help. Before, `rb submit --help` failed with "Unknown option".
+- The version the MCP server reports to clients now comes from `package.json`, so it always matches the installed release.
+
 ## 0.2.0 (2026-11-26)
 
 First public release.

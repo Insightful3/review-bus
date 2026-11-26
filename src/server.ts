@@ -10,15 +10,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { appendFileSync, realpathSync } from "node:fs";
+import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
 
 /** Largest file review_file returns in one tool result. */
 const MAX_TOOL_FILE_BYTES = 10 * 1024 * 1024;
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { INLINE_MAX_CHARS, logSafeArtifact, logSafeRelated } from "./inline.js";
-import { loadConfig, vendorOfClient } from "./config.js";
+import { loadConfig, PACKAGE_ROOT, vendorOfClient } from "./config.js";
 import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import { GitSpec } from "./git.js";
 import { ReviewerSpec, Vendor } from "./settings.js";
@@ -26,6 +27,9 @@ import { describeArtifact } from "./snapshot.js";
 import { listRubrics } from "./rubrics.js";
 import { renderSummary } from "./store.js";
 import type { AuthorInfo, Review } from "./types.js";
+
+/** The version from package.json, reported to MCP clients. */
+const VERSION: string = JSON.parse(readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8")).version;
 
 /** A document sent as text: for clients that do not share this machine's disk (chat apps, sandboxes). */
 const InlineDocSchema = z
@@ -149,7 +153,7 @@ const TASK_TTL_MS = 2 * 60 * 60 * 1000;
 export function createServer(engine: Engine): { server: McpServer; trackTaskRequests: (transport: Transport) => void; taskStore: InMemoryTaskStore } {
   const taskStore = new InMemoryTaskStore();
   const server = new McpServer(
-    { name: "review-bus", version: "0.2.0" },
+    { name: "review-bus", version: VERSION },
     {
       capabilities: { tasks: { requests: { tools: { call: {} } } } },
       taskStore,
