@@ -1,8 +1,8 @@
-# v0.1 task list
+# Task list
 
-Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
+Order follows "thinnest slice first, then widen". See `SPEC.md` for details. Released versions are in `CHANGELOG.md`; the next one is planned under v0.3 at the end.
 
-## Slice 1: one document review loop (in progress)
+## Slice 1: one document review loop (done)
 
 - [x] Project scaffold: TypeScript, Node 22+, ESM, `@modelcontextprotocol/sdk`, `zod`
 - [x] Reviewer output schema in zod, JSON Schema generated into `spec/` (Codex strict rules)
@@ -60,9 +60,8 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] Claude Code waits for the finished review in one call: progress notifications every 10 s keep the call alive (checked with Claude Code 2.1.316 and a 70 s review)
 - [ ] 2026-07-28 Tasks extension, if Claude Code ever needs it over stdio: the v2 SDK 2.4.0 serves 2026-07-28 over HTTP only
 - [ ] Resubmit with pages: return before the capture too
-- [ ] Hosted multi-user mode (accounts instead of one token), Gemini adapter, GitHub sync
+- [ ] Hosted multi-user mode (accounts instead of one token), GitHub sync
 - [ ] claude.ai web and phone without the desktop app: `rb serve` as a remote connector (a tunnel plus OAuth, since claude.ai connectors cannot send our bearer token)
-- [ ] `rb submit -` reading the document from stdin
 
 ## v0.2 (25 Nov 2026)
 
@@ -76,3 +75,15 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] Documents sent as text (SPEC 3): `{name, content}` for the artifact, related documents and resubmits, for chat apps and sandboxes without this machine's disk; README shows the Claude desktop app setup
 - [x] Codex review of documents sent as text (rv_01m8ba757d2tnwykkjd7vrft5b): text redacted from REVIEW_BUS_LOG, cleaned up on every failure path, a folder per resubmit, 413 with a reason over HTTP; the Claude desktop app recognised as an Anthropic author
 - [x] Second Codex review of documents sent as text (rv_01m8bagnv47m5nqz4tv8npbzwq, 3 rounds, escalated at the cap): crash windows closed (review saved before its text, cleanup retried on every look, dead resubmit attempts pruned), allowlisted log fields, text next to a git change refused. Not changed: text is kept once its review is saved, even if the client never received the id
+
+## v0.3 (planned)
+
+From the first real use of the released 0.2.1 (26 Nov 2026): a document review of a client contract over 3 rounds, and a code review by Claude Code over MCP with Codex reviewing.
+
+- [ ] Later rounds block only on what is new and serious: from round 2 on, a finding blocks only if it is high or critical, or if it is about a change made since the last round. In both reviews, rounds 2 and 3 mostly reacted to the previous round's fixes (a 4-line cart function grew to about 60 lines of exact decimal maths; half the contract's later findings came from earlier fixes)
+- [ ] Shorter results: `review_result` for the contract was about 65,000 characters, too long for an agent to read in one call. Return the summary and blocking findings, with advisory findings and full quotes only on request
+- [ ] `review_wait` in the Claude desktop app's Code tab stopped after 50 s each call instead of the longer wait clients that show progress get. Find out what the client sends and lift the cap where it is safe
+- [ ] Resubmit a document sent as text without sending all of it again: accept the changes (find and replace) against the last version, so an agent does not have to retype a long document
+- [ ] Antigravity CLI (`agy`, Google's successor to Gemini CLI) as an author: a `google` vendor and its MCP client name in `author_vendors`; README setup for `~/.gemini/config/mcp_config.json`
+- [ ] Antigravity CLI as a reviewer: an `agy` adapter (`agy -p` with `--mode=plan`, `--output-format json`, `--model`, `--effort`), started in the review folder, tested with a fake. Check first that plan mode answers headless and that output arrives when stdout is not a terminal
+- [ ] `rb submit -` reading the document from stdin
