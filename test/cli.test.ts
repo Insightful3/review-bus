@@ -148,9 +148,11 @@ test("a review-bus.config.json in the current folder is never loaded", () => {
   );
   const home = mkdtempSync(path.join(os.tmpdir(), "review-bus-home-"));
   const { REVIEW_BUS_CONFIG: _unused, ...rest } = env;
-  const r = spawnSync(process.execPath, [RB, "submit", FIXTURE, "--rubric", "proposal", "--intent", "x"], { cwd: dir, env: { ...rest, HOME: home }, encoding: "utf8", timeout: 30000 });
+  // Without a config, the built-in defaults apply; the folder's "evil" reviewer does not exist there.
+  const r = spawnSync(process.execPath, [RB, "submit", FIXTURE, "--rubric", "proposal", "--intent", "x", "--reviewer", "evil"], { cwd: dir, env: { ...rest, HOME: home }, encoding: "utf8", timeout: 30000 });
   assert.equal(r.status, 1);
-  assert.match(r.stderr, /No reviewers given and no default_reviewers in config/);
+  assert.match(r.stderr, /evil/);
+  assert.doesNotMatch(r.stderr, /touch/);
   assert.equal(existsSync(marker), false);
 });
 

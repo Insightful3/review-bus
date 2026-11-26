@@ -1929,3 +1929,12 @@ test("rounds saved before later_rounds existed keep the round 1 rule", () => {
   assert.equal(laterRounds(round({ max_blocking: 5, max_rounds: 3 })), "same"); // frozen before the setting
   assert.equal(laterRounds(round({ max_blocking: 5, max_rounds: 3, later_rounds: "stricter" })), "stricter");
 });
+
+test("without a config file review-bus uses the example config: Codex and Claude review, reviews in ~/.review-bus", () => {
+  const c = loadConfig(null);
+  assert.deepEqual(c.default_reviewers, ["codex", "claude"]);
+  assert.deepEqual([c.adapters.codex.type, c.adapters.claude.type, c.adapters.agy.vendor], ["codex", "claude", "google"]);
+  assert.equal(c.storage.documents, path.join(os.homedir(), ".review-bus", "reviews"));
+  assert.equal(c.config_file, null);
+  assert.ok(c.rubric_paths.includes(path.join(os.homedir(), ".review-bus", "rubrics")));
+});

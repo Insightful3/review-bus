@@ -138,11 +138,20 @@ function findConfigFile(): string | null {
   return candidates.find((p) => existsSync(p)) ?? null;
 }
 
-/** Loads the config from REVIEW_BUS_CONFIG or ~/.review-bus/config.json, or from `file` to reload the same one. */
+/**
+ * Settings when there is no config file: those of the example config shipped with the package
+ * (Codex and Claude as reviewers, reviews in ~/.review-bus/reviews), so review-bus works right after
+ * install. Copy the example to ~/.review-bus/config.json to change them.
+ */
+export function builtInDefaults(): Record<string, unknown> {
+  return JSON.parse(readFileSync(path.join(PACKAGE_ROOT, "review-bus.config.example.json"), "utf8"));
+}
+
+/** Loads the config from REVIEW_BUS_CONFIG or ~/.review-bus/config.json, or from `file` to reload the same one; without one, the built-in defaults. */
 export function loadConfig(file: string | null = findConfigFile()): Config {
-  const raw = file ? JSON.parse(readFileSync(file, "utf8")) : {};
+  const raw = file ? JSON.parse(readFileSync(file, "utf8")) : builtInDefaults();
   const parsed = Config.parse(raw);
-  const config_dir = file ? path.dirname(file) : process.cwd();
+  const config_dir = file ? path.dirname(file) : path.join(os.homedir(), ".review-bus");
   const resolve = (p: string) => path.resolve(config_dir, expandHome(p));
   // Reviewers run with the round folder as cwd, so relative paths in a command adapter
   // ("./test/fake-reviewer.mjs") are resolved against the config file's folder.

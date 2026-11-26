@@ -1,36 +1,40 @@
 # review-bus
 
-A review layer for AI agents. An agent submits its work (a document, a code change or web pages), other agents review it, and the verdict comes back as structured state the author has to answer: every blocking finding must be accepted, rejected with a reason or deferred before the review can close or go another round.
+Have a second AI, from a different company, review your AI agent's work before you use it.
 
-It runs as an MCP server (over stdio, or over HTTP with `rb serve`), so any MCP client can be the author. Claude Code and Codex are both supported as authors and as reviewers, and by default a review always goes to a model from a different vendor than the author. People and agents in other tools can review too: they pick up waiting work and post their answer, from the web inbox, `rb` or MCP.
+Your agent (Claude Code, Codex, the Claude desktop app, Antigravity or any MCP client) submits a document, a code change or web pages. Another model reviews a frozen copy read-only, against a rubric, and sends back findings. Every blocking finding must be fixed or answered (accepted, rejected with a reason, or deferred) before the review closes, and after at most 3 rounds a person decides. By default, a Claude agent's work goes to Codex and Codex's work goes to Claude. People can review too, from a web inbox or the `rb` command line.
 
-Status: v0.2. See `SPEC.md` for the design and `TASKS.md` for what is built and what is open.
+Status: 0.3. See `CHANGELOG.md` for what changed, `SPEC.md` for the design and `TASKS.md` for what is open.
 
 ## Quick start
 
-You need Node.js 22 or newer, git, and the Codex CLI logged in (`npm install -g @openai/codex`, then `codex login`). Claude Code is the author in this example; Codex reviews its work.
+About two minutes, with Claude Code as the author. You need Node.js 22 or newer, git, and a reviewer from a different vendor than your agent, logged in. For Claude Code that is Codex:
 
-1. Install review-bus and copy the example config:
+```bash
+npm install -g @openai/codex
+codex login
+```
+
+(Antigravity works as the reviewer too; see Antigravity as a reviewer.)
+
+1. Install review-bus and connect it to Claude Code:
 
    ```bash
    npm install -g review-bus
-   mkdir -p ~/.review-bus
-   cp "$(npm root -g)/review-bus/review-bus.config.example.json" ~/.review-bus/config.json
+   claude mcp add review-bus -s user -- review-bus
    ```
 
-2. Connect it to Claude Code:
+2. Start a new Claude Code session and ask, in a git repo with uncommitted changes:
 
-   ```bash
-   claude mcp add review-bus -s user -e REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- review-bus
-   ```
+   > Review my uncommitted changes with review-bus (code rubric), then fix or answer every blocking finding.
 
-3. In a Claude Code session inside a git repo, ask:
+   Or for a document, anywhere:
 
-   > Submit my uncommitted changes to review-bus with the `code` rubric, wait for the result and answer every blocking finding.
+   > Review /path/to/proposal.docx with review-bus using the proposal rubric. The intent is to win the project at a fixed price. Then answer every blocking finding.
 
-Claude Code sends the change, Codex reviews a frozen copy of it read-only, and the findings come back. Claude fixes or answers each blocking one, resubmits, and after at most 3 rounds the review is approved or a person decides. Every review is kept in `~/.review-bus/reviews`, with a readable `report.md`.
+A review takes about a minute; a large change or high effort takes several. Claude Code waits for it, shows the findings, fixes or answers each blocking one and resubmits until the review closes. Every review is kept in `~/.review-bus/reviews`, with a readable `report.md`.
 
-For documents, use a document rubric (`proposal`, `contract-b2b`, `client-email`, `linkedin-post`, `plan`, `sop`) and give the file's path, or send the text itself. The rest of this README covers the details: other authors (Codex, the Claude desktop app), people as reviewers, the web inbox, and writing your own rubrics.
+No config file is needed: without one, review-bus uses the settings in `review-bus.config.example.json` from the package. Copy it to `~/.review-bus/config.json` when you want to change reviewers, approvals or limits (see Configure). Other document rubrics: `contract-b2b`, `client-email`, `linkedin-post`, `plan`, `sop`; `rb rubrics` lists them all. The rest of this README covers other authors (Codex, the Claude desktop app, Antigravity), people as reviewers, the web inbox and writing your own rubrics.
 
 ## What it reviews
 
@@ -79,7 +83,7 @@ Then restart Claude Code, the Claude desktop app, or whatever runs the MCP serve
 
 ## Configure
 
-Copy the example config (from the npm package or a source checkout) and edit it:
+Without a config file, review-bus uses the example config's settings. To change them, copy the example config (from the npm package or a source checkout) and edit it:
 
 ```bash
 mkdir -p ~/.review-bus
@@ -88,7 +92,7 @@ cp "$(npm root -g)/review-bus/review-bus.config.example.json" ~/.review-bus/conf
 
 The example uses Codex and Claude Code as reviewers, approves both for `contract-b2b`, and looks for your own rubrics in `~/.review-bus/rubrics`. Remove a reviewer you do not have from `default_reviewers`.
 
-The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.json`. It is never read from the current folder: a config names commands to run, and a cloned repo is not a trusted source of commands. Relative paths in it are resolved against the config file's folder.
+The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.json`, else the example config's settings built in. It is never read from the current folder: a config names commands to run, and a cloned repo is not a trusted source of commands. Relative paths in it are resolved against the config file's folder.
 
 | Key | What it does |
 | --- | --- |
@@ -115,25 +119,24 @@ Any MCP client can be the author. These three are tested.
 ### Claude Code
 
 ```bash
-claude mcp add review-bus -s user -e REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- review-bus
+claude mcp add review-bus -s user -- review-bus
 ```
+
+It reads `~/.review-bus/config.json` when that exists. To use a config elsewhere, add `-e REVIEW_BUS_CONFIG=/path/to/config.json` before `--`.
 
 ### Codex
 
 ```bash
-codex mcp add review-bus --env REVIEW_BUS_CONFIG=$HOME/.review-bus/config.json -- review-bus
+codex mcp add review-bus -- review-bus
 ```
 
-Then open `~/.codex/config.toml` and add two lines to the `[mcp_servers.review-bus]` section it created. Put them right after the `command` line (or `args`, from a source checkout), before `[mcp_servers.review-bus.env]`: anything below that header becomes an environment variable instead of a setting.
+Then open `~/.codex/config.toml` and add two lines to the `[mcp_servers.review-bus]` section it created, right after the `command` line (or `args`, from a source checkout). If the section has an `[mcp_servers.review-bus.env]` part, the lines go before it: anything below that header becomes an environment variable instead of a setting.
 
 ```toml
 [mcp_servers.review-bus]
 command = "review-bus"
 default_tools_approval_mode = "approve"
 tool_timeout_sec = 120
-
-[mcp_servers.review-bus.env]
-REVIEW_BUS_CONFIG = "/Users/you/.review-bus/config.json"
 ```
 
 Without `default_tools_approval_mode`, `codex exec` refuses every review-bus tool call ("MCP tool call requires approval"). `tool_timeout_sec` gives tool calls more than the default 60 seconds. Check with `codex mcp get review-bus`, which should list both.
@@ -148,7 +151,6 @@ Add review-bus to `~/Library/Application Support/Claude/claude_desktop_config.js
     "review-bus": {
       "command": "/opt/homebrew/bin/review-bus",
       "env": {
-        "REVIEW_BUS_CONFIG": "/Users/you/.review-bus/config.json",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
       }
     }
