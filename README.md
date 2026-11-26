@@ -104,7 +104,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 | `http` | For `rb serve`: `host` (default `127.0.0.1`), `port` (7777), `token_file` (`~/.review-bus/http-token`), `allow_remote` (false), `allowed_hosts`, `public_origin` (behind a TLS proxy) |
 | `snapshot_wait_seconds` | How long `review_submit` waits for page screenshots before returning the review id (default 10) |
 | `storage.documents` | Where reviews are stored (default `~/.review-bus/reviews`) |
-| `author_vendors` | Maps MCP client names to vendors (`anthropic`, `openai`, `google`, `other`). `claude-code`, `codex-mcp-client` and `local-agent-mode-*` (the Claude desktop app) are built in; a key ending in `*` matches names that start with the rest |
+| `author_vendors` | Maps MCP client names to vendors (`anthropic`, `openai`, `google`, `other`). `claude-code`, `codex-mcp-client`, `local-agent-mode-*` (the Claude desktop app) and `antigravity-client` (Antigravity CLI) are built in; a key ending in `*` matches names that start with the rest |
 | `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px), `args` (extra Chrome flags) |
 | `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`. Without it, only near-identical findings are merged |
 | `max_wait_seconds` | Longest a tool call waits before returning (default 50, under the usual 60 second client timeout) |
@@ -164,7 +164,13 @@ The server runs on your computer, so reviewers use the Codex or Claude login the
 
 Google's Antigravity CLI (`agy`) reads MCP servers from `~/.gemini/config/mcp_config.json`; the Antigravity app has its own list under Customizations, MCP Servers. The format is the same `mcpServers` block as for the Claude desktop app above.
 
-review-bus does not know Antigravity's MCP client name yet, so it cannot tell on its own that the author is Google's. Either ask the agent to pass `author_vendor: "google"` in `review_submit`, or find the client name in a `REVIEW_BUS_LOG` file (the `initialize` line) and map it in `author_vendors`, for example `"<that name>": "google"`. Then the default reviewers (Codex and Claude) both review its work.
+The Antigravity CLI connects as `antigravity-client`, which review-bus counts as a Google author, so the default reviewers (Codex and Claude) both review its work. If another Antigravity client shows up as unknown, pass `author_vendor: "google"` in `review_submit`, or map its name (the `initialize` line of a `REVIEW_BUS_LOG` file) in `author_vendors`.
+
+agy asks before it calls an MCP tool. In headless runs (`agy -p`) nobody can answer, so the call is refused; allow review-bus's tools in `~/.gemini/antigravity-cli/settings.json`:
+
+```json
+{ "permissions": { "allow": ["mcp(review-bus/*)"] } }
+```
 
 ## Use it
 

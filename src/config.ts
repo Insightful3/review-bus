@@ -30,7 +30,7 @@ export type AdapterConfig = Omit<z.infer<typeof AdapterConfigIn>, "vendor" | "ti
 // MCP clientInfo.name -> vendor. Names checked against Claude Code 2.1.316 and Codex 0.172.0. A
 // key ending in * matches names starting with the rest: the Claude desktop app (chat and Cowork)
 // connects as "local-agent-mode-<server name>".
-const DEFAULT_AUTHOR_VENDORS: Record<string, Vendor> = { "claude-code": "anthropic", "codex-mcp-client": "openai", "local-agent-mode-*": "anthropic" };
+const DEFAULT_AUTHOR_VENDORS: Record<string, Vendor> = { "claude-code": "anthropic", "codex-mcp-client": "openai", "local-agent-mode-*": "anthropic", "antigravity-client": "google" };
 
 /** Whether an MCP client name is in a list of names and prefixes ending in *. */
 export function clientListed(list: string[], client: string | null): boolean {

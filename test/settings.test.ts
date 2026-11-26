@@ -67,6 +67,7 @@ test("client names map to vendors by default", () => {
   const cfg = loadConfig();
   assert.equal(cfg.author_vendors["claude-code"], "anthropic");
   assert.equal(cfg.author_vendors["codex-mcp-client"], "openai");
+  assert.equal(cfg.author_vendors["antigravity-client"], "google"); // what agy 1.5.18 sends in initialize
 });
 
 test("an explicitly named config that does not exist is an error, not a silent fallback", () => {
