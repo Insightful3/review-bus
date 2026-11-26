@@ -14,7 +14,7 @@ function previousRound(round: Round): string {
   return `
 ## Previous round (round ${round.n})
 
-These findings were raised on the previous version, with the author's answers. Check that accepted findings are fixed in this version. Do not raise a rejected finding again unless the author's reason does not hold; if you do, say in evidence why the reason does not hold.
+These findings were raised on the previous version, with the author's answers. Check that accepted findings are fixed in this version, and look for problems the fixes introduced. Do not raise a rejected finding again unless the author's reason does not hold; if you do, say in evidence why the reason does not hold. Rate new findings as you would in a first round: do not raise the impact of a small point because it is new.
 
 ${items.join("\n")}
 `;

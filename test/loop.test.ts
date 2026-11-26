@@ -1,7 +1,7 @@
 // End-to-end: an MCP client spawns the server over stdio, submits a Markdown document,
 // the fake command reviewer runs, and review_result returns the findings.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -49,6 +49,9 @@ before(async () => {
       codex: { type: "codex", command: path.join(ROOT, "test/fake-codex.mjs"), timeout_seconds: 30 },
       claude: { type: "claude", command: path.join(ROOT, "test/fake-claude.mjs"), timeout_seconds: 30 },
       claude_err: { type: "claude", command: path.join(ROOT, "test/fake-claude.mjs"), args: ["--fake-mode=error"], timeout_seconds: 30 },
+      agy: { type: "agy", command: path.join(ROOT, "test/fake-agy.mjs"), timeout_seconds: 30 },
+      agy_denied: { type: "agy", command: path.join(ROOT, "test/fake-agy.mjs"), args: ["--fake-mode=denied"], timeout_seconds: 30 },
+      agy_err: { type: "agy", command: path.join(ROOT, "test/fake-agy.mjs"), args: ["--fake-mode=error"], timeout_seconds: 30 },
     },
   };
   const configFile = path.join(tmp, "config.json");
@@ -98,6 +101,21 @@ test("full loop: submit a Markdown proposal, fake reviewer finds issues, result 
   // Without include_advisory only blocking findings come back.
   const blockingOnly = await call("review_result", { review_id: id });
   assert.equal(blockingOnly.json.findings.length, 2);
+
+  // The JSON does not repeat the long texts the Markdown already has; advisory findings are one
+  // line each in the Markdown. full: true gives everything, as report.md does.
+  const f1 = json.findings[0];
+  assert.equal(f1.claim, "The total price in the summary (EUR 24,000) does not match the price table (EUR 22,500).");
+  assert.deepEqual([f1.failure_scenario, f1.evidence, f1.suggested_fix, f1.location.quote], [undefined, undefined, undefined, undefined]);
+  assert.equal(f1.location.section, "Summary");
+  assert.match(result.markdown, /Failure scenario: The client signs expecting EUR 22,500/); // blocking: in full
+  assert.match(result.markdown, /- \*\*r1\.f3\*\* \[medium\/possible\] \(Timeline\) The go-live date/); // advisory: one line
+  assert.doesNotMatch(result.markdown, /Bluefin delivers access late/);
+  assert.match(result.markdown, /Evidence: Summary says EUR 24,000/); // evidence once, in the Markdown
+  const full = await call("review_result", { review_id: id, full: true }); // full includes advisory findings
+  assert.equal(full.json.findings[2].failure_scenario, "Bluefin delivers access late and still expects go-live on 15 March.");
+  assert.match(full.markdown, /Bluefin delivers access late/);
+  assert.ok(JSON.stringify(full.res).length > JSON.stringify(result.res).length);
 
   // Storage: snapshot copy, prompt, raw reviewer output and report, outside the repo.
   const dir = path.join(tmp, "reviews", id);
@@ -218,6 +236,34 @@ test("claude adapter surfaces an error envelope as a failed reviewer", async () 
   const { json } = await call("review_submit", { artifact: FIXTURE, rubric: "proposal", intent: "x", reviewers: ["claude_err"], wait_seconds: 10 });
   assert.equal(json.state, "failed");
   assert.match(json.reviewers[0].error, /error_max_turns/);
+});
+
+test("agy adapter (Antigravity CLI): read-only deny rules, schema file, the last valid answer in the response", async () => {
+  const { json, markdown } = await call("review_submit", { artifact: FIXTURE, rubric: "proposal", intent: "x", reviewers: [{ name: "agy", model: "gemini-test", effort: "high" }], wait_seconds: 10 });
+  const r = json.reviewers[0];
+  assert.equal(r.status, "done", r.error ?? "");
+  assert.deepEqual([r.vendor, r.label, r.model_source, r.effort_source], ["google", "agy:gemini-test:high", "call", "call"]);
+  assert.match(r.summary, /^Fake agy review\./); // the second, valid attempt
+  assert.equal(json.findings[0].finding_id, "r1.f1");
+  assert.match(markdown, /model gemini-test \(requested, from call\)/i);
+  const outDir = path.join(tmp, "reviews", json.review_id, "r1");
+  assert.ok(existsSync(path.join(outDir, "agy.schema.json")));
+  // The prompt (the document) is in an owner-only file, never on agy's command line (the fake checks argv).
+  assert.equal(statSync(path.join(outDir, "agy-prompt.md")).mode & 0o777, 0o600);
+});
+
+test("agy adapter: a long prompt works the same way; a denied tool or an error fails the reviewer with the reason", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "review-bus-agy-"));
+  const long = path.join(dir, "long.md");
+  writeFileSync(long, readFileSync(FIXTURE, "utf8") + "\n" + "Background paragraph. ".repeat(6000));
+  const { json } = await call("review_submit", { artifact: long, rubric: "proposal", intent: "x", reviewers: ["agy"], wait_seconds: 10 });
+  assert.equal(json.reviewers[0].status, "done", json.reviewers[0].error ?? "");
+  assert.ok(existsSync(path.join(tmp, "reviews", json.review_id, "r1", "agy-prompt.md")));
+  const denied = (await call("review_submit", { artifact: FIXTURE, rubric: "proposal", intent: "x", reviewers: ["agy_denied"], wait_seconds: 10 })).json;
+  assert.equal(denied.state, "failed");
+  assert.match(denied.reviewers[0].error, /no answer \(it tried a tool reviewers may not use: Bash\)/);
+  const err = (await call("review_submit", { artifact: FIXTURE, rubric: "proposal", intent: "x", reviewers: ["agy_err"], wait_seconds: 10 })).json;
+  assert.match(err.reviewers[0].error, /agy -p reported ERROR: .*model not available/);
 });
 
 test("rejects unknown rubric, unknown reviewer and unsupported file type", async () => {

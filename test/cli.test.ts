@@ -211,3 +211,14 @@ test("reviewers stop when their runner is killed outright", async () => {
   while (alive() && Date.now() < until) await new Promise((r) => setTimeout(r, 200));
   assert.equal(alive(), false, "the watchdog should stop a reviewer (even one ignoring SIGTERM) after its runner died");
 });
+
+test("rb submit - reviews a document piped in on standard input", () => {
+  const r = spawnSync(process.execPath, [RB, "submit", "-", "--name", "post.md", "--rubric", "proposal", "--intent", "Win the project."], { env, encoding: "utf8", input: readFileSync(FIXTURE, "utf8"), timeout: 60000 });
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stdout, /Artifact: post\.md \(sent as text\)/);
+  assert.match(r.stdout, /State: \*\*changes_requested\*\*/);
+  // Nothing piped in: refused rather than reviewing an empty document.
+  const empty = spawnSync(process.execPath, [RB, "submit", "-", "--rubric", "proposal", "--intent", "x"], { env, encoding: "utf8", input: "", timeout: 60000 });
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /is empty/);
+});

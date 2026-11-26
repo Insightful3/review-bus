@@ -258,6 +258,7 @@ function findingLine(f: Finding): string {
     loc ? `  - Where: ${loc}` : null,
     f.location.quote ? `  - Quote: "${f.location.quote}"` : null,
     f.failure_scenario ? `  - Failure scenario: ${f.failure_scenario}` : null,
+    f.evidence ? `  - Evidence: ${f.evidence}` : null,
     f.suggested_fix ? `  - Suggested fix: ${f.suggested_fix}` : null,
     `  - Reviewer: ${f.reviewer}, confidence ${f.confidence}`,
     f.agreement > 1 ? `  - Also raised by: ${(f.also_raised_by ?? []).map((r) => `${r.reviewer} [${r.impact}/${r.likelihood}]`).join(", ")} (agreement ${f.agreement})` : null,
@@ -266,7 +267,14 @@ function findingLine(f: Finding): string {
   return "- " + parts.filter(Boolean).join("\n");
 }
 
-export function renderSummary(review: Review, includeAdvisory = true): string {
+/** An advisory finding on one line, for tool results: the full text is in report.md and in review_result with full. */
+function shortLine(f: Finding): string {
+  const loc = f.location.section ?? (f.location.line_start != null ? `line ${f.location.line_start}` : null);
+  return `- **${f.finding_id}** [${f.impact}/${f.likelihood}]${loc ? ` (${loc})` : ""} ${f.claim}${f.response ? ` Response: ${f.response.status}.` : ""}`;
+}
+
+/** includeAdvisory: list advisory findings too; full (default): each in full, else one line each. */
+export function renderSummary(review: Review, includeAdvisory = true, full = true): string {
   const round = review.rounds.at(-1);
   const lines: string[] = [`# Review ${review.id}`, ""];
   if (typeof review.rubric_meta.report_notice === "string") lines.push(`> ${review.rubric_meta.report_notice}`, "");
@@ -307,6 +315,9 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
         ? `- Findings: ${blocking.length} blocking, ${overLimit.length + advisory.length} advisory${overLimit.length ? ` (${overLimit.length} of them would block but are over the limit of ${limit ?? blocking.length} blocking per round)` : ""}`
         : "- Findings: not yet, the round is still running",
     );
+    if (round.n >= 2 && round.policy?.later_rounds === "stricter" && review.request.stage !== "draft") {
+      lines.push("- From round 2 only critical findings, and high ones that are certain or likely, block");
+    }
     const unanswered = blocking.filter((f) => !f.response).length;
     if (blocking.length) lines.push(`- Unanswered blocking findings: ${unanswered}`);
     if (review.signoff) lines.push(`- Signed off by ${review.signoff.by} on ${review.signoff.at}${review.signoff.note ? `: ${review.signoff.note}` : ""}`);
@@ -341,7 +352,8 @@ export function renderSummary(review: Review, includeAdvisory = true): string {
     }
     if (includeAdvisory) {
       lines.push("", "## Advisory findings", "");
-      lines.push(advisory.length ? advisory.map(findingLine).join("\n") : "None.");
+      if (advisory.length && !full) lines.push("One line each; review_result with full: true, or report.md, has them in full.", "");
+      lines.push(advisory.length ? advisory.map(full ? findingLine : shortLine).join("\n") : "None.");
     } else {
       // Challenges to the author's assumptions are always shown (SPEC 6).
       const challenges = advisory.filter((f) => f.assumption_challenge);

@@ -10,7 +10,7 @@ import { checkEffort, DEFAULT_VENDOR, Effort, Vendor } from "./settings.js";
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 const AdapterConfigIn = z.object({
-  type: z.enum(["command", "codex", "codex-review", "claude", "pull"]),
+  type: z.enum(["command", "codex", "codex-review", "claude", "agy", "pull"]),
   // Not used by pull reviewers, which have no command: they fetch the work themselves.
   command: z.string().default(""),
   // Pull reviewers: MCP client names (clientInfo.name) allowed to claim their work; empty: any client.
@@ -31,6 +31,12 @@ export type AdapterConfig = Omit<z.infer<typeof AdapterConfigIn>, "vendor" | "ti
 // key ending in * matches names starting with the rest: the Claude desktop app (chat and Cowork)
 // connects as "local-agent-mode-<server name>".
 const DEFAULT_AUTHOR_VENDORS: Record<string, Vendor> = { "claude-code": "anthropic", "codex-mcp-client": "openai", "local-agent-mode-*": "anthropic" };
+
+/** Whether an MCP client name is in a list of names and prefixes ending in *. */
+export function clientListed(list: string[], client: string | null): boolean {
+  if (!client) return false;
+  return list.some((k) => (k.endsWith("*") ? client.startsWith(k.slice(0, -1)) : k === client));
+}
 
 /** The vendor author_vendors gives an MCP client name: an exact key first, then the longest matching prefix*. */
 export function vendorOfClient(map: Record<string, Vendor>, client: string): Vendor | null {
@@ -97,12 +103,19 @@ const Config = z.object({
   // Longest a call waits when the client sent a progressToken: progress notifications every 10 s
   // keep it alive, so it can wait for the whole round instead of polling.
   max_wait_with_progress_seconds: z.number().int().min(1).max(3600).default(900),
+  // MCP clients (names, or prefixes ending in *) that may wait up to max_wait_with_progress_seconds
+  // without sending a progressToken. Only for clients known not to time out a long tool call: no
+  // progress is sent to keep them alive. Empty by default.
+  long_wait_clients: z.array(z.string()).default([]),
   policy: z
     .object({
       max_blocking: z.number().int().positive().default(5),
       max_rounds: z.number().int().positive().default(3),
+      // "stricter": from round 2 only critical findings, and high ones that are certain or likely,
+      // block (a rubric's high_blocks_always applies to round 1). "same": every round as round 1.
+      later_rounds: z.enum(["stricter", "same"]).default("stricter"),
     })
-    .default({ max_blocking: 5, max_rounds: 3 }),
+    .default({ max_blocking: 5, max_rounds: 3, later_rounds: "stricter" }),
 });
 export type Config = Omit<z.infer<typeof Config>, "adapters" | "rubric_packs"> & {
   rubric_packs: RubricPack[];

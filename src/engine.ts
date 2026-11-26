@@ -59,6 +59,67 @@ function waitingOnPull(rd: Round): boolean {
   );
 }
 
+/** One edit to a text document's last version: find must occur exactly once. */
+export interface TextChange {
+  find: string;
+  replace: string;
+}
+
+/**
+ * Applies edits to a text. Each find is located in the original text and must occur there exactly
+ * once (overlapping occurrences count); edits may not overlap. They are applied by position, so an
+ * earlier edit cannot move a later one onto other text. Throws, changing nothing, on any problem.
+ */
+export function applyChanges(text: string, changes: TextChange[]): string {
+  if (!changes.length) throw new Error("changes is empty.");
+  const short = (s: string) => JSON.stringify(s.length > 60 ? `${s.slice(0, 60)}...` : s);
+  const spans = changes.map((c, i) => {
+    let count = 0;
+    let at = -1;
+    for (let pos = text.indexOf(c.find); pos >= 0; pos = text.indexOf(c.find, pos + 1)) {
+      if (count++ === 0) at = pos;
+    }
+    if (count !== 1) {
+      throw new Error(`Change ${i + 1}: ${short(c.find)} occurs ${count} times in the version submitted last; it must occur exactly once (copy more of the text around it). Nothing was changed.`);
+    }
+    return { n: i + 1, at, end: at + c.find.length, replace: c.replace };
+  });
+  const ordered = [...spans].sort((a, b) => a.at - b.at);
+  for (let k = 1; k < ordered.length; k++) {
+    if (ordered[k].at < ordered[k - 1].end) throw new Error(`Changes ${ordered[k - 1].n} and ${ordered[k].n} overlap in the version submitted last. Nothing was changed.`);
+  }
+  let out = text;
+  for (const s of ordered.reverse()) out = out.slice(0, s.at) + s.replace + out.slice(s.end);
+  return out;
+}
+
+/**
+ * The next version of a text document: edits to the version the last round reviewed (its frozen
+ * copy, not the author's file, which may have changed since), as text to resubmit.
+ */
+function changedVersion(review: Review, reviewDir: string, changes: TextChange[]): InlineDoc {
+  const round = review.rounds.at(-1);
+  const snap = round?.snapshot;
+  if (!review.request.artifact?.path || !snap?.file) throw new Error("changes work only for document reviews; git changes and pages are captured again on resubmit.");
+  // A file given by path may have a name text documents cannot (R&D.md): keep it readable, drop the rest.
+  const name = path.basename(review.request.artifact.path).replace(/[^\p{L}\p{N} ._()-]/gu, "-").replace(/^\.+/, "");
+  if (snap.kind !== "markdown" && snap.kind !== "text") throw new Error(`changes work only for text documents (.md, .txt); ${name} needs its new version as a path.`);
+  let text: string;
+  try {
+    text = readFileSync(path.join(reviewDir, snap.file), "utf8");
+  } catch {
+    throw new Error(`The version round ${round!.n} reviewed can no longer be read; send the new version as artifact.`);
+  }
+  const doc = { name, content: applyChanges(text, changes) };
+  inlineName(doc); // name, emptiness and length checked now, before any answer is saved
+  return doc;
+}
+
+/** The later-rounds rule a round runs under: as frozen at its start; "same" for rounds started before the rule existed. */
+export function laterRounds(round: Round): "stricter" | "same" {
+  return round.policy?.later_rounds ?? "same";
+}
+
 /** max_blocking from a rubric's front matter, when it is a positive whole number. */
 function rubricLimit(meta: Record<string, unknown>): { max_blocking?: number } {
   const v = meta.max_blocking;
@@ -479,9 +540,17 @@ export class Engine {
   async respond(
     id: string,
     responses: ResponseInput[],
-    opts: { resubmit: boolean; artifact?: string | InlineDoc; waitSeconds?: number },
+    opts: { resubmit: boolean; artifact?: string | InlineDoc; changes?: TextChange[]; waitSeconds?: number },
   ): Promise<{ review: Review; unanswered: string[] }> {
-    this.get(id); // marks a round cut off by a dead process as failed
+    if (opts.changes && !opts.resubmit) throw new Error("changes need resubmit: true (they make the next version).");
+    if (opts.changes && opts.artifact) throw new Error("Give either artifact or changes, not both.");
+    const before = this.get(id); // marks a round cut off by a dead process as failed
+    // Edits are checked before any answer is saved: a refused edit leaves the review as it was.
+    // The edits are made against this round; if another call moves the review on first, they are refused.
+    const editedRound = opts.changes ? (before.rounds.at(-1)?.n ?? null) : null;
+    if (opts.changes && before.rounds.length) {
+      opts = { ...opts, artifact: changedVersion(before, this.store.dir(id), opts.changes), changes: undefined };
+    }
     let unanswered: string[] = [];
     let closeRefused: string | null = null;
     // Answers, checks and (without resubmit) closing happen in one locked step.
@@ -489,6 +558,9 @@ export class Engine {
       if (r.state === "submitted") throw new Error(`Review ${id} is still being prepared (taking the snapshot). Wait for the result first.`);
       if (!r.rounds.length) throw new Error(`Review ${id} failed before its first round (${r.notes.at(-1) ?? r.state}). Submit the work again as a new review.`);
       const round = r.rounds.at(-1)!;
+      if (editedRound !== null && round.n !== editedRound) {
+        throw new Error(`Review ${id} moved on to round ${round.n} while the changes were made against round ${editedRound}. Nothing was saved; send the changes again against round ${round.n}.`);
+      }
       if (r.state === "in_review") throw new Error(`Review ${id} is still in review (round ${round.n}). Wait for the result first.`);
       if (r.state === "canceled") throw new Error(`Review ${id} is canceled.`);
       const t = now();
@@ -965,6 +1037,7 @@ export class Engine {
       stage: review.request.stage,
       max_blocking: (round.policy ?? this.config.policy).max_blocking,
       high_blocks_always: review.rubric_meta.high_blocks_always === true,
+      later_round: n >= 2 && laterRounds(round) === "stricter",
     };
     // The merge model sees quotes: approvals as the rubric is now (confidential if it became so).
     const { merged, merge } = await this.merge(raised, review.request.rubric, review.rubric_meta, roundDir, signal, (f) => wouldBlock(f, policy), review);

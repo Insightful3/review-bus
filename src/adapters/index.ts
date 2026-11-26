@@ -412,6 +412,80 @@ async function runClaude(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult>
   };
 }
 
+/**
+ * Antigravity CLI reviewers are held read-only by deny rules, which win over any allow rule in the
+ * user's own agy settings: no file writes, no shell commands, no MCP tools. Headless, a tool that
+ * needs approval is refused anyway, but agy writes files in its default mode without asking (seen
+ * with agy 1.5.18), and its plan mode returned no answer. Reading files in the round folder stays
+ * allowed (the prompt, screenshots, the project copy).
+ */
+export const AGY_READ_ONLY = { permissions: { deny: ["write_file(/)", "command(regex:.*)", "mcp(*)"] } };
+/**
+ * What agy gets as -p. The prompt itself (the document under review) is written to agy-prompt.md in the
+ * round folder, which only the owner can read: command-line arguments can be seen by other users of
+ * the machine, and are limited in size.
+ */
+export const AGY_INSTRUCTION =
+  "Your full instructions and the work to review are in the file agy-prompt.md in the current folder. Open it with your file viewing tool (do not run shell commands), follow it, and return only JSON matching the output schema.";
+
+/** The reviewer answer in agy's response: the last line that is a JSON object (agy can print an earlier attempt first). */
+export function agyAnswer(response: string): unknown {
+  const text = response.trim();
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Several attempts, one per line: the last one that parses.
+  }
+  for (const line of text.split("\n").reverse()) {
+    try {
+      const v = JSON.parse(line);
+      if (v && typeof v === "object") return v;
+    } catch {
+      // not JSON
+    }
+  }
+  return undefined;
+}
+
+async function runAgy(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
+  const schemaFile = path.join(job.outDir, `${job.reviewerName}.schema.json`);
+  writeFileSync(schemaFile, JSON.stringify(job.schema ?? reviewerOutputJsonSchema()));
+  writeFileSync(path.join(job.cwd, "agy-prompt.md"), job.prompt, { mode: 0o600 });
+  const args = [
+    "-p",
+    AGY_INSTRUCTION,
+    "--output-format",
+    "json",
+    "--json-schema",
+    schemaFile,
+    "--sandbox",
+    "--disable-slash-commands",
+    "--settings",
+    JSON.stringify(AGY_READ_ONLY),
+    ...(job.model ? ["--model", job.model] : []),
+    ...(job.effort ? ["--effort", job.effort] : []),
+    ...cfg.args,
+  ];
+  const r = await runProcess(cfg.command, args, { cwd: job.cwd, stdin: "", timeoutMs: cfg.timeout_seconds * 1000, signal: job.signal });
+  writeFileSync(path.join(job.outDir, `${job.reviewerName}.out.json`), r.stdout);
+  if (r.stderr.trim()) writeFileSync(path.join(job.outDir, `${job.reviewerName}.log.txt`), r.stderr);
+  if (r.code !== 0 || r.timedOut) throw new Error(describeFailure("agy -p", r));
+  let envelope: { status?: string; response?: string; error?: unknown; denied_actions?: { display_name?: string; action?: string }[] };
+  try {
+    envelope = JSON.parse(r.stdout);
+  } catch {
+    throw new Error("agy -p did not return valid JSON");
+  }
+  if (envelope.status !== "SUCCESS") throw new Error(`agy -p reported ${envelope.status ?? "no status"}: ${JSON.stringify(envelope.error ?? "").slice(0, 300)}`);
+  const json = agyAnswer(envelope.response ?? "");
+  if (json === undefined) {
+    const denied = (envelope.denied_actions ?? []).map((d) => d.display_name ?? d.action).filter(Boolean);
+    throw new Error(`agy -p returned no answer${denied.length ? ` (it tried a tool reviewers may not use: ${denied.join(", ")})` : ""}`);
+  }
+  // agy does not report the model it used: the requested one is recorded as requested.
+  return { json, reportedModel: null, reportedEffort: null };
+}
+
 function runRaw(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
   switch (cfg.type) {
     case "command":
@@ -424,6 +498,8 @@ function runRaw(cfg: AdapterConfig, job: ReviewJob): Promise<RawResult> {
       throw new Error("pull reviewers are not run by the server; they claim their work (review_claim)");
     case "claude":
       return runClaude(cfg, job);
+    case "agy":
+      return runAgy(cfg, job);
   }
 }
 

@@ -69,6 +69,14 @@ npm test
 
 The tests use fake reviewers, so they need no model login. With a source checkout, use `node /path/to/review-bus/dist/src/server.js` wherever the commands below say `review-bus`.
 
+### Upgrading
+
+```bash
+npm install -g review-bus@latest
+```
+
+Then restart Claude Code, the Claude desktop app, or whatever runs the MCP server, so it starts the new version. Your config and your reviews stay where they are; settings a new version adds take their defaults until you set them. A review that is open during the upgrade keeps the rules each of its rounds started with. `CHANGELOG.md` lists what changed.
+
 ## Configure
 
 Copy the example config (from the npm package or a source checkout) and edit it:
@@ -84,7 +92,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 
 | Key | What it does |
 | --- | --- |
-| `adapters` | The reviewers you can use, each with `type` (`codex`, `claude`, `codex-review`, `command` or `pull`), `command`, `vendor`, `model`, `effort` and `timeout_seconds`. Pull reviewers have no command; `claim_clients` limits which MCP clients may claim their work |
+| `adapters` | The reviewers you can use, each with `type` (`codex`, `claude`, `agy`, `codex-review`, `command` or `pull`), `command`, `vendor`, `model`, `effort` and `timeout_seconds`. Pull reviewers have no command; `claim_clients` limits which MCP clients may claim their work |
 | `default_reviewers` | Used when the author names none. Reviewers from the author's own vendor are skipped |
 | `allowed_reviewers` | Per rubric, the reviewers you approve for that kind of content. Required for confidential rubrics such as `contract-b2b` |
 | `rubric_paths` | Extra folders with rubric files. Later folders override earlier ones by rubric name. This repo's `rubrics/` always comes first |
@@ -92,12 +100,13 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 | `http` | For `rb serve`: `host` (default `127.0.0.1`), `port` (7777), `token_file` (`~/.review-bus/http-token`), `allow_remote` (false), `allowed_hosts`, `public_origin` (behind a TLS proxy) |
 | `snapshot_wait_seconds` | How long `review_submit` waits for page screenshots before returning the review id (default 10) |
 | `storage.documents` | Where reviews are stored (default `~/.review-bus/reviews`) |
-| `author_vendors` | Maps MCP client names to vendors. `claude-code`, `codex-mcp-client` and `local-agent-mode-*` (the Claude desktop app) are built in; a key ending in `*` matches names that start with the rest |
+| `author_vendors` | Maps MCP client names to vendors (`anthropic`, `openai`, `google`, `other`). `claude-code`, `codex-mcp-client` and `local-agent-mode-*` (the Claude desktop app) are built in; a key ending in `*` matches names that start with the rest |
 | `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px), `args` (extra Chrome flags) |
 | `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`. Without it, only near-identical findings are merged |
 | `max_wait_seconds` | Longest a tool call waits before returning (default 50, under the usual 60 second client timeout) |
 | `max_wait_with_progress_seconds` | Longest a call waits when the client shows progress, like Claude Code (default 900) |
-| `policy` | `max_blocking` findings per round (5; a rubric can set its own) and `max_rounds` (3) |
+| `long_wait_clients` | MCP clients (names, or prefixes ending in `*`) that may wait as long as `max_wait_with_progress_seconds` without showing progress. Empty by default; add a client only once you know it does not time out a long tool call |
+| `policy` | `max_blocking` findings per round (5; a rubric can set its own), `max_rounds` (3) and `later_rounds` (`stricter`, the default, or `same`; see How findings block) |
 
 ## Connect an author agent
 
@@ -149,6 +158,12 @@ Add review-bus to `~/Library/Application Support/Claude/claude_desktop_config.js
 
 The server runs on your computer, so reviewers use the Codex or Claude login there, even when you drive the app from your phone. The computer must be on. Chats and sandboxed sessions often cannot hand over a path on your disk: they send the document as text instead (see What to submit).
 
+### Antigravity
+
+Google's Antigravity CLI (`agy`) reads MCP servers from `~/.gemini/config/mcp_config.json`; the Antigravity app has its own list under Customizations, MCP Servers. The format is the same `mcpServers` block as for the Claude desktop app above.
+
+review-bus does not know Antigravity's MCP client name yet, so it cannot tell on its own that the author is Google's. Either ask the agent to pass `author_vendor: "google"` in `review_submit`, or find the client name in a `REVIEW_BUS_LOG` file (the `initialize` line) and map it in `author_vendors`, for example `"<that name>": "google"`. Then the default reviewers (Codex and Claude) both review its work.
+
 ## Use it
 
 Ask the author agent in plain words, for example:
@@ -169,8 +184,8 @@ The loop the agent runs:
 | `review_submit` | Submit a document, a git change and/or pages. Takes `rubric`, `intent`, `assumptions`, `criteria`, `reviewers`, `stage` (`draft`, `pre-merge`, `release`) and `wait_seconds` |
 | `review_status` | State, round, reviewers done and pending, counts of findings |
 | `review_wait` | Wait until the round finishes or time runs out, then return the status |
-| `review_result` | Verdicts and findings for the latest round, as Markdown plus JSON |
-| `review_respond` | Answer findings; close, or resubmit for the next round |
+| `review_result` | Verdicts and findings for the latest round, as Markdown plus JSON. Blocking findings come in full, advisory ones (with `include_advisory`) one line each; `full: true` gives everything, as in `report.md` |
+| `review_respond` | Answer findings; close, or resubmit for the next round (with a new `artifact`, or `changes` to the last version) |
 | `review_list` | Recent reviews, optionally filtered by state |
 | `review_cancel` | Cancel a review and stop its reviewers |
 | `review_rubrics` | The rubrics you can name, with their purpose, including rubric packs |
@@ -188,10 +203,16 @@ A document, compared with the accepted proposal (`related` documents are not rev
 { "artifact": "/path/to/contract.docx", "related": ["/path/to/accepted-proposal.pdf"], "rubric": "contract-b2b", "intent": "Sign the services agreement." }
 ```
 
-A document sent as text, for agents whose files are not on this computer (a chat, a sandbox). `.md` and `.txt` only, up to 1,000,000 characters; `related` documents can be text too. The text is saved in the review folder and reviewed like a file. To resubmit, send the new version the same way in `review_respond`'s `artifact`:
+A document sent as text, for agents whose files are not on this computer (a chat, a sandbox). `.md` and `.txt` only, up to 1,000,000 characters; `related` documents can be text too. The text is saved in the review folder and reviewed like a file. To resubmit, send the new version the same way in `review_respond`'s `artifact`, or send only the edits in `changes` (below):
 
 ```json
 { "artifact": { "name": "post.md", "content": "The full text of the post" }, "related": [{ "name": "sources.md", "content": "The facts behind it" }], "rubric": "linkedin-post", "intent": "Publish the post on Thursday." }
+```
+
+Edits to the version submitted last, instead of the whole text again (`.md` and `.txt` documents, sent as text or as a path). Each `find` is copied exactly and must occur exactly once; if one does not, nothing is changed. The edited text becomes the next version, kept as text; a file you gave as a path is only read:
+
+```json
+{ "review_id": "rv_...", "responses": [{ "finding_id": "r1.f1", "status": "accepted" }], "resubmit": true, "changes": [{ "find": "Total price: EUR 24,000", "replace": "Total price: EUR 22,500" }] }
 ```
 
 A branch against its base, plus the rendered pages from a running dev server:
@@ -212,7 +233,7 @@ Git modes: `uncommitted` (working tree against HEAD, including new files), `base
 A careful review can take several minutes, and MCP clients give up on a silent tool call after about 60 seconds. review-bus handles both kinds of client:
 
 - **Clients that show progress (Claude Code does).** They send a progress token with each call. review-bus then sends a progress update every 10 seconds ("Round 1: 1 of 2 reviewer(s) done; still working: codex…"), which keeps the call alive, and waits up to `max_wait_with_progress_seconds` (default 900). So `review_submit` with `wait_seconds: 900` returns the finished review in one call. Checked with Claude Code 2.1.316: one call, a 70 second review, the full result back.
-- **Other clients.** A call waits at most `max_wait_seconds` (default 50) and says so (`wait_capped`); the agent calls `review_wait` again until the state is no longer `in_review`.
+- **Other clients.** A call waits at most `max_wait_seconds` (default 50) and says so (`wait_capped`); the agent calls `review_wait` again until the state is no longer `in_review`. The Claude desktop app (chat, Cowork and the Code tab) is one of these: it sends no progress token. If you know a client does not time out long tool calls, list it in `long_wait_clients` and it waits as long as a client that shows progress.
 - **Pages.** Rendering pages can take a while. A review with pages is saved first and its pages are rendered in the background; if that takes longer than `snapshot_wait_seconds` (default 10, and never longer than the call's own `max_wait_seconds`), `review_submit` returns the review id with state `submitted`, and a later capture error shows as a failed review. A page that fails to load within those seconds is still an error on submit.
 - **Pull reviewers.** A wait (and an MCP task) ends as soon as only pull reviewers are left, since a person may answer tomorrow. The answer then carries `waiting_for_pull` and a hint to check back later with `review_status`. The review stays `in_review` until they post.
 
@@ -231,11 +252,21 @@ The model and effort that actually ran are recorded on every finding as `reviewe
 
 ### Tasks
 
-`review_submit`, `review_respond` (with `resubmit`) and `review_wait` can also be called as MCP tasks (2025-11-25 form): the call returns at once and the task completes with the result when the round finishes. Clients that do not use tasks are unaffected. Claude Code 2.1.316 does not use this form (it uses tasks only on 2026-07-28 connections), so it relies on progress updates instead (above). To see how a client calls review-bus, set `REVIEW_BUS_LOG` to a file path in the server's environment: every request is logged with whether it came as a task, and tool calls with their arguments (paths and intents included; claim tokens and the content of documents sent as text are replaced by `[redacted]` and the text's length). The file is created readable by you only. Use it for debugging only.
+`review_submit`, `review_respond` (with `resubmit`) and `review_wait` can also be called as MCP tasks (2025-11-25 form): the call returns at once and the task completes with the result when the round finishes. Clients that do not use tasks are unaffected. Claude Code 2.1.316 does not use this form (it uses tasks only on 2026-07-28 connections), so it relies on progress updates instead (above). To see how a client calls review-bus, set `REVIEW_BUS_LOG` to a file path in the server's environment: every request is logged with whether it came as a task, and tool calls with their arguments (paths and intents included; claim tokens and the content of documents sent as text are replaced by `[redacted]` and the text's length, and resubmit `changes` by their number). The file is created readable by you only. Use it for debugging only.
 
 ### Several reviewers
 
 With more than one reviewer, the same problem usually comes back from each of them in different words. review-bus merges these: the highest-risk version is kept, `agreement` counts how many reviewers raised it, and `also_raised_by` lists the others' versions. Set `merge_with` to let a cheap model do the grouping (in a test on a real proposal, Claude Haiku grouped all five shared findings correctly in 5 seconds for a fraction of a cent). Without it, only near-identical findings are merged, because word-based matching cannot tell "the launch date is unconditional" and "the go-live date is stated as fixed" are the same problem without also merging unrelated findings. The merge model sees the findings and their quotes, so for a rubric with `allowed_reviewers` it is only used if it is on that list.
+
+### Antigravity as a reviewer
+
+`type: "agy"` runs Google's Antigravity CLI headless (`agy -p` with `--output-format json` and the reviewer schema as `--json-schema`), with Gemini models by default. Install it and sign in once by running `agy`; `agy models` lists the model names for `model`.
+
+```json
+"agy": { "type": "agy", "command": "/Users/you/.local/bin/agy", "vendor": "google", "effort": "medium", "timeout_seconds": 600 }
+```
+
+It is held read-only by deny rules passed with `--settings`, which win over any allow rule in your own agy settings: no file writes, no shell commands, no MCP tools. This matters because agy 1.5.18 writes files in its default mode without asking, even headless, and its plan mode returned no answer. Reading files in the round folder stays allowed. The prompt, with the work under review, is written to `agy-prompt.md` in the round folder (readable by you only) and agy is told to read it: it never goes on agy's command line, where other users of the machine could see it. If Gemini tries a forbidden tool and gives no answer, the reviewer fails with the tool's name. agy does not report which model it used, so the result shows the requested model. Checked with agy 1.5.18 on a real proposal: 25 seconds, the planted price mismatch found.
 
 ### Codex's native review
 
@@ -248,7 +279,7 @@ A reviewer with `type: "pull"` is not started by review-bus. Its work waits unti
 ```json
 "adapters": {
   "ana": { "type": "pull", "vendor": "other", "timeout_seconds": 172800 },
-  "gemini": { "type": "pull", "vendor": "other", "claim_clients": ["gemini-cli"] }
+  "antigravity": { "type": "pull", "vendor": "google" }
 }
 ```
 
@@ -279,6 +310,7 @@ Open `http://rb.localhost:7777/inbox` (or `http://127.0.0.1:7777/inbox`) and pas
 rb submit proposal.docx --rubric proposal --intent "Win the project at a fixed price."
 rb submit --git . --mode base --base origin/main --page http://localhost:4321/ --rubric webpage --intent "Publish the new home page."
 rb submit contract.docx --related proposal.pdf --rubric contract-b2b --intent "Sign the agreement." --reviewer codex::high
+pbpaste | rb submit - --name post.md --rubric linkedin-post --intent "Publish on Thursday."
 rb list
 rb show <review_id>
 rb respond <review_id> r1.f1=accepted r1.f2=rejected:"Intentional, agreed with the client" --resubmit
@@ -364,7 +396,9 @@ Reviewers rate each finding by impact (`critical`, `high`, `medium`, `low`) and 
 | Medium | block | block | advisory | advisory |
 | Low | advisory | advisory | advisory | advisory |
 
-A finding without a failure scenario is advisory. A finding that challenges one of the author's stated assumptions blocks only if it is high or critical. At most 5 findings block per round, highest risk first; a rubric can set its own limit with `max_blocking` in its front matter (`contract-b2b` uses 12). Findings that would block but are over the limit are marked "over the limit" and get their own section in the report, so they are not mistaken for minor points. At `stage: draft` only critical findings block.
+A finding without a failure scenario is advisory. A finding that challenges one of the author's stated assumptions blocks only if it is high or critical.
+
+From round 2 on, only critical findings, and high ones that are certain or likely, block; the rest are advisory, and a rubric's `high_blocks_always` applies to round 1 only. Later rounds mostly react to the previous round's fixes and find smaller things each time, and this keeps a review from going round after round on them. Set `policy.later_rounds` to `same` to use the table above in every round. A round keeps the rule it started with, so changing the setting does not affect a round already running. At most 5 findings block per round, highest risk first; a rubric can set its own limit with `max_blocking` in its front matter (`contract-b2b` uses 12). Findings that would block but are over the limit are marked "over the limit" and get their own section in the report, so they are not mistaken for minor points. At `stage: draft` only critical findings block.
 
 ## Where results go
 

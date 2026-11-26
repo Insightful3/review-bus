@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig, vendorOfClient } from "../src/config.js";
-import { Engine } from "../src/engine.js";
+import { Engine, laterRounds } from "../src/engine.js";
+import { renderSummary } from "../src/store.js";
 import { startHttp } from "../src/http.js";
 import { gitlinksAfter } from "../src/adapters/index.js";
 import { checkRubric, checkRubricPath, listRubrics, loadRubric } from "../src/rubrics.js";
@@ -707,7 +708,7 @@ test("review.json is readable by its owner only and holds no claim token; the po
   const text = readFileSync(file, "utf8");
   assert.ok(!text.includes(work.token));
   assert.match(text, /"token_sha256"/);
-  assert.deepEqual(JSON.parse(text).rounds[0].policy, { max_blocking: 5, max_rounds: 3 });
+  assert.deepEqual(JSON.parse(text).rounds[0].policy, { max_blocking: 5, max_rounds: 3, later_rounds: "stricter" });
   const done = await engine.post(review.id, "person", work.token, { output: { verdict: "approve", summary: "ok", findings: [] } });
   assert.equal(done.state, "approved");
 });
@@ -1804,4 +1805,127 @@ test("cleanup a stopped process left undone is retried: a failed review with no 
   }
   new Engine(loadConfig()).get(review.id);
   assert.deepEqual(readdirSync(sources).sort(), [`r2-${process.pid}-def`, "r1"].sort());
+});
+
+test("from round 2 only critical findings, and high ones that are certain or likely, block; later_rounds same keeps round 1's rule", async () => {
+  const fake = { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs"), "--high-possible"], timeout_seconds: 30 };
+  const run = async (later_rounds?: "same") => {
+    writeConfig({ adapters: { fake }, ...(later_rounds ? { policy: { later_rounds } } : {}) });
+    const e = new Engine(loadConfig());
+    const review = await e.submit({ artifact: { path: FIXTURE }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, PERSON, 10);
+    await e.settled(review.id);
+    const r1 = e.get(review.id).rounds[0];
+    const answers = r1.findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+    await e.respond(review.id, answers, { resubmit: true });
+    await e.settled(review.id);
+    const done = e.get(review.id);
+    const blocks = (n: number, claim: string) => done.rounds[n].findings.find((f) => f.claim.startsWith(claim))!.blocking;
+    return { done, blocks };
+  };
+  const stricter = await run();
+  assert.equal(stricter.blocks(0, "The support hours"), true); // high/possible blocks in round 1
+  assert.equal(stricter.blocks(1, "The support hours"), false); // and is advisory from round 2
+  assert.equal(stricter.blocks(1, "The total price"), true); // critical still blocks
+  assert.equal(stricter.blocks(1, "The 70% resolution rate"), true); // high/likely still blocks
+  assert.equal(stricter.done.rounds[1].policy!.later_rounds, "stricter");
+  assert.match(readFileSync(path.join(tmp, "reviews", stricter.done.id, "report.md"), "utf8"), /From round 2 only critical findings, and high ones that are certain or likely, block/);
+  // A draft review blocks only critical findings in every round: the later-rounds note is not shown.
+  assert.doesNotMatch(renderSummary({ ...stricter.done, request: { ...stricter.done.request, stage: "draft" } }), /From round 2/);
+  const same = await run("same");
+  assert.equal(same.blocks(1, "The support hours"), true);
+  writeConfig();
+});
+
+test("a client in long_wait_clients waits for the round without a progressToken; others stay under max_wait_seconds", async () => {
+  const slow = { type: "command", command: process.execPath, args: [path.join(ROOT, "test/fake-reviewer.mjs"), "--sleep=2500"], timeout_seconds: 30 };
+  writeConfig({ adapters: { slow }, max_wait_seconds: 1, long_wait_clients: ["desktop-app-*"] });
+  const e = new Engine(loadConfig());
+  const s = await startHttp(e, { port: 0, host: "127.0.0.1" });
+  const opts = { requestInit: { headers: { authorization: `Bearer ${token}` } } };
+  const submitAs = async (name: string) => {
+    const c = new Client({ name, version: "0" });
+    await c.connect(new StreamableHTTPClientTransport(new URL(`${s.url}mcp`), opts));
+    try {
+      const res = (await c.callTool({ name: "review_submit", arguments: { artifact: FIXTURE, rubric: "proposal", intent: "x", reviewers: ["slow"], wait_seconds: 10 } })) as ToolResult;
+      return JSON.parse(res.content.map((x) => x.text).find((t) => t.includes('"review_id"'))!).state as string;
+    } finally {
+      await c.close();
+    }
+  };
+  try {
+    assert.equal(await submitAs("desktop-app-review-bus"), "changes_requested"); // waited for the round
+    assert.equal(await submitAs("other-client"), "in_review"); // answered within max_wait_seconds
+  } finally {
+    await s.close();
+    writeConfig();
+  }
+});
+
+test("a resubmit can send changes to the version last reviewed instead of the whole text; the author's file is only read", async () => {
+  writeConfig();
+  const e = new Engine(loadConfig());
+  const file = path.join(tmp, "draft-proposal.md");
+  writeFileSync(file, readFileSync(FIXTURE, "utf8"));
+  const original = readFileSync(file, "utf8");
+  const review = await e.submit({ artifact: { path: file }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, PERSON, 10);
+  await e.settled(review.id);
+  // The author keeps working on the file after round 1; the edits apply to what round 1 reviewed.
+  writeFileSync(file, original + "\nUNREVIEWED DRAFT LINE\n");
+  const answers = e.get(review.id).rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "accepted" as const }));
+  // Refused before anything is saved: a find that occurs twice, one that is missing, overlapping edits, artifact and changes together.
+  await assert.rejects(e.respond(review.id, answers, { resubmit: true, changes: [{ find: "EUR", replace: "USD" }] }), /occurs \d+ times .* exactly once.*Nothing was changed/);
+  await assert.rejects(e.respond(review.id, answers, { resubmit: true, changes: [{ find: "not in the text", replace: "x" }] }), /occurs 0 times/);
+  await assert.rejects(
+    e.respond(review.id, answers, { resubmit: true, changes: [{ find: "Total price: EUR 24,000", replace: "a" }, { find: "EUR 24,000 excluding", replace: "b" }] }),
+    /Changes 1 and 2 overlap/,
+  );
+  await assert.rejects(e.respond(review.id, answers, { resubmit: true, artifact: file, changes: [{ find: "a", replace: "b" }] }), /either artifact or changes/);
+  // Too long once edited: refused before the answers are saved.
+  await assert.rejects(e.respond(review.id, answers, { resubmit: true, changes: [{ find: "Two languages: German and English.", replace: "x".repeat(1_000_001) }] }), /longer than 1000000 characters/);
+  // Another call moved the review on after these edits were made: refused, nothing saved.
+  const realGet = e.get.bind(e);
+  const stale = structuredClone(realGet(review.id));
+  e.get = ((rid: string) => { e.get = realGet; return rid === review.id ? stale : realGet(rid); }) as typeof e.get;
+  e.store.update(review.id, (r) => void r.rounds.push({ ...structuredClone(r.rounds[0]), n: 2 }));
+  await assert.rejects(e.respond(review.id, answers, { resubmit: true, changes: [{ find: "Two languages: German and English.", replace: "y" }] }), /moved on to round 2 while the changes were made against round 1/);
+  e.store.update(review.id, (r) => void r.rounds.pop());
+  assert.equal(e.get(review.id).rounds.length, 1);
+  assert.ok(e.get(review.id).rounds[0].findings.every((f) => f.response === null), "a refused edit saves no answers");
+  // Each edit applies where it was found in the reviewed text: the first edit's new text ("Go-live
+  // on 15 March 2027.") must not become the target of the second edit.
+  await e.respond(review.id, answers, {
+    resubmit: true,
+    changes: [
+      { find: "Total price: EUR 24,000 excluding VAT.", replace: "Total price: EUR 22,500 excluding VAT. Go-live on 15 March 2027." },
+      { find: "Go-live on 15 March 2027.", replace: "Go-live on 1 April 2027." },
+      { find: "Two languages: German and English.", replace: "Two languages: German and English, $& extra" },
+    ],
+  });
+  await e.settled(review.id);
+  const done = e.get(review.id);
+  assert.equal(readFileSync(file, "utf8"), original + "\nUNREVIEWED DRAFT LINE\n"); // the author's file is untouched
+  assert.equal(done.request.artifact?.inline, true); // the new version is kept as text
+  const r2 = readFileSync(path.join(tmp, "reviews", review.id, "r2", "artifact.md"), "utf8");
+  assert.match(r2, /Total price: EUR 22,500 excluding VAT\. Go-live on 15 March 2027\. Go-live on 1 April 2027\./);
+  assert.match(r2, /German and English, \$& extra/); // replacement text is literal, $& is not a pattern
+  assert.doesNotMatch(r2, /UNREVIEWED DRAFT LINE/);
+  // A later resubmit edits the version round 2 reviewed, not the original.
+  // A file name text documents cannot have (R&D.md) is kept readable for the new version.
+  const odd = path.join(tmp, "R&D plan.md");
+  writeFileSync(odd, original);
+  const r3 = await e.submit({ artifact: { path: odd }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, PERSON, 10);
+  await e.settled(r3.id);
+  const oddAnswers = e.get(r3.id).rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+  await e.respond(r3.id, oddAnswers, { resubmit: true, changes: [{ find: "Two languages: German and English.", replace: "Three languages." }] });
+  await e.settled(r3.id);
+  assert.equal(path.basename(e.get(r3.id).request.artifact!.path!), "R-D plan.md");
+  const answers2 = done.rounds[1].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
+  await assert.rejects(e.respond(review.id, answers2, { resubmit: true, changes: [{ find: "EUR 24,000 excluding VAT.", replace: "x" }] }), /occurs 0 times/);
+});
+
+test("rounds saved before later_rounds existed keep the round 1 rule", () => {
+  const round = (policy?: Record<string, unknown>) => ({ n: 2, policy }) as unknown as Parameters<typeof laterRounds>[0];
+  assert.equal(laterRounds(round()), "same"); // no frozen policy at all
+  assert.equal(laterRounds(round({ max_blocking: 5, max_rounds: 3 })), "same"); // frozen before the setting
+  assert.equal(laterRounds(round({ max_blocking: 5, max_rounds: 3, later_rounds: "stricter" })), "stricter");
 });

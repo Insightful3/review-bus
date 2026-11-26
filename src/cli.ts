@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
+import { INLINE_MAX_CHARS } from "./inline.js";
 import { loadConfig } from "./config.js";
 import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import type { GitSpec } from "./git.js";
@@ -17,6 +18,7 @@ const USAGE = `rb: submit work for review by other agents, and answer the findin
 
 Usage:
   rb submit <file> --rubric <name> --intent <text> [options]
+  rb submit - [--name <file name>] --rubric <name> --intent <text> [options]   (document from stdin)
   rb submit --git <repo> [--mode uncommitted|base|commit|all] [--base <branch>] [--commit <sha>] --rubric <name> --intent <text> [options]
   rb submit --page <url> [--page <url>...] --rubric webpage --intent <text> [options]
   rb status <review_id>
@@ -185,6 +187,7 @@ async function main() {
       model: { type: "string" },
       port: { type: "string" },
       host: { type: "string" },
+      name: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -214,11 +217,23 @@ async function main() {
       if (!v.intent) fail("submit needs --intent");
       const stage = (v.stage ?? "pre-merge") as Stage;
       if (!["draft", "pre-merge", "release"].includes(stage)) fail(`bad --stage "${stage}"`);
-      let artifact: { path?: string; git?: GitSpec } | null = null;
+      let artifact: { path?: string; git?: GitSpec; text?: { name: string; content: string } } | null = null;
       if (v.git) {
         const mode = (v.mode ?? "uncommitted") as GitSpec["mode"];
         if (!["uncommitted", "base", "commit", "all"].includes(mode)) fail(`bad --mode "${mode}"`);
         artifact = { git: { repo: v.git, mode, ...(v.base ? { base: v.base } : {}), ...(v.commit ? { commit: v.commit } : {}) } };
+      } else if (pos[0] === "-") {
+        // The document from standard input, sent as text (.md unless --name says .txt).
+        if (process.stdin.isTTY) fail("submit - reads the document from standard input; pipe it in, for example: cat post.md | rb submit - ...");
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const c of process.stdin) {
+          size += (c as Buffer).length;
+          // A character is at most 4 bytes: past this the text is surely over the limit.
+          if (size > INLINE_MAX_CHARS * 4) fail(`The document on standard input is longer than ${INLINE_MAX_CHARS} characters. Give a path instead.`);
+          chunks.push(c as Buffer);
+        }
+        artifact = { text: { name: v.name ?? "stdin.md", content: Buffer.concat(chunks).toString("utf8") } };
       } else if (pos[0]) {
         artifact = { path: path.resolve(pos[0]) };
       }

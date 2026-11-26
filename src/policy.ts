@@ -25,6 +25,18 @@ export const DRAFT_MATRIX: Matrix = {
   low: row(false, false, false, false),
 };
 
+/**
+ * Round 2 and later (policy.later_rounds "stricter"): a round mostly reacts to the previous round's
+ * fixes, and each one finds smaller things. Only critical findings, and high ones that are certain or
+ * likely, still block; the rest are advisory.
+ */
+export const LATER_MATRIX: Matrix = {
+  critical: row(true, true, true, true),
+  high: row(true, true, false, false),
+  medium: row(false, false, false, false),
+  low: row(false, false, false, false),
+};
+
 const IMPACT_RANK: Record<ImpactT, number> = { critical: 4, high: 3, medium: 2, low: 1 };
 const LIKELIHOOD_RANK: Record<LikelihoodT, number> = { certain: 4, likely: 3, possible: 2, remote: 1 };
 
@@ -39,8 +51,10 @@ export interface PolicyInput {
 export interface PolicyOptions {
   stage: Stage;
   max_blocking: number;
-  /** Rubric override: high and critical block at any likelihood. */
+  /** Rubric override: high and critical block at any likelihood (round 1 only when later_round is set). */
   high_blocks_always?: boolean;
+  /** Round 2 or later under policy.later_rounds "stricter": LATER_MATRIX decides. */
+  later_round?: boolean;
 }
 
 export function riskScore(f: PolicyInput): number {
@@ -64,11 +78,10 @@ function blocksByMatrix(f: PolicyInput, opts: PolicyOptions): boolean {
   // Challenges to the author's assumptions block only when high or critical (then the matrix
   // decides as for any finding); medium and low ones stay advisory.
   if (f.assumption_challenge && f.impact !== "high" && f.impact !== "critical") return false;
-  if (opts.high_blocks_always && opts.stage !== "draft" && (f.impact === "high" || f.impact === "critical")) {
-    return true;
-  }
-  const matrix = opts.stage === "draft" ? DRAFT_MATRIX : DEFAULT_MATRIX;
-  return matrix[f.impact][f.likelihood];
+  if (opts.stage === "draft") return DRAFT_MATRIX[f.impact][f.likelihood];
+  if (opts.later_round) return LATER_MATRIX[f.impact][f.likelihood];
+  if (opts.high_blocks_always && (f.impact === "high" || f.impact === "critical")) return true;
+  return DEFAULT_MATRIX[f.impact][f.likelihood];
 }
 
 /** Returns a blocking flag per finding, in input order. Caps blocking at max_blocking, highest risk first. */

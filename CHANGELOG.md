@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased (0.3.0)
+
+From the first real use of 0.2.1: a client contract over 3 rounds, and a code review by Claude Code with Codex reviewing.
+
+- From round 2 only critical findings, and high ones that are certain or likely, block; the rest are advisory, and a rubric's `high_blocks_always` applies to round 1 only. Later rounds mostly reacted to the previous round's fixes. `policy.later_rounds: "same"` keeps the old rule; a round keeps the rule it started with.
+- Shorter results: `review_result` no longer repeats each finding's long texts in the JSON, and advisory findings are one line each in the Markdown. On the real contract, a result with advisory findings went from about 62,000 to 20,000 characters. `full: true` gives everything, as `report.md` does.
+- `review_respond` takes `changes`, edits to the version submitted last (`find` exactly once, `replace`), instead of the whole text again. For `.md` and `.txt` documents.
+- `long_wait_clients`: MCP clients that may wait as long as clients that show progress. The Claude desktop app sends no progress token, so its calls stay under 50 seconds unless it is listed.
+- `rb submit -` reads the document from standard input (`--name` sets its file name).
+- Antigravity CLI (`agy`, Google's successor to Gemini CLI) as a reviewer: `type: "agy"`, held read-only by deny rules for file writes, shell commands and MCP tools. `google` is a vendor, and the README shows Antigravity as an author too.
+- README: how to upgrade.
+
 ## 0.2.1 (2026-11-26)
 
 - `rb <command> --help` (or `-h`) shows the help. Before, `rb submit --help` failed with "Unknown option".

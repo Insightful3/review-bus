@@ -118,6 +118,21 @@ process.stdin.on("end", async () => {
           assumption_challenge: false,
           confidence: 0.7,
         },
+        ...(process.argv.includes("--high-possible")
+          ? [
+              {
+                claim: "The support hours are not stated.",
+                failure_scenario: "The client expects weekend support and complains when nobody answers on Saturday.",
+                evidence: "The scope names no support hours.",
+                location: loc("Scope", "Two languages: German and English."),
+                likelihood: "possible",
+                impact: "high",
+                suggested_fix: "State the support hours.",
+                assumption_challenge: false,
+                confidence: 0.7,
+              },
+            ]
+          : []),
         ...(process.argv.includes("--challenge")
           ? [
               {

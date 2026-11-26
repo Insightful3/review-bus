@@ -55,3 +55,25 @@ test("caps blocking findings, highest risk first", () => {
 test("rubric override: high blocks at any likelihood", () => {
   assert.deepEqual(computeBlocking([f("high", "remote")], { ...opts, high_blocks_always: true }), [true]);
 });
+
+test("round 2 and later: only critical, and high when certain or likely, block; the rubric override is for round 1", () => {
+  const later = { ...opts, later_round: true };
+  const cases: [PolicyInput, boolean][] = [
+    [f("critical", "remote"), true],
+    [f("high", "certain"), true],
+    [f("high", "likely"), true],
+    [f("high", "possible"), false],
+    [f("medium", "certain"), false],
+    [f("low", "certain"), false],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(computeBlocking([input], later)[0], expected, `${input.impact}/${input.likelihood}`);
+  }
+  // A contract rubric's high_blocks_always: high/possible blocks in round 1, not from round 2.
+  assert.deepEqual(computeBlocking([f("high", "possible")], { ...opts, high_blocks_always: true }), [true]);
+  assert.deepEqual(computeBlocking([f("high", "possible")], { ...later, high_blocks_always: true }), [false]);
+  // Draft stage stays draft: high/certain does not block there in any round.
+  assert.deepEqual(computeBlocking([f("high", "certain")], { ...later, stage: "draft" }), [false]);
+  // Still needs a failure scenario.
+  assert.deepEqual(computeBlocking([f("critical", "certain", { failure_scenario: null })], later), [false]);
+});

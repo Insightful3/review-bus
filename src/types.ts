@@ -126,7 +126,7 @@ export interface Round {
   reviewers: ReviewerRun[];
   findings: Finding[];
   /** The blocking policy the round was started with: whoever finishes the round applies this one. */
-  policy?: { max_blocking: number; max_rounds: number };
+  policy?: { max_blocking: number; max_rounds: number; later_rounds?: "stricter" | "same" };
   /** The process merging the findings and deciding the state, once every reviewer has finished. */
   finalizing?: { pid: number; host: string; started_at: string } | null;
   /** How duplicates across reviewers were merged. */

@@ -19,14 +19,14 @@ const MAX_TOOL_FILE_BYTES = 10 * 1024 * 1024;
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { INLINE_MAX_CHARS, logSafeArtifact, logSafeRelated } from "./inline.js";
-import { loadConfig, PACKAGE_ROOT, vendorOfClient } from "./config.js";
+import { clientListed, loadConfig, PACKAGE_ROOT, vendorOfClient } from "./config.js";
 import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import { GitSpec } from "./git.js";
 import { ReviewerSpec, Vendor } from "./settings.js";
 import { describeArtifact } from "./snapshot.js";
 import { listRubrics } from "./rubrics.js";
 import { renderSummary } from "./store.js";
-import type { AuthorInfo, Review } from "./types.js";
+import type { AuthorInfo, Finding, Review } from "./types.js";
 
 /** The version from package.json, reported to MCP clients. */
 const VERSION: string = JSON.parse(readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8")).version;
@@ -49,11 +49,23 @@ function pullHint(review: Review) {
   };
 }
 
-function resultPayload(review: Review, includeAdvisory: boolean) {
+/**
+ * A finding in the JSON part of a result: its id, rating, place and answer, plus the claim. The long
+ * texts (failure scenario, evidence, suggested fix, quote) are in the Markdown part already; sending
+ * them twice made a long review's result too big for an agent to read in one call.
+ */
+function slimFinding(f: Finding) {
+  const { failure_scenario: _s, evidence: _e, suggested_fix: _x, location, ...rest } = f;
+  const { quote: _q, ...place } = location;
+  return { ...rest, location: place };
+}
+
+function resultPayload(review: Review, includeAdvisory: boolean, full = false) {
   const round = review.rounds.at(-1);
   // Challenges to the author's assumptions are always shown, even when advisory (SPEC 6).
   // Findings over the blocking limit are shown too: they would block on their own.
-  const findings = (round?.findings ?? []).filter((f) => includeAdvisory || f.blocking || f.over_limit || f.assumption_challenge);
+  const shown = (round?.findings ?? []).filter((f) => includeAdvisory || f.blocking || f.over_limit || f.assumption_challenge);
+  const findings = full ? shown : shown.map(slimFinding);
   return {
     review_id: review.id,
     state: review.state,
@@ -86,12 +98,12 @@ function resultPayload(review: Review, includeAdvisory: boolean) {
   };
 }
 
-function reply(review: Review, includeAdvisory: boolean) {
-  const payload = resultPayload(review, includeAdvisory);
+function reply(review: Review, includeAdvisory: boolean, full = false) {
+  const payload = resultPayload(review, includeAdvisory, full);
   return {
     content: [
-      { type: "text" as const, text: renderSummary(review, includeAdvisory) },
-      { type: "text" as const, text: JSON.stringify(payload, null, 2) },
+      { type: "text" as const, text: renderSummary(review, includeAdvisory, full) },
+      { type: "text" as const, text: JSON.stringify(payload) },
     ],
   };
 }
@@ -183,6 +195,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
                   ...("token" in a ? { token: "[redacted]" } : {}),
                   ...("artifact" in a ? { artifact: logSafeArtifact(a.artifact) } : {}),
                   ...("related" in a ? { related: logSafeRelated(a.related) } : {}),
+                  ...("changes" in a ? { changes: Array.isArray(a.changes) ? `[${a.changes.length} changes]` : "[redacted]" } : {}),
                 },
               }
             : params;
@@ -242,6 +255,13 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
             budget: () => Math.max(0, engine.config.max_wait_seconds - (Date.now() - callStarted) / 1000),
             wait: async (id, requested) => {
               if (asTask || requested <= 0) return 0;
+              if (progressToken === undefined && clientListed(engine.config.long_wait_clients, server.server.getClientVersion()?.name ?? null)) {
+                // Configured as a client that does not time out long calls: wait as long as a client
+                // with progress would, without notifications, counting time this call already spent.
+                const seconds = Math.max(0, Math.min(requested, engine.config.max_wait_with_progress_seconds) - (Date.now() - callStarted) / 1000);
+                if (seconds > 0) await engine.waitFor(id, seconds);
+                return Math.round(seconds);
+              }
               if (progressToken === undefined) {
                 // The whole call stays under max_wait_seconds: time already spent (for example on
                 // page screenshots before the review id existed) counts.
@@ -338,7 +358,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           .describe(
             "Reviewer names from config, or {name, model, effort} to override. Empty uses default_reviewers from a different vendor than the author.",
           ),
-        author_vendor: Vendor.optional().describe("Your vendor (anthropic, openai, other). Detected from the MCP client when omitted."),
+        author_vendor: Vendor.optional().describe("Your vendor (anthropic, openai, google, other). Detected from the MCP client when omitted; Antigravity agents pass google."),
         stage: z.enum(["draft", "pre-merge", "release"]).default("pre-merge"),
         wait_seconds: z.number().int().min(0).max(3600).default(0).describe("Seconds to wait for the result; the server caps it (see the tool description)"),
       },
@@ -387,15 +407,17 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     "review_result",
     {
       description:
-        "Get verdicts and findings for the latest round of a review, as a Markdown summary plus JSON. The author must answer every blocking finding.",
+        "Get verdicts and findings for the latest round of a review, as a Markdown summary plus JSON. The author must answer every blocking finding. " +
+        "The Markdown has each blocking finding in full and each advisory finding on one line; the JSON gives each finding's id, rating, place, claim and answer. full: true gives every finding, advisory ones included, in full (as in report.md).",
       inputSchema: {
         review_id: z.string(),
         include_advisory: z.boolean().default(false),
+        full: z.boolean().default(false),
       },
     },
     async (args) => {
       try {
-        return reply(engine.get(args.review_id), args.include_advisory);
+        return reply(engine.get(args.review_id), args.include_advisory || args.full, args.full);
       } catch (err) {
         return errorReply(err);
       }
@@ -462,11 +484,18 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           .describe(
             "The new version: a path, or {name, content} as text. Defaults to the version submitted last (for a document sent as text, the same text again).",
           ),
+        changes: z
+          .array(z.object({ find: z.string().min(1), replace: z.string() }).strict())
+          .max(200)
+          .optional()
+          .describe(
+            "Instead of artifact, for a text document (.md, .txt): edits to the version submitted last, each find copied exactly and found exactly once. The edited text becomes the new version, sent as text. Saves sending a long document again.",
+          ),
         wait_seconds: z.number().int().min(0).max(3600).default(0).describe("Seconds to wait for the result; the server caps it (see the tool description)"),
       },
     },
     async (args, ctx) => {
-      const responded = await engine.respond(args.review_id, args.responses, { resubmit: args.resubmit, artifact: args.artifact });
+      const responded = await engine.respond(args.review_id, args.responses, { resubmit: args.resubmit, artifact: args.artifact, changes: args.changes });
       if (args.resubmit) await ctx.wait(args.review_id, args.wait_seconds);
       const review = args.resubmit ? engine.get(args.review_id) : responded.review;
       const unanswered = responded.unanswered;

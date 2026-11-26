@@ -53,6 +53,15 @@
       "args": [],
       "timeout_seconds": 900
     },
+    "agy": {
+      "type": "agy",
+      "command": "agy",
+      "vendor": "google",
+      "model": null,
+      "effort": "medium",
+      "args": [],
+      "timeout_seconds": 600
+    },
     "codex-native": {
       "type": "codex-review",
       "command": "codex",
