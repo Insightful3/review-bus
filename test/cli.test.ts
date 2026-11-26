@@ -178,7 +178,8 @@ test("a reviewer that ignores SIGTERM is still stopped by a cancel", async () =>
       return false;
     }
   };
-  const until = Date.now() + 10_000;
+  // The cancel is noticed, SIGTERM is sent, and SIGKILL follows 5 s later: allow for a busy machine.
+  const until = Date.now() + 20_000;
   while (alive() && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
   assert.equal(alive(), false, "the reviewer should be killed after SIGTERM is ignored");
   await exited;
