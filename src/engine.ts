@@ -293,6 +293,51 @@ export class Engine {
   }
 
   /**
+   * Cleanup that a stopped process may have left undone, retried on every look at the review:
+   * a failed or canceled review with no round keeps no text or snapshot; a review with rounds keeps
+   * only the text its rounds and request name, plus attempts whose process is still alive.
+   */
+  private pruneSources(review: Review): void {
+    const dir = this.store.dir(review.id);
+    if (!review.rounds.length) {
+      if ((review.state === "failed" || review.state === "canceled") && readdirSync(dir).some((f) => f === "source" || f.startsWith(".staging-") || /^r\d+$/.test(f))) {
+        this.dropUnusedSources(review.id);
+      }
+      return;
+    }
+    const sources = path.join(dir, "source");
+    if (!existsSync(sources)) return;
+    const orphans = (r: Review) => {
+      const used = new Set<string>();
+      const note = (p: string | undefined) => {
+        const rel = p ? path.relative(sources, p) : "";
+        if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) used.add(rel.split(path.sep)[0]);
+      };
+      note(r.request.artifact?.path);
+      (r.request.related ?? []).forEach(note);
+      for (const rd of r.rounds) {
+        note(rd.snapshot.source_path);
+        (rd.snapshot.related ?? []).forEach((x) => note(x.source_path));
+      }
+      return readdirSync(sources).filter((f) => {
+        if (used.has(f)) return false;
+        // An attempt by this process or another live one may still record its round (its own
+        // failure path removes it otherwise); only a dead process's attempt is an orphan.
+        const pid = Number(f.match(/^r\d+-(\d+)-/)?.[1] ?? 0);
+        return !(pid && (pid === process.pid || processAlive(pid)));
+      });
+    };
+    if (!orphans(review).length) return;
+    try {
+      this.store.withLock(review.id, () => {
+        for (const f of orphans(this.store.load(review.id))) rmSync(path.join(sources, f), { recursive: true, force: true });
+      });
+    } catch {
+      /* busy or gone: tried again next time */
+    }
+  }
+
+  /**
    * Text sent inline is kept only for a review that has a round (a resubmit without new text reads
    * it again). A review whose first snapshot failed or was canceled has none: its text goes.
    */
@@ -515,7 +560,7 @@ export class Engine {
         // A folder made for this attempt alone (mkdtemp): racing resubmits never share one.
         const sources = path.join(this.store.ensureDir(id), "source");
         mkdirSync(sources, { recursive: true, mode: 0o700 });
-        written = mkdtempSync(path.join(sources, `r${round.n + 1}-`));
+        written = mkdtempSync(path.join(sources, `r${round.n + 1}-${process.pid}-`)); // the pid lets recovery tell a live attempt from a dead one
         review.request.artifact = { path: writeInline(written, [opts.artifact])[0], inline: true };
       }
       await this.startRound(review, runs, "resubmit", rubric.meta);
@@ -706,6 +751,7 @@ export class Engine {
       }
     }
     const review = this.store.load(id);
+    this.pruneSources(review);
     const cutOff = (r: Review) => {
       if (this.running.has(id)) return false;
       // Page capture has no reviewer timeout to bound it: only the process itself counts.

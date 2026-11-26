@@ -1661,6 +1661,8 @@ test("REVIEW_BUS_LOG records a text document's name and length, never its conten
     await call("review_submit", { artifact: { name: 5, content: secret }, related: [{ content: [secret] }], rubric: "proposal", intent: "x" });
     await call("review_submit", { artifact: { name: "c.md", content: "x" }, related: { "p.md": { content: secret } }, rubric: "proposal", intent: "x" });
     await call("review_submit", { artifact: [{ name: "c.md", content: secret }], rubric: "proposal", intent: "x" });
+    await call("review_submit", { artifact: { git: { repo: ROOT, mode: "uncommitted", content: secret, base: { content: secret } } }, rubric: "code", intent: "x" });
+    await call("review_submit", { artifact: { name: "c.md", content: "x" }, related: [{ git: { repo: secret } }], rubric: "proposal", intent: "x" });
   } finally {
     delete process.env.REVIEW_BUS_LOG;
   }
@@ -1777,4 +1779,29 @@ test("text is written only after its review is saved, so a stopped process alway
 test("a git change with text fields next to it is refused, not reviewed as the git change", async () => {
   const { res, text } = await call("review_submit", { artifact: { git: { repo: ROOT, mode: "uncommitted" }, name: "post.md", content: "Draft" }, rubric: "code", intent: "x" });
   assert.equal(res.isError, true, text);
+});
+
+test("cleanup a stopped process left undone is retried: a failed review with no round, and a dead resubmit attempt", async () => {
+  // A failed review with no round, saved as failed by a process that stopped before cleaning up.
+  writeConfig({ snapshot_wait_seconds: 0 });
+  const e = new Engine(loadConfig());
+  const failed = await e.submit({ artifact: { text: { name: "post.md", content: "Draft" } }, pages: ["http://127.0.0.1:9/"], rubric: "webpage", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  await e.settled(failed.id);
+  writeConfig();
+  const fdir = path.join(tmp, "reviews", failed.id);
+  mkdirSync(path.join(fdir, "source/r1/01"), { recursive: true });
+  writeFileSync(path.join(fdir, "source/r1/01/post.md"), "Draft");
+  assert.equal(new Engine(loadConfig()).get(failed.id).state, "failed");
+  assert.equal(existsSync(path.join(fdir, "source")), false);
+
+  // A review with a round: a dead process's unrecorded resubmit attempt goes; a live one's and round 1's stay.
+  const review = await e.submit({ artifact: { text: { name: "post.md", content: "Draft one" } }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [], stage: "pre-merge" }, PERSON);
+  await e.settled(review.id);
+  const sources = path.join(tmp, "reviews", review.id, "source");
+  for (const f of ["r2-999999-abc", `r2-${process.pid}-def`]) {
+    mkdirSync(path.join(sources, f, "01"), { recursive: true });
+    writeFileSync(path.join(sources, f, "01/post.md"), "Draft two");
+  }
+  new Engine(loadConfig()).get(review.id);
+  assert.deepEqual(readdirSync(sources).sort(), [`r2-${process.pid}-def`, "r1"].sort());
 });
