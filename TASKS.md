@@ -61,6 +61,8 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [ ] 2026-07-28 Tasks extension, if Claude Code ever needs it over stdio: the v2 SDK 2.4.0 serves 2026-07-28 over HTTP only
 - [ ] Resubmit with pages: return before the capture too
 - [ ] Hosted multi-user mode (accounts instead of one token), Gemini adapter, GitHub sync
+- [ ] claude.ai web and phone without the desktop app: `rb serve` as a remote connector (a tunnel plus OAuth, since claude.ai connectors cannot send our bearer token)
+- [ ] `rb submit -` reading the document from stdin
 
 ## v0.2 (25 Nov 2026)
 
@@ -71,3 +73,4 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details.
 - [x] `server.ts` starts stdio only as the entry point (rb serve imports it)
 - [x] Codex reviewed v0.2 with review-bus itself, 3 rounds (rv_01m89x5tve51aaxs476b8eygjf): 16 blocking findings fixed with tests; escalated at the round cap, a person decides
 - [x] Advisories from round 3, fixed with tests: the snapshot wait is capped by the call's budget (f7); the inbox gives a claim back if its page cannot be built (f9); every release names its claim with claimed_at (f10); submodule pointers in codex-review (f12); results and task completions carry the pull-only hint (f13)
+- [x] Documents sent as text (SPEC 3): `{name, content}` for the artifact, related documents and resubmits, for chat apps and sandboxes without this machine's disk; README shows the Claude desktop app setup

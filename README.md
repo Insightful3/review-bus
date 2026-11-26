@@ -101,6 +101,26 @@ REVIEW_BUS_CONFIG = "/Users/you/.review-bus/config.json"
 
 Without `default_tools_approval_mode`, `codex exec` refuses every review-bus tool call ("MCP tool call requires approval"). `tool_timeout_sec` gives tool calls more than the default 60 seconds. Check with `codex mcp get review-bus`, which should list both.
 
+### Claude desktop app (chat and Cowork)
+
+Add review-bus to `~/Library/Application Support/Claude/claude_desktop_config.json` (on Windows `%APPDATA%\Claude\claude_desktop_config.json`) and restart the app. Apps started from the Dock do not get your shell's `PATH`, so give the full path of `review-bus` (`which review-bus`) and a `PATH` that finds `node`, `codex`, `git` and `pdftotext`:
+
+```json
+{
+  "mcpServers": {
+    "review-bus": {
+      "command": "/opt/homebrew/bin/review-bus",
+      "env": {
+        "REVIEW_BUS_CONFIG": "/Users/you/.review-bus/config.json",
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  }
+}
+```
+
+The server runs on your computer, so reviewers use the Codex or Claude login there, even when you drive the app from your phone. The computer must be on. Chats and sandboxed sessions often cannot hand over a path on your disk: they send the document as text instead (see What to submit).
+
 ## Use it
 
 Ask the author agent in plain words, for example:
@@ -138,6 +158,12 @@ A document, compared with the accepted proposal (`related` documents are not rev
 
 ```json
 { "artifact": "/path/to/contract.docx", "related": ["/path/to/accepted-proposal.pdf"], "rubric": "contract-b2b", "intent": "Sign the services agreement." }
+```
+
+A document sent as text, for agents whose files are not on this computer (a chat, a sandbox). `.md` and `.txt` only, up to 1,000,000 characters; `related` documents can be text too. The text is saved in the review folder and reviewed like a file. To resubmit, send the new version the same way in `review_respond`'s `artifact`:
+
+```json
+{ "artifact": { "name": "post.md", "content": "The full text of the post" }, "related": [{ "name": "sources.md", "content": "The facts behind it" }], "rubric": "linkedin-post", "intent": "Publish the post on Thursday." }
 ```
 
 A branch against its base, plus the rendered pages from a running dev server:

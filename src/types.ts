@@ -8,6 +8,14 @@ import type { PageInfo } from "./pages.js";
 export interface ArtifactRef {
   path?: string;
   git?: GitSpec;
+  /** The document was sent as text (review_submit with {content, name}); path is its copy in the review folder. */
+  inline?: boolean;
+}
+
+/** A document sent as text instead of a path, for clients that do not share this machine's disk. */
+export interface InlineDoc {
+  name: string;
+  content: string;
 }
 
 export type ReviewState =

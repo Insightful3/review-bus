@@ -17,6 +17,7 @@ import { readFile, stat } from "node:fs/promises";
 const MAX_TOOL_FILE_BYTES = 10 * 1024 * 1024;
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { INLINE_MAX_CHARS } from "./inline.js";
 import { loadConfig } from "./config.js";
 import { Engine, isActive, onlyPullLeft } from "./engine.js";
 import { GitSpec } from "./git.js";
@@ -25,6 +26,14 @@ import { describeArtifact } from "./snapshot.js";
 import { listRubrics } from "./rubrics.js";
 import { renderSummary } from "./store.js";
 import type { AuthorInfo, Review } from "./types.js";
+
+/** A document sent as text: for clients that do not share this machine's disk (chat apps, sandboxes). */
+const InlineDocSchema = z
+  .object({
+    name: z.string().min(1).max(100).describe("File name with .md or .txt, e.g. post.md"),
+    content: z.string().min(1).max(INLINE_MAX_CHARS).describe("The full text"),
+  })
+  .strict();
 
 /** Present when only pull reviewers are left: waiting returns at once, so say what to do instead. */
 function pullHint(review: Review) {
@@ -282,16 +291,20 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
         "Called as an MCP task, it returns at once and the task completes with the result when the round finishes, or when only pull reviewers are left (waiting_for_pull: check back later with review_status).",
       inputSchema: {
         artifact: z
-          .union([z.string(), z.object({ git: GitSpec })])
+          .union([z.string(), z.object({ git: GitSpec }), InlineDocSchema])
           .optional()
           .describe(
-            'Absolute path to a document, or {"git": {"repo": "/path", "mode": "uncommitted" | "base" | "commit", "base"?: "main", "commit"?: "sha"}}. Optional when pages are given.',
+            'Absolute path to a document on the machine review-bus runs on; or the document as text, {"name": "post.md", "content": "..."} (.md or .txt, ' +
+              "for clients whose files are elsewhere, like a chat or a sandbox); " +
+              'or {"git": {"repo": "/path", "mode": "uncommitted" | "base" | "commit", "base"?: "main", "commit"?: "sha"}}. Optional when pages are given.',
           ),
         related: z
-          .array(z.string())
+          .array(z.union([z.string(), InlineDocSchema]))
           .max(3)
           .default([])
-          .describe("Paths to documents to compare against, not under review (for example the accepted proposal when reviewing a contract)"),
+          .describe(
+            "Documents to compare against, not under review (for example the accepted proposal when reviewing a contract, or the sources behind a post): paths, or {name, content} as text",
+          ),
         pages: z
           .array(z.string())
           .max(10)
@@ -315,7 +328,14 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     async (args, ctx) => {
       const submitted = await engine.submit(
         {
-          artifact: args.artifact === undefined ? null : typeof args.artifact === "string" ? { path: args.artifact } : { git: args.artifact.git },
+          artifact:
+            args.artifact === undefined
+              ? null
+              : typeof args.artifact === "string"
+                ? { path: args.artifact }
+                : "git" in args.artifact
+                  ? { git: args.artifact.git }
+                  : { text: args.artifact },
           pages: args.pages,
           related: args.related,
           rubric: args.rubric,
@@ -418,7 +438,12 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           )
           .default([]),
         resubmit: z.boolean().default(false),
-        artifact: z.string().optional().describe("Path to the new version; defaults to the originally submitted path"),
+        artifact: z
+          .union([z.string(), InlineDocSchema])
+          .optional()
+          .describe(
+            "The new version: a path, or {name, content} as text. Defaults to the version submitted last (for a document sent as text, the same text again).",
+          ),
         wait_seconds: z.number().int().min(0).max(3600).default(0).describe("Seconds to wait for the result; the server caps it (see the tool description)"),
       },
     },

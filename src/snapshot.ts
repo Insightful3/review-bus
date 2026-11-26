@@ -106,7 +106,7 @@ export { promptDiff } from "./change.js";
 
 export function describeArtifact(req: ReviewRequest): string {
   const parts: string[] = [];
-  if (req.artifact?.path) parts.push(req.artifact.path);
+  if (req.artifact?.path) parts.push(req.artifact.inline ? `${path.basename(req.artifact.path)} (sent as text)` : req.artifact.path);
   if (req.artifact?.git) {
     const g = req.artifact.git;
     parts.push(`git ${g.repo} (${g.mode}${g.mode === "base" && g.base ? ` vs ${g.base}` : ""}${g.mode === "commit" && g.commit ? ` ${g.commit}` : ""})`);

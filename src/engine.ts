@@ -15,7 +15,14 @@ import { checkPageUrl } from "./pages.js";
 import { ReviewerOutput, reviewerOutputJsonSchema } from "./spec/reviewer-output.js";
 import { newReviewId, Store } from "./store.js";
 import { checkEffort, resolveModelEffort, reviewerLabel, type ReviewerSpec } from "./settings.js";
-import type { AuthorInfo, Finding, FindingResponse, Review, ReviewRequest, ReviewerRun, ReviewState, Round } from "./types.js";
+import type { ArtifactRef, AuthorInfo, Finding, FindingResponse, InlineDoc, Review, ReviewRequest, ReviewerRun, ReviewState, Round } from "./types.js";
+import { inlineName, isInline, writeInline } from "./inline.js";
+
+/** What review_submit and rb submit pass in: like ReviewRequest, but a document may come as text. */
+export type SubmitRequest = Omit<ReviewRequest, "artifact" | "related"> & {
+  artifact: (ArtifactRef & { text?: InlineDoc }) | null;
+  related?: (string | InlineDoc)[];
+};
 
 export interface ResponseInput {
   finding_id: string;
@@ -162,13 +169,39 @@ export class Engine {
    * opts.snapshotWaitSeconds: the most this call may spend on page screenshots before returning the
    * review id (an MCP call's remaining budget); snapshot_wait_seconds from config if lower.
    */
-  async submit(req: ReviewRequest, author: AuthorInfo, waitSeconds = 0, opts: { snapshotWaitSeconds?: number } = {}): Promise<Review> {
-    const rubric = loadRubric(req.rubric, this.config.rubric_paths, this.config.rubric_packs);
+  async submit(input: SubmitRequest, author: AuthorInfo, waitSeconds = 0, opts: { snapshotWaitSeconds?: number } = {}): Promise<Review> {
+    // Checks that need no files come first: nothing is written for a request that cannot run.
+    const text = input.artifact?.text;
+    if (text && (input.artifact?.path || input.artifact?.git)) throw new Error("Give the document as a path, as text or a git change, only one of them.");
+    if (input.artifact?.path && input.artifact.git) throw new Error("Give either a document path or a git change, not both.");
+    input.pages.forEach(checkPageUrl);
+    const inlineDocs = [...(text ? [text] : []), ...(input.related ?? []).filter(isInline)];
+    inlineDocs.forEach(inlineName);
+    const rubric = loadRubric(input.rubric, this.config.rubric_paths, this.config.rubric_packs);
     // Approvals as they are on disk now: a session may have started before one was revoked.
-    const allowed = this.allowedReviewers(req.rubric, rubric.meta, this.currentConfig());
-    const { specs, notes } = this.pickReviewers(req.reviewers, author, allowed);
-    const runs = specs.map((spec) => this.planRun(spec, rubric.meta, req.stage));
+    const allowed = this.allowedReviewers(input.rubric, rubric.meta, this.currentConfig());
+    const { specs, notes } = this.pickReviewers(input.reviewers, author, allowed);
+    const runs = specs.map((spec) => this.planRun(spec, rubric.meta, input.stage));
     const id = newReviewId();
+    // Documents sent as text get a file in the review folder and are reviewed like any document.
+    let req: ReviewRequest;
+    if (inlineDocs.length) {
+      const dir = this.store.ensureDir(id);
+      try {
+        const files = writeInline(dir, "r1", inlineDocs);
+        let i = 0;
+        req = {
+          ...input,
+          artifact: text ? { path: files[i++], inline: true } : (input.artifact as ArtifactRef | null),
+          related: (input.related ?? []).map((r) => (isInline(r) ? files[i++] : r)),
+        };
+      } catch (err) {
+        rmSync(dir, { recursive: true, force: true });
+        throw err;
+      }
+    } else {
+      req = input as ReviewRequest;
+    }
     const t = now();
     const review: Review = {
       id,
@@ -188,8 +221,6 @@ export class Engine {
       // and take the snapshot in the background. A snapshot that fails within
       // snapshot_wait_seconds is an error on submit as before (nothing is kept); after that the
       // caller gets the review id, and a later snapshot error shows as a failed review.
-      req.pages.forEach(checkPageUrl);
-      if (req.artifact?.path && req.artifact.git) throw new Error("Give either a document path or a git change, not both.");
       review.preparing = { pid: process.pid, host: os.hostname(), started_at: t };
       this.store.withLock(id, () => this.store.save(review));
       const outcome: Promise<unknown> = this.startRound(review, runs, "prepared").then(
@@ -343,7 +374,7 @@ export class Engine {
   async respond(
     id: string,
     responses: ResponseInput[],
-    opts: { resubmit: boolean; artifact?: string; waitSeconds?: number },
+    opts: { resubmit: boolean; artifact?: string | InlineDoc; waitSeconds?: number },
   ): Promise<{ review: Review; unanswered: string[] }> {
     this.get(id); // marks a round cut off by a dead process as failed
     let unanswered: string[] = [];
@@ -411,12 +442,25 @@ export class Engine {
     }
     const runs = review.request.reviewers.map((spec) => this.planRun(spec, rubric.meta, review.request.stage));
     // A new document path replaces the old one; git changes and pages are simply captured again.
+    // A document sent as text gets its new version as text (or a path); the old text is kept in its round's snapshot.
+    let written: string | null = null;
     if (opts.artifact) {
       if (!review.request.artifact?.path) throw new Error("artifact can only be changed for document reviews; git changes and pages are captured again on resubmit.");
-      review.request.artifact = { path: opts.artifact };
+      if (isInline(opts.artifact)) {
+        const sub = `r${round.n + 1}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        written = path.join(this.store.dir(id), "source", sub);
+        review.request.artifact = { path: writeInline(this.store.ensureDir(id), sub, [opts.artifact])[0], inline: true };
+      } else {
+        review.request.artifact = { path: opts.artifact };
+      }
     }
     // The new round's blocking limit comes from the rubric as it is now (max_blocking may have changed).
-    await this.startRound(review, runs, "resubmit", rubric.meta);
+    try {
+      await this.startRound(review, runs, "resubmit", rubric.meta);
+    } catch (err) {
+      if (written) rmSync(written, { recursive: true, force: true });
+      throw err;
+    }
     if (opts.waitSeconds) await this.waitFor(id, opts.waitSeconds);
     return { review: this.get(id), unanswered: [] };
   }

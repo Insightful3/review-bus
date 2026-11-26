@@ -1,6 +1,6 @@
 // DOCX and PDF snapshots, the contract-b2b rubric, and per-rubric approved reviewers.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -166,4 +166,62 @@ test("merged table cells keep every value under its own heading (real mammoth ou
     "| Service | Standard | Premium |\n| --- | --- | --- |\n| Support assistant | EUR 22,500 | EUR 31,000 |\n" +
       "| Support assistant | EUR 1,200 / month | EUR 2,000 / month |\n| Total first year | Total first year | EUR 55,000 |\n",
   );
+});
+
+test("a document sent as text: reviewed like a file, a new version as text on resubmit, round 1 kept", async () => {
+  const original = readFileSync(path.join(ROOT, "test/fixtures/proposal-bluefin.md"), "utf8");
+  const { json: r1, text } = await call("review_submit", {
+    artifact: { name: "proposal", content: original },
+    related: [{ name: "sources.txt", content: "Bluefin asked for a fixed price of EUR 22,500." }],
+    rubric: "proposal",
+    intent: "Win the Bluefin project.",
+    reviewers: ["fake"],
+    wait_seconds: 10,
+  });
+  assert.ok(r1, text);
+  assert.equal(r1.state, "changes_requested");
+  const dir = path.join(tmp, "reviews", r1.review_id);
+  const review = JSON.parse(readFileSync(path.join(dir, "review.json"), "utf8"));
+  // No extension: saved as .md in the review folder, owner-only, outside any repo.
+  const source = review.request.artifact.path;
+  assert.equal(review.request.artifact.inline, true);
+  assert.ok(source.startsWith(path.join(dir, "source") + path.sep) && source.endsWith("proposal.md"), source);
+  assert.equal(statSync(source).mode & 0o777, 0o600);
+  assert.equal(review.rounds[0].snapshot.kind, "markdown");
+  assert.equal(readFileSync(path.join(dir, "r1/artifact.md"), "utf8").trim(), original.trim());
+  assert.match(readFileSync(path.join(dir, "r1/prompt.md"), "utf8"), /<related name="sources\.txt">\nBluefin asked for a fixed price/);
+  assert.match(readFileSync(path.join(dir, "report.md"), "utf8"), /proposal\.md \(sent as text\) \+ compared with sources\.txt/);
+
+  const fixed = original
+    .replace("Total price: EUR 24,000 excluding VAT.", "Total price: EUR 22,500 excluding VAT.")
+    .replace("The assistant will resolve 70% of incoming support questions", "We target 70% of incoming support questions resolved");
+  const answers = r1.findings.filter((f: { blocking: boolean }) => f.blocking).map((f: { finding_id: string }) => ({ finding_id: f.finding_id, status: "accepted", note: "Fixed." }));
+  const r2 = await call("review_respond", { review_id: r1.review_id, responses: answers, resubmit: true, artifact: { name: "proposal.md", content: fixed }, wait_seconds: 10 });
+  assert.notEqual(r2.res.isError, true, r2.text);
+  const result = JSON.parse(r2.res.content.find((c) => c.text.trim().startsWith("{"))!.text); // the review, then the unanswered list
+  assert.equal(result.round, 2);
+  assert.equal(result.state, "approved");
+  assert.match(readFileSync(path.join(dir, "r2/artifact.md"), "utf8"), /EUR 22,500 excluding VAT/);
+  assert.match(readFileSync(path.join(dir, "r1/artifact.md"), "utf8"), /EUR 24,000 excluding VAT/);
+});
+
+test("text documents: folder names, binary formats and empty text are refused before anything is written", async () => {
+  const before = readdirSync(path.join(tmp, "reviews")).length;
+  for (const [artifact, pattern] of [
+    [{ name: "../escape.md", content: "x" }, /plain file name/],
+    [{ name: ".hidden.md", content: "x" }, /plain file name/],
+    [{ name: "contract.docx", content: "x" }, /only \.md, \.markdown, \.txt can be sent as text/],
+    [{ name: "post.md", content: "  \n" }, /is empty/],
+  ] as const) {
+    const { res, text } = await call("review_submit", { artifact, rubric: "proposal", intent: "x", reviewers: ["fake"] });
+    assert.equal(res.isError, true, JSON.stringify(artifact));
+    assert.match(text, pattern);
+  }
+  // A bad related text fails the whole submit, even with a good document.
+  const bad = await call("review_submit", { artifact: { name: "post.md", content: "Hello" }, related: [{ name: "a/b.md", content: "x" }], rubric: "proposal", intent: "x", reviewers: ["fake"] });
+  assert.match(bad.text, /plain file name/);
+  // The text and a path together are refused by the schema.
+  const both = await call("review_submit", { artifact: { name: "post.md", content: "Hello", path: "/x.md" }, rubric: "proposal", intent: "x", reviewers: ["fake"] });
+  assert.equal(both.res.isError, true);
+  assert.equal(readdirSync(path.join(tmp, "reviews")).length, before);
 });
