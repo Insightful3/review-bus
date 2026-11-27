@@ -76,7 +76,7 @@ Order follows "thinnest slice first, then widen". See `SPEC.md` for details. Rel
 - [x] Codex review of documents sent as text (rv_01m8ba757d2tnwykkjd7vrft5b): text redacted from REVIEW_BUS_LOG, cleaned up on every failure path, a folder per resubmit, 413 with a reason over HTTP; the Claude desktop app recognised as an Anthropic author
 - [x] Second Codex review of documents sent as text (rv_01m8bagnv47m5nqz4tv8npbzwq, 3 rounds, escalated at the cap): crash windows closed (review saved before its text, cleanup retried on every look, dead resubmit attempts pruned), allowlisted log fields, text next to a git change refused. Not changed: text is kept once its review is saved, even if the client never received the id
 
-## v0.3 (planned)
+## v0.3 (26 Nov 2026; 0.3.1 on 27 Nov)
 
 From the first real use of the released 0.2.1 (26 Nov 2026): a document review of a client contract over 3 rounds, and a code review by Claude Code over MCP with Codex reviewing.
 
@@ -90,3 +90,11 @@ From the first real use of the released 0.2.1 (26 Nov 2026): a document review o
 - [x] Antigravity's MCP client name, `antigravity-client` (agy 1.5.18), is in the built-in `author_vendors`; headless agy needs `mcp(review-bus/*)` allowed to call review-bus
 - [x] Antigravity CLI as a reviewer: `type: "agy"` (`agy -p`, `--output-format json`, `--json-schema`, `--sandbox`, deny rules in `--settings`), tested with a fake and with agy 1.5.18. Plan mode returned no answer headless, and default mode wrote files without asking, so deny rules hold it read-only. Output arrives when stdout is not a terminal
 - [x] `rb submit -` reading the document from stdin
+
+## Next
+
+From reviewing the launch post with the `linkedin-post` rubric (27 Nov 2026; rv_01m8e7zq5nk0k7fn1y3eqs8yfr and rv_01m8e8kxyy6yqm1q0v7v11zq5r, Codex reviewing).
+
+- [ ] `linkedin-post` rubric: a post is not documentation. Codex rated true simplifications as high and likely ("3 rounds" without "by default", "fix it or say why not" without deferral). Say in the rubric that leaving out a detail is fine as long as what the post says stays true; a missing detail is low at most
+- [ ] A new review knows nothing about an earlier one on the same document. The deferral point came back in the second review although the author had rejected it with a reason in the first. Let a submit name an earlier review, so its rejected findings and their reasons go to the reviewer as already decided
+- [ ] `changes` in `review_respond` edits the copy review-bus keeps, not the author's file (by design: review-bus never writes to it). The author's file then lacks the change unless the author edits it too, which is easy to miss. Say so in the result ("sent as text; your file is unchanged"), and in the README
