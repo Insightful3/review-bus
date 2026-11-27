@@ -916,7 +916,9 @@ export class Engine {
     const images = screenshotFiles(snap).map((f) => path.join(reviewDir, f));
     const previous = review.rounds.find((r) => r.n === n - 1) ?? null;
     const related = (snap.related ?? []).map((r) => ({ name: path.basename(r.source_path), text: readFileSync(path.join(reviewDir, r.markdown_file), "utf8") }));
-    const prompt = buildPrompt(review.request, rubric, snap, text, snap.markdown_file ? path.basename(snap.markdown_file) : "", previous, related);
+    // Rounds before the previous one: their rejected and deferred findings stay decided.
+    const earlier = review.rounds.filter((r) => r.n < n - 1);
+    const prompt = buildPrompt(review.request, rubric, snap, text, snap.markdown_file ? path.basename(snap.markdown_file) : "", previous, related, earlier);
     writeFileSync(path.join(roundDir, "prompt.md"), prompt);
 
     // A cancel can come from another process (rb cancel, another session): watch the stored state.

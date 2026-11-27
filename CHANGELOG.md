@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Later rounds see every earlier round's decisions, not only the previous round's: findings rejected or deferred in round 1 are still in round 3's prompt, under "Decided in earlier rounds" (newest first, at most 40 items and 12,000 characters). A deferred finding may come back only as a reminder that does not block.
 - After a resubmit with `changes`, the result's notes say the new version was kept as text and that the author's file (named when it was given as a path) does not have the edits.
 - `linkedin-post` rubric: a post is not documentation. A detail left out (a default, an exception, an option) is low at most, as long as what the post says stays true.
 
