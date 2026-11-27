@@ -4,7 +4,7 @@ Have a second AI, from a different company, review your AI agent's work before y
 
 Your agent (Claude Code, Codex, the Claude desktop app, Antigravity or any MCP client) submits a document, a code change or web pages. Another model reviews a frozen copy read-only, against a rubric, and sends back findings. Every blocking finding must be fixed or answered (accepted, rejected with a reason, or deferred) before the review closes, and after at most 3 rounds a person decides. By default, a Claude agent's work goes to Codex and Codex's work goes to Claude. People can review too, from a web inbox or the `rb` command line.
 
-Status: 0.3. See `CHANGELOG.md` for what changed, `SPEC.md` for the design and `TASKS.md` for what is open.
+Status: 0.4. See `CHANGELOG.md` for what changed, `SPEC.md` for the design and `TASKS.md` for what is open.
 
 ## Quick start
 

@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-11-27)
 
-- Decisions that stay decided (v0.4). `review_submit` takes `follows`, an earlier closed review of the same work (`rb submit --follows`): its rejected, deferred and accepted findings, and blocking findings a person signed off without answering, go to the reviewers under "Decided earlier". A file with the same name as a recent closed review gets a hint to pass it.
+Decisions that stay decided: a point you rejected or deferred does not come back as new, in the next round or the next review. From the launch post's reviews, where the same point came back in a second review.
+
+- `review_submit` takes `follows`, an earlier closed review of the same work (`rb submit --follows`): its rejected, deferred and accepted findings, and blocking findings a person signed off without answering, go to the reviewers under "Decided earlier". A file with the same name as a recent closed review gets a hint to pass it.
 - Reviewers mark a finding that repeats an earlier decision (`repeats`, a new field in the reviewer output). A repeat of a rejected, deferred or settled finding blocks only if it is critical, or high and certain; a repeat of an accepted one is not softened.
 - With `merge_with`, its model also checks each round's blocking findings for repeats the reviewers did not mark (one call per round, only when there is something to compare).
 - `review_respond` takes status `repeat` with `repeat_of` (CLI `r2.f1=repeat:r1.f3`): it counts as rejected, with the earlier reason. With another status, `repeat_of` names the earlier finding the answer supersedes.
