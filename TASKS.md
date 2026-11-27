@@ -96,5 +96,53 @@ From the first real use of the released 0.2.1 (26 Nov 2026): a document review o
 From reviewing the launch post with the `linkedin-post` rubric (27 Nov 2026; rv_01m8e7zq5nk0k7fn1y3eqs8yfr and rv_01m8e8kxyy6yqm1q0v7v11zq5r, Codex reviewing).
 
 - [x] `linkedin-post` rubric: a post is not documentation. Codex rated true simplifications as high and likely ("3 rounds" without "by default", "fix it or say why not" without deferral). Say in the rubric that leaving out a detail is fine as long as what the post says stays true; a missing detail is low at most
-- [ ] A new review knows nothing about an earlier one on the same document. The deferral point came back in the second review although the author had rejected it with a reason in the first. Let a submit name an earlier review, so its rejected findings and their reasons go to the reviewer as already decided
+- [ ] A new review knows nothing about an earlier one on the same document. The deferral point came back in the second review although the author had rejected it with a reason in the first. Let a submit name an earlier review, so its rejected findings and their reasons go to the reviewer as already decided (design: v0.4 below)
 - [x] `changes` in `review_respond` edits the copy review-bus keeps, not the author's file (by design: review-bus never writes to it). The author's file then lacks the change unless the author edits it too, which is easy to miss. Say so in the result ("sent as text; your file is unchanged"), and in the README
+
+## v0.4 design: decisions that stay decided (draft, 27 Nov 2026)
+
+For discussion before any code. The problem: an author rejects or defers a finding with a reason, and the same point comes back anyway.
+
+### What happens today
+
+- Within a review, a round sees only the round before it (`buildPrompt` gets one `previous` round). A finding rejected in round 1 is not in round 3's prompt, so it can come back in round 3.
+- The prompt asks reviewers not to raise a rejected finding again. Deferred findings are listed with their answer but not protected.
+- A new review of the same document starts from nothing. On the launch post, the deferral point was answered in rv_01m8e7zq5nk0k7fn1y3eqs8yfr and raised again as blocking in rv_01m8e8kxyy6yqm1q0v7v11zq5r.
+- When a point comes back, the author answers it again, and a blocking slot (5 per round) goes to it instead of to something new.
+
+### Proposal
+
+1. **Every earlier round, not just the last.** The prompt lists the findings of all earlier rounds that were rejected or deferred, with the author's reason, plus the last round in full as today. Accepted findings from older rounds are left out: the version under review shows whether they were fixed. This step needs no new input and can ship first.
+2. **Deferred counts as decided (new behaviour).** The rule for rejected findings extends to deferred ones, in the last round, in older rounds and in carried history: do not raise it again unless the reason does not hold for this version, and if you do, say in evidence why. Deferred means "known, fixed later", not "raise it again".
+3. **`follows` on submit.** `review_submit` takes `follows: "rv_..."` (CLI: `rb submit --follows rv_...`). Only a closed review can be followed: approved, awaiting sign-off or escalated. A review that is being prepared, in review, waiting for answers, failed or canceled is refused before anything is saved, as are an unknown id and a different kind of artifact (a document following a git change). A different rubric is allowed.
+4. **Copied once, at submit.** The carried decisions are copied into the new review when it is submitted (`request.inherited`) and never read from the earlier review again, so later rounds see the same list the submit result announced ("Follows rv_...: 4 earlier decisions passed to the reviewers").
+5. **What carries over.** From the followed review: findings answered rejected or deferred, each with its claim, rating, place and reason, and the sign-off (see the open questions). Because each review keeps its own copied list, following review B also brings what B inherited from A: no chain is walked at submit, and a missing or deleted earlier review cannot break anything later.
+6. **A budget for the history.** Each carried item is cut to 200 characters of claim, 120 of place and 300 of reason; a sign-off note to 300. The whole rendered history (older rounds and carried decisions together) is at most 12,000 characters and 40 items. When it does not fit, the oldest items are dropped first, and the prompt and the result say how many were left out. The last round, shown in full as today, is outside this budget: it is bounded by that round's own findings. An item answered as a repeat (step 9) is stored as its original, so the same decision never takes two places.
+7. **How the reviewer is told.** A section "Decided earlier" with the rule from step 2.
+8. **Marking a repeat.** The reviewer output gets an optional `repeats` field naming the earlier finding (for example `rv_01m8e7zq.../r1.f3`). A finding marked as a repeat blocks only if it is critical, or high and certain; otherwise it is advisory, shown next to the earlier decision. A valid id is one of the decisions shown in that round's prompt (the last round, older rounds and carried history, after the budget). An id that is not among them is ignored: the finding follows the ordinary rule, and the result notes the bad reference.
+9. **Unmarked repeats.** A reviewer can repeat a point in other words and leave `repeats` out; review-bus cannot tell reliably on its own. So the author gets a cheap answer for it: `review_respond` status `repeat` with the earlier finding's id. It counts as rejected, with the earlier reason copied, and needs no new argument. The id must be one of the decisions shown in the round that raised the finding; any other id refuses the whole answer before anything is saved. The result counts marked and author-reported repeats, so real use shows whether stricter enforcement is needed (see the open questions).
+10. **A hint instead of guessing.** No automatic linking. When a new review's document has the same file path or file name as a recent closed review, the submit result adds a note: "rv_... reviewed a file of the same name on <date>; pass follows to carry its decisions." The agent decides.
+
+### Open questions for Mitja
+
+- Unmarked repeats: is step 9 (best effort, the author points out the repeat) enough for v0.4, or should review-bus enforce it, for example with a second, cheap model call that compares new blocking findings with the carried decisions before blocking slots are given out? That costs a call per round.
+- Sign-off and unanswered findings: a person signs off a review that still has an unanswered blocking finding. Does the next review carry that finding as decided by the person (the sign-off note as its reason), or only the sign-off note? Proposed: carried as decided, so a sign-off means "this is settled".
+- Should `follows` also carry accepted findings, as "fixed earlier, check it did not come back"? Useful for code, noise for posts.
+- Should a repeat of a deferred finding come back as an advisory reminder rather than not at all?
+- Hosted mode later: `follows` must check that the earlier review belongs to the same account.
+
+### Still to settle before code (Codex, rv_01m8ecp4s3fpedvnpq3py3qxsb round 3)
+
+- A last round with many long findings can still make the prompt large: cut its fields too, or give it its own budget.
+- `request.inherited` is stored in review.json: copy only what fits the budget (40 items), not everything the earlier review had.
+- When two reviewers raise the same point and their findings are merged, one marks it as a repeat and the other does not: say which wins (proposed: the merged finding is a repeat only if every reviewer that raised it marked the same earlier decision).
+
+### Tests (with fakes)
+
+- Round 3's prompt lists findings rejected and deferred in round 1, and the rule covers deferred ones.
+- A review with `follows` gets the earlier decisions; following B brings what B inherited from A; the list does not change when B changes later.
+- `follows` is refused for an unknown id and for a review that is preparing, in review, waiting for answers, failed or canceled, and for a different artifact kind, before anything is saved.
+- Budget: an oversized claim, place, reason and sign-off note are cut; a history over 12,000 characters or 40 items drops the oldest and reports how many.
+- A finding marked `repeats` is advisory unless critical or high and certain. An unknown id, or one dropped by the budget, leaves the finding under the ordinary rule with a note. An unmarked repeat blocks as before, and the author's `repeat` answer closes it with the earlier reason; an author `repeat` with an id not shown in that round is refused and saves nothing.
+- A decision answered as a repeat and carried on is stored once, as its original.
+- The same-name hint appears for a closed review of the same file and not for an open one.
