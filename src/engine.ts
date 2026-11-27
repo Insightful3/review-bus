@@ -424,8 +424,15 @@ export class Engine {
    * Snapshots the artifact as round n+1, saves, and runs the reviewers in the background.
    * mode "new": the review is saved here for the first time; "prepared": it was saved already (state
    * submitted, snapshot taken in the background); "resubmit": the next round of an answered review.
+   * note, if given, is saved with the round in the same step, so it exists exactly when the round does.
    */
-  private async startRound(review: Review, runs: ReviewerRun[], mode: "new" | "prepared" | "resubmit", rubricMeta: Record<string, unknown> = review.rubric_meta): Promise<void> {
+  private async startRound(
+    review: Review,
+    runs: ReviewerRun[],
+    mode: "new" | "prepared" | "resubmit",
+    rubricMeta: Record<string, unknown> = review.rubric_meta,
+    note?: string,
+  ): Promise<void> {
     const isNew = mode === "new";
     const n = review.rounds.length + 1;
     const t = now();
@@ -473,6 +480,7 @@ export class Engine {
       });
       r.state = "in_review";
       r.history.push({ at: t, event: "round_started", detail: `round ${n}` });
+      if (note) r.notes.push(note);
     };
     try {
       if (isNew) {
@@ -548,6 +556,11 @@ export class Engine {
     // Edits are checked before any answer is saved: a refused edit leaves the review as it was.
     // The edits are made against this round; if another call moves the review on first, they are refused.
     const editedRound = opts.changes ? (before.rounds.at(-1)?.n ?? null) : null;
+    // The author's own file (the latest version given as a path, not as text): review-bus never writes to it.
+    const ownDir = path.resolve(this.store.dir(id)) + path.sep;
+    const authorFile = opts.changes
+      ? ([...before.rounds].reverse().map((rd) => rd.snapshot?.source_path).find((p) => p && !path.resolve(p).startsWith(ownDir)) ?? null)
+      : null;
     if (opts.changes && before.rounds.length) {
       opts = { ...opts, artifact: changedVersion(before, this.store.dir(id), opts.changes), changes: undefined };
     }
@@ -625,6 +638,13 @@ export class Engine {
       if (!review.request.artifact?.path) throw new Error("artifact can only be changed for document reviews; git changes and pages are captured again on resubmit.");
       if (!isInline(opts.artifact)) review.request.artifact = { path: opts.artifact };
     }
+    // Saved with the new round: the author's file does not get edits sent as changes.
+    const changesNote =
+      editedRound === null
+        ? undefined
+        : authorFile
+          ? `Round ${round.n + 1} was made from changes and kept as text; \`${authorFile}\` is unchanged. Make the same edits there if you keep using that file.`
+          : `Round ${round.n + 1} was made from changes and kept as text. If you keep this document in a file of your own, make the same edits there.`;
     // The new round's blocking limit comes from the rubric as it is now (max_blocking may have changed).
     try {
       if (isInline(opts.artifact)) {
@@ -635,7 +655,7 @@ export class Engine {
         written = mkdtempSync(path.join(sources, `r${round.n + 1}-${process.pid}-`)); // the pid lets recovery tell a live attempt from a dead one
         review.request.artifact = { path: writeInline(written, [opts.artifact])[0], inline: true };
       }
-      await this.startRound(review, runs, "resubmit", rubric.meta);
+      await this.startRound(review, runs, "resubmit", rubric.meta, changesNote);
     } catch (err) {
       if (written) rmSync(written, { recursive: true, force: true });
       throw err;

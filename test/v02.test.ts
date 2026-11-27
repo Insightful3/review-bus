@@ -1905,6 +1905,8 @@ test("a resubmit can send changes to the version last reviewed instead of the wh
   const done = e.get(review.id);
   assert.equal(readFileSync(file, "utf8"), original + "\nUNREVIEWED DRAFT LINE\n"); // the author's file is untouched
   assert.equal(done.request.artifact?.inline, true); // the new version is kept as text
+  // The result says so, naming the author's file, which still lacks the edits.
+  assert.ok(done.notes.some((n) => n.startsWith("Round 2 was made from changes and kept as text; ") && n.includes(`\`${file}\` is unchanged`)), done.notes.join("\n"));
   const r2 = readFileSync(path.join(tmp, "reviews", review.id, "r2", "artifact.md"), "utf8");
   assert.match(r2, /Total price: EUR 22,500 excluding VAT\. Go-live on 15 March 2027\. Go-live on 1 April 2027\./);
   assert.match(r2, /German and English, \$& extra/); // replacement text is literal, $& is not a pattern
@@ -1921,6 +1923,18 @@ test("a resubmit can send changes to the version last reviewed instead of the wh
   assert.equal(path.basename(e.get(r3.id).request.artifact!.path!), "R-D plan.md");
   const answers2 = done.rounds[1].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "deferred" as const }));
   await assert.rejects(e.respond(review.id, answers2, { resubmit: true, changes: [{ find: "EUR 24,000 excluding VAT.", replace: "x" }] }), /occurs 0 times/);
+  // Round 3 edits round 2's text copy: the note still names the author's file, not the copy.
+  await e.respond(review.id, answers2, { resubmit: true, changes: [{ find: "Go-live on 1 April 2027.", replace: "Go-live on 2 April 2027." }] });
+  await e.settled(review.id);
+  assert.ok(e.get(review.id).notes.some((n) => n.startsWith("Round 3 was made from changes") && n.includes(`\`${file}\` is unchanged`)));
+  // A document sent as text from the start has no file here: the note says to edit your own copy, if any.
+  const t = await e.submit({ artifact: { text: { name: "post.md", content: readFileSync(FIXTURE, "utf8") } }, pages: [], rubric: "proposal", intent: "x", assumptions: [], criteria: [], reviewers: [{ name: "fake" }], stage: "pre-merge" }, PERSON, 10);
+  await e.settled(t.id);
+  const tAnswers = e.get(t.id).rounds[0].findings.filter((f) => f.blocking).map((f) => ({ finding_id: f.finding_id, status: "accepted" as const }));
+  await e.respond(t.id, tAnswers, { resubmit: true, changes: [{ find: "Two languages: German and English.", replace: "Three languages." }] });
+  await e.settled(t.id);
+  const tNotes = e.get(t.id).notes;
+  assert.ok(tNotes.includes("Round 2 was made from changes and kept as text. If you keep this document in a file of your own, make the same edits there."), tNotes.join("\n"));
 });
 
 test("rounds saved before later_rounds existed keep the round 1 rule", () => {

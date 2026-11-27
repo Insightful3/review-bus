@@ -217,7 +217,7 @@ A document sent as text, for agents whose files are not on this computer (a chat
 { "artifact": { "name": "post.md", "content": "The full text of the post" }, "related": [{ "name": "sources.md", "content": "The facts behind it" }], "rubric": "linkedin-post", "intent": "Publish the post on Thursday." }
 ```
 
-Edits to the version submitted last, instead of the whole text again (`.md` and `.txt` documents, sent as text or as a path). Each `find` is copied exactly and must occur exactly once; if one does not, nothing is changed. The edited text becomes the next version, kept as text; a file you gave as a path is only read:
+Edits to the version submitted last, instead of the whole text again (`.md` and `.txt` documents, sent as text or as a path). Each `find` is copied exactly and must occur exactly once; if one does not, nothing is changed. The edited text becomes the next version, kept as text. A file you gave as a path is only read, so it does not get the edits; the result's notes remind you to make them there too:
 
 ```json
 { "review_id": "rv_...", "responses": [{ "finding_id": "r1.f1", "status": "accepted" }], "resubmit": true, "changes": [{ "find": "Total price: EUR 24,000", "replace": "Total price: EUR 22,500" }] }

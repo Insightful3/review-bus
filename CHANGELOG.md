@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- After a resubmit with `changes`, the result's notes say the new version was kept as text and that the author's file (named when it was given as a path) does not have the edits.
+- `linkedin-post` rubric: a post is not documentation. A detail left out (a default, an exception, an option) is low at most, as long as what the post says stays true.
+
 ## 0.3.1 (2026-11-27)
 
 - The Antigravity CLI is recognised as a Google author: it connects as `antigravity-client`, now in the built-in `author_vendors`. The README shows the allow rule headless `agy -p` needs to call review-bus.
