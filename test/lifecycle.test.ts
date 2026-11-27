@@ -177,9 +177,9 @@ test("round cap: blocking findings still open after round 3 escalate, then a per
   assert.deepEqual([r3.round, r3.state], [3, "escalated"]);
   // Round 3 still sees what was rejected in round 1, not only round 2's findings.
   const prompt3 = readFileSync(path.join(tmp, "reviews", id, "r3/prompt.md"), "utf8");
-  assert.match(prompt3, /## Previous round \(round 2\)[\s\S]*### Decided in earlier rounds[\s\S]*- r1\.f1 [^\n]*\n  Author's answer: rejected: Intentional\./);
+  assert.match(prompt3, /## Previous round \(round 2\)[\s\S]*## Decided earlier[\s\S]*- r1\.f1 [^\n]*\n  Author's answer: rejected: Intentional\./);
   assert.match(prompt3, /A deferred finding is known and planned for later/);
-  assert.doesNotMatch(readFileSync(path.join(tmp, "reviews", id, "r2/prompt.md"), "utf8"), /Decided in earlier rounds/);
+  assert.doesNotMatch(readFileSync(path.join(tmp, "reviews", id, "r2/prompt.md"), "utf8"), /## Decided earlier/);
 
   await fails("review_respond", rejectAll(3), /escalated after 3 rounds/);
   assert.throws(() => person().signoff(id, "  ", ""), /person's name/);

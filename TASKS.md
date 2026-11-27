@@ -96,12 +96,12 @@ From the first real use of the released 0.2.1 (26 Nov 2026): a document review o
 From reviewing the launch post with the `linkedin-post` rubric (27 Nov 2026; rv_01m8e7zq5nk0k7fn1y3eqs8yfr and rv_01m8e8kxyy6yqm1q0v7v11zq5r, Codex reviewing).
 
 - [x] `linkedin-post` rubric: a post is not documentation. Codex rated true simplifications as high and likely ("3 rounds" without "by default", "fix it or say why not" without deferral). Say in the rubric that leaving out a detail is fine as long as what the post says stays true; a missing detail is low at most
-- [ ] A new review knows nothing about an earlier one on the same document. The deferral point came back in the second review although the author had rejected it with a reason in the first. Let a submit name an earlier review, so its rejected findings and their reasons go to the reviewer as already decided (design: v0.4 below)
+- [x] A new review knows nothing about an earlier one on the same document. The deferral point came back in the second review although the author had rejected it with a reason in the first. Let a submit name an earlier review, so its rejected findings and their reasons go to the reviewer as already decided (design: v0.4 below)
 - [x] `changes` in `review_respond` edits the copy review-bus keeps, not the author's file (by design: review-bus never writes to it). The author's file then lacks the change unless the author edits it too, which is easy to miss. Say so in the result ("sent as text; your file is unchanged"), and in the README
 
-## v0.4 design: decisions that stay decided (draft, 27 Nov 2026)
+## v0.4 design: decisions that stay decided (27 Nov 2026)
 
-For discussion before any code. The problem: an author rejects or defers a finding with a reason, and the same point comes back anyway.
+Built 27 Nov 2026 (steps 1 to 11), unreleased. Differences from the draft: a repeat of an accepted finding is not softened (the fix did not hold), and only a repeat id the reviewers were never shown adds a note. The problem: an author rejects or defers a finding with a reason, and the same point comes back anyway.
 
 ### What happens today
 
@@ -132,11 +132,17 @@ For discussion before any code. The problem: an author rejects or defers a findi
 - A deferred finding may come back, as an advisory reminder only (step 2).
 - Hosted mode later: `follows` must check that the earlier review belongs to the same account.
 
-### Still to settle before code (Codex, rv_01m8ecp4s3fpedvnpq3py3qxsb round 3)
+### Known limits (Codex, rv_01m8efyh9mg1sg3cy49sx0jsr1 round 2)
 
-- A last round with many long findings can still make the prompt large: cut its fields too, or give it its own budget.
-- `request.inherited` is stored in review.json: copy only what fits the budget (40 items), not everything the earlier review had.
-- When two reviewers raise the same point and their findings are merged, one marks it as a repeat and the other does not: say which wins (proposed: the merged finding is a repeat only if every reviewer that raised it marked the same earlier decision).
+- A rubric that was confidential only for a while during the earlier review (made confidential after submit, then not again before the follow) is not caught: a review records the rubric's confidentiality at submit, not per round.
+- Two reviewers citing the same decision by different ids (a repeat answer's id and its original) count as disagreeing, so the merged finding keeps the ordinary rule. This errs toward blocking.
+- From rv_01m8egspzjs5fa96r3q0vsp2bz round 2: the merge model's approval is checked against a config read separate from the one that starts it (remote: the adapter would have to be redefined in between); a rejection or deferral that names an earlier decision leaves that one usable as a repeat target too (both soften, as either decision would); a second process could take over finishing a round while a slow merge or repeat-check call runs, as before 0.4 for the merge.
+
+### Settled while building (Codex, rv_01m8ecp4s3fpedvnpq3py3qxsb round 3)
+
+- A last round with many long findings can still make the prompt large: cut its fields too, or give it its own budget. (Open: the previous round is still shown in full, as before 0.4.)
+- `request.inherited` is stored in review.json: copy only what fits the budget (40 items), not everything the earlier review had. (Done: `decisionsOf` copies at most 40.)
+- When two reviewers raise the same point and their findings are merged, one marks it as a repeat and the other does not: say which wins (done: the merged finding is a repeat only if every reviewer that raised it marked the same earlier decision).
 
 ### Tests (with fakes)
 

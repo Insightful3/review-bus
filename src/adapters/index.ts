@@ -23,6 +23,8 @@ export interface ReviewJob {
   schema?: Record<string, unknown>;
   /** Claude only: "read" (Read, Grep, Glob) for reviews, "none" for tasks that need no files. */
   tools?: "read" | "none";
+  /** The prompt's previous round and Decided earlier sections on their own (v0.4): codex-review's converter needs them for repeats. */
+  earlier?: string;
   /** Git rounds: the reviewers' copy of the project and the patch (absolute paths). Needed by codex-review. */
   git?: { tree: string; patch: string; gitlinks?: { path: string; sha: string }[] };
 }
@@ -276,6 +278,11 @@ export function gitlinksAfter(patch: Buffer): { path: string; sha: string }[] {
   return out;
 }
 
+/** The earlier findings for the converter, passed on their own: never cut out of the prompt (an answer may contain any heading). */
+export function earlierFindings(earlier: string | undefined): string {
+  return earlier?.trim() ? `\nEarlier findings (for repeats only; do not review them):\n${earlier}\n` : "";
+}
+
 /** Codex's native review priorities, mapped onto the impact scale. */
 const CONVERT_PROMPT = `You convert a code review into structured findings. Below is the text of a review that Codex's built-in code reviewer wrote about a change.
 
@@ -289,6 +296,7 @@ Rules:
 - likelihood: likely, unless the comment says the problem always happens (certain) or only in rare cases (possible).
 - suggested_fix: the fix the comment suggests, else null.
 - assumption_challenge: false. confidence: 0.7.
+- repeats: when a comment raises the same point as one of the earlier findings listed after the review (if any), that finding's id; else null.
 - verdict: changes_requested when there are findings, else approve. summary: the review's overall summary sentence.
 
 <review>
@@ -355,7 +363,10 @@ async function runCodexReview(cfg: AdapterConfig, job: ReviewJob): Promise<RawRe
   if (!text) throw new Error("codex exec review returned no review text");
   const left = Math.floor((deadline - Date.now()) / 1000);
   if (left < 5) throw new Error(`codex exec review used the reviewer's time (timeout_seconds ${cfg.timeout_seconds}); no time was left to convert its answer.`);
-  const converted = await runCodex({ ...cfg, timeout_seconds: left }, { ...job, reviewerName: `${job.reviewerName}.convert`, prompt: `${CONVERT_PROMPT}${text}\n</review>\n`, images: [], git: undefined });
+  const converted = await runCodex(
+    { ...cfg, timeout_seconds: left },
+    { ...job, reviewerName: `${job.reviewerName}.convert`, prompt: `${CONVERT_PROMPT}${text}\n</review>\n${earlierFindings(job.earlier)}`, images: [], git: undefined },
+  );
   // The review itself is what ran; the conversion is bookkeeping.
   return { json: converted.json, ...codexReported(`${r.stderr}\n${r.stdout}`) };
 }

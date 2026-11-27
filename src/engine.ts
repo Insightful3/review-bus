@@ -5,8 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { runAdapter } from "./adapters/index.js";
 import { loadConfig, type Config } from "./config.js";
-import { buildPrompt, screenshotFiles } from "./prompt.js";
-import { applyGroups, MERGE_SCHEMA, mergeFindings, mergePrompt, type CanBlock, type Merged, type Raised } from "./merge.js";
+import { buildPrompt, earlierSections, historyFor, HISTORY_LIMITS, isRepeat, repeatTargets, screenshotFiles, shownDecisions, toDecision } from "./prompt.js";
+import { applyGroups, applyRepeatMatches, MERGE_SCHEMA, mergeFindings, mergePrompt, REPEAT_SCHEMA, repeatPrompt, type CanBlock, type Merged, type Raised } from "./merge.js";
 import { runStructured } from "./adapters/index.js";
 import { computeBlocking, severityOf, wouldBlock, type PolicyOptions } from "./policy.js";
 import { baseName, loadRubric } from "./rubrics.js";
@@ -15,7 +15,7 @@ import { checkPageUrl } from "./pages.js";
 import { ReviewerOutput, reviewerOutputJsonSchema } from "./spec/reviewer-output.js";
 import { newReviewId, Store } from "./store.js";
 import { checkEffort, resolveModelEffort, reviewerLabel, type ReviewerSpec } from "./settings.js";
-import type { ArtifactRef, AuthorInfo, Finding, FindingResponse, InlineDoc, Review, ReviewRequest, ReviewerRun, ReviewState, Round } from "./types.js";
+import type { ArtifactRef, AuthorInfo, Decision, Finding, FindingResponse, InlineDoc, Review, ReviewRequest, ReviewerRun, ReviewState, Round } from "./types.js";
 import { inlineName, inlinePaths, isInline, writeInline } from "./inline.js";
 
 /** What review_submit and rb submit pass in: like ReviewRequest, but a document may come as text. */
@@ -26,8 +26,10 @@ export type SubmitRequest = Omit<ReviewRequest, "artifact" | "related"> & {
 
 export interface ResponseInput {
   finding_id: string;
-  status: FindingResponse["status"];
+  /** "repeat": the finding repeats an earlier decision shown in its round (repeat_of); stored as rejected with that reason. */
+  status: FindingResponse["status"] | "repeat";
   note?: string;
+  repeat_of?: string;
 }
 
 /** States in which nothing more happens without a person or a new submit. */
@@ -215,6 +217,63 @@ export interface ClaimedWork {
 }
 
 
+/** States a review can be followed from: nothing more happens to its findings. */
+const FOLLOWABLE: ReviewState[] = ["approved", "awaiting_signoff", "escalated"];
+
+/** What kind of work a request reviews: a document, a git change, or pages alone. */
+function artifactKind(a: { artifact: { path?: string; git?: unknown; text?: unknown } | null }): "document" | "git" | "pages" {
+  return a.artifact?.git ? "git" : a.artifact?.path || a.artifact?.text ? "document" : "pages";
+}
+
+/** Internal model calls (merge, repeat check) keep their files apart from reviewers', whatever those are named. */
+function internalDir(roundDir: string): string {
+  const dir = path.join(roundDir, "internal");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/** Where a review's carried decisions come from: every rubric of the followed chain, also of decisions left out. */
+const carriedSources = (r: Review) => [...(r.request.inherited ?? []), ...(r.request.inherited_rubrics ?? [])];
+
+/** The decisions a review leaves behind for one that follows it: its own, newest first, then what it carried. */
+export function decisionsOf(earlier: Review): { items: Decision[]; left_out: number; rubrics: { rubric: string; confidential: boolean }[] } {
+  const own: Decision[] = [];
+  const last = earlier.rounds.at(-1);
+  const rubric = earlier.request.rubric;
+  const confidential = earlier.rubric_meta.confidential === true;
+  for (const rd of [...earlier.rounds].sort((a, b) => b.n - a.n)) {
+    for (const f of rd.findings) {
+      if (isRepeat(f)) continue; // answered as a repeat: its original is carried instead
+      const ref = `${earlier.id}/${f.finding_id}`;
+      const st = f.response?.status;
+      // An answer is the newest decision on its point, even on a finding marked as a repeat.
+      if (st) own.push({ ...toDecision(f, st, f.response!.note, ref), rubric, confidential });
+      // A person signed off while this blocking finding was unanswered: settled by that person.
+      else if (earlier.signoff && rd === last && f.blocking) {
+        own.push({ ...toDecision(f, "signed_off", `${earlier.signoff.by}${earlier.signoff.note ? `: ${earlier.signoff.note}` : ""}`, ref), rubric, confidential });
+      }
+    }
+  }
+  // A local id ("r1.f2") names a finding of the earlier review: qualify it, as its ref is. A finding
+  // answered as a repeat is not carried, so a link to it goes on to its original.
+  const repeatOf = new Map(earlier.rounds.flatMap((r) => r.findings).filter((f) => f.response?.repeat_of).map((f) => [f.finding_id, f.response!.repeat_of!]));
+  for (const d of own) {
+    if (!d.supersedes) continue;
+    let ref = d.supersedes;
+    for (let hops = 0; repeatOf.has(ref) && hops < 50; hops++) ref = repeatOf.get(ref)!;
+    d.supersedes = ref.startsWith("rv_") ? ref : `${earlier.id}/${ref}`;
+  }
+  const all = [...own, ...(earlier.request.inherited ?? []).map((d) => ({ ...d, rubric: d.rubric ?? rubric, confidential: d.confidential === true || (!d.rubric && confidential) }))];
+  const items = all.slice(0, HISTORY_LIMITS.items);
+  // The rubrics of every decision in the chain, kept even when the decision itself is cut: findings
+  // that quote it may still be carried, so its approvals still apply.
+  const rubrics = new Map<string, boolean>();
+  for (const r of [...all.map((d) => ({ rubric: d.rubric ?? rubric, confidential: d.confidential === true })), { rubric, confidential }, ...(earlier.request.inherited_rubrics ?? [])]) {
+    rubrics.set(r.rubric, (rubrics.get(r.rubric) ?? false) || r.confidential);
+  }
+  return { items, left_out: all.length - items.length + (earlier.request.inherited_left_out ?? 0), rubrics: [...rubrics].map(([r, c]) => ({ rubric: r, confidential: c })) };
+}
+
 export class Engine {
   readonly store: Store;
   /** Rounds running in this process, keyed by review id. */
@@ -243,17 +302,32 @@ export class Engine {
     const allowed = this.allowedReviewers(input.rubric, rubric.meta, this.currentConfig());
     const { specs, notes } = this.pickReviewers(input.reviewers, author, allowed);
     const runs = specs.map((spec) => this.planRun(spec, rubric.meta, input.stage));
+    // v0.4: decisions from the followed review are copied once, now, and never read from it again.
+    const carried = input.follows ? this.inheritFrom(input.follows, artifactKind(input), specs.map((x) => x.name)) : null;
+    if (carried) {
+      notes.push(
+        `Follows ${input.follows}: ${carried.items.length} earlier decision(s) passed to the reviewers${carried.left_out ? `, ${carried.left_out} older one(s) left out` : ""}.`,
+      );
+    } else {
+      const hint = this.sameNameHint(input);
+      if (hint) notes.push(hint);
+    }
     const id = newReviewId();
     // Documents sent as text get a file in the review folder and are reviewed like any document.
     // They are written only after the review is saved (below), so a process that stops at any
     // point leaves either nothing or a review that recovery finds and cleans up.
-    let req: ReviewRequest = input as ReviewRequest;
+    // Only follows comes from the caller; what it carries is set here.
+    const { inherited: _i, inherited_left_out: _l, follows: _f, ...rest } = input;
+    let req: ReviewRequest = {
+      ...(rest as ReviewRequest),
+      ...(carried ? { follows: input.follows!, inherited: carried.items, inherited_left_out: carried.left_out, inherited_rubrics: carried.rubrics } : {}),
+    };
     const inlineBase = path.join(this.store.dir(id), "source", "r1");
     if (inlineDocs.length) {
       const files = inlinePaths(inlineBase, inlineDocs);
       let i = 0;
       req = {
-        ...input,
+        ...req,
         artifact: text ? { path: files[i++], inline: true } : (input.artifact as ArtifactRef | null),
         related: (input.related ?? []).map((r) => (isInline(r) ? files[i++] : r)),
       };
@@ -577,6 +651,8 @@ export class Engine {
       if (r.state === "in_review") throw new Error(`Review ${id} is still in review (round ${round.n}). Wait for the result first.`);
       if (r.state === "canceled") throw new Error(`Review ${id} is canceled.`);
       const t = now();
+      // The decisions this round's reviewers were shown: what a "repeat" answer may name (v0.4).
+      let targets: Map<string, Decision> | null = null;
       for (const x of responses) {
         const f = round.findings.find((y) => y.finding_id === x.finding_id);
         if (!f) {
@@ -584,8 +660,28 @@ export class Engine {
           throw new Error(`Finding ${x.finding_id} is not in round ${round.n}${older ? " (it belongs to an earlier round)" : ""}.`);
         }
         const note = (x.note ?? "").trim();
+        if (x.status === "repeat") {
+          const ref = (x.repeat_of ?? "").trim();
+          if (!ref) throw new Error(`Answering ${x.finding_id} as a repeat needs repeat_of: the id of the earlier finding it repeats.`);
+          targets ??= repeatTargets(r.rounds, round.n, historyFor(r.rounds, round.n, r.request.inherited ?? [], r.request.inherited_left_out ?? 0), r.request.inherited ?? []);
+          const d = targets.get(ref);
+          if (!d) {
+            throw new Error(`${x.finding_id}: ${ref} is not one of the rejected, deferred or settled findings shown to round ${round.n}'s reviewers. Nothing was saved.`);
+          }
+          f.response = { status: "rejected", note: `Repeat of ${d.ref}${d.reason ? `: ${d.reason}` : ""}`, at: t, repeat_of: d.ref };
+          continue;
+        }
         if (x.status === "rejected" && !note) throw new Error(`Rejecting ${x.finding_id} needs a reason in note.`);
-        f.response = { status: x.status, note, at: t };
+        // repeat_of with another answer: the same point as an earlier finding, which this answer
+        // supersedes (an acceptance then stops the older rejection from softening it later).
+        let supersedes: string | undefined;
+        if (x.repeat_of?.trim()) {
+          const ref = x.repeat_of.trim();
+          const known = r.rounds.some((rd) => rd.n < round.n && rd.findings.some((y) => y.finding_id === ref)) || (r.request.inherited ?? []).some((d) => d.ref === ref);
+          if (!known) throw new Error(`${x.finding_id}: repeat_of ${ref} is not an earlier finding of this review or a decision it carries. Nothing was saved.`);
+          supersedes = ref;
+        }
+        f.response = { status: x.status, note, at: t, ...(supersedes ? { supersedes } : {}) };
       }
       if (responses.length) {
         r.history.push({ at: t, event: "responded", detail: responses.map((x) => `${x.finding_id} ${x.status}`).join(", ") });
@@ -630,6 +726,9 @@ export class Engine {
         throw new Error(`Reviewer "${spec.name}" is no longer approved for ${review.request.rubric} (approved: ${allowed.join(", ")}). Nothing was sent. Submit a new review.`);
       }
     }
+    // Carried decisions: their rubrics' approvals are checked again too (v0.4).
+    const carriedBlock = this.unapprovedFor(carriedSources(review), review.request.reviewers.map((x) => x.name));
+    if (carriedBlock) throw new Error(`${carriedBlock}. Nothing was sent. Submit a new review.`);
     const runs = review.request.reviewers.map((spec) => this.planRun(spec, rubric.meta, review.request.stage));
     // A new document path replaces the old one; git changes and pages are simply captured again.
     // A document sent as text gets its new version as text (or a path); the old text is kept in its round's snapshot.
@@ -662,6 +761,79 @@ export class Engine {
     }
     if (opts.waitSeconds) await this.waitFor(id, opts.waitSeconds);
     return { review: this.get(id), unanswered: [] };
+  }
+
+  /** The decisions a new review carries from the one it follows (v0.4), checked before anything is saved. */
+  private inheritFrom(followId: string, kind: ReturnType<typeof artifactKind>, reviewers: string[]): ReturnType<typeof decisionsOf> {
+    if (!/^rv_[0-9a-z]{26}$/.test(followId)) throw new Error(`follows: "${followId}" is not a review id.`);
+    if (!existsSync(path.join(this.store.dir(followId), "review.json"))) throw new Error(`follows: review ${followId} was not found.`);
+    const earlier = this.get(followId);
+    if (!FOLLOWABLE.includes(earlier.state)) {
+      throw new Error(`follows: review ${followId} is ${earlier.state}; only a closed review (approved, awaiting sign-off or escalated) can be followed.`);
+    }
+    const theirs = artifactKind(earlier.request);
+    if (theirs !== kind) throw new Error(`follows: review ${followId} reviewed ${theirs === "git" ? "a git change" : theirs === "pages" ? "pages" : "a document"}, not ${kind === "git" ? "a git change" : kind === "pages" ? "pages" : "a document"}.`);
+    const carried = decisionsOf(earlier);
+    // Confidential now counts too, and is kept with the carried rubrics: a later change to the rubric
+    // never lifts it for this review or the ones that follow it. One config read for all of it.
+    const current = this.currentConfig();
+    carried.rubrics = carried.rubrics.map((x) => {
+      try {
+        return { ...x, confidential: x.confidential || loadRubric(x.rubric, current.rubric_paths, current.rubric_packs).meta.confidential === true };
+      } catch {
+        return { ...x, confidential: true };
+      }
+    });
+    // Carried claims and reasons quote the earlier work: every reviewer of the new review must be
+    // approved for each rubric they come from (a confidential rubric's approvals still apply).
+    const blocked = this.unapprovedFor(carried.rubrics, reviewers, current);
+    if (blocked) throw new Error(`follows: ${blocked}. Nothing was saved.`);
+    return carried;
+  }
+
+  /**
+   * Null when every name may see decisions made under their rubrics; else why not. A rubric that no
+   * longer loads counts as restricted to nobody (fail closed).
+   */
+  private unapprovedFor(sources: { rubric?: string; confidential?: boolean }[], names: string[], current: Config = this.currentConfig()): string | null {
+    for (const rubric of new Set(sources.map((d) => d.rubric).filter((r): r is string => Boolean(r)))) {
+      // Confidential if it was when the decision was made, or is now: a later change never lifts it.
+      const wasConfidential = sources.some((d) => d.rubric === rubric && d.confidential === true);
+      let allowed: string[] | null;
+      try {
+        const meta = loadRubric(rubric, current.rubric_paths, current.rubric_packs).meta;
+        allowed = this.allowedReviewers(rubric, { ...meta, confidential: meta.confidential === true || wasConfidential }, current);
+      } catch (err) {
+        return `decisions from rubric ${rubric} cannot be checked (${(err as Error).message})`;
+      }
+      const not = names.filter((x) => allowed && !allowed.includes(x));
+      if (not.length) return `${not.join(", ")} ${not.length === 1 ? "is" : "are"} not approved for ${rubric}, whose decisions would be carried`;
+    }
+    return null;
+  }
+
+  /**
+   * A note when a recent closed review had a document of the same file name (v0.4): the agent may
+   * pass follows. Never links on its own. Reads at most the 100 newest reviews, without side effects.
+   */
+  private sameNameHint(input: SubmitRequest): string | null {
+    const name = input.artifact?.text ? inlineName(input.artifact.text) : input.artifact?.path ? path.basename(input.artifact.path) : null;
+    if (!name || !existsSync(this.store.root)) return null;
+    const since = Date.now() - 30 * 24 * 3600 * 1000;
+    const dirs = readdirSync(this.store.root).filter((d) => /^rv_[0-9a-z]{26}$/.test(d)).sort().reverse().slice(0, 100);
+    for (const d of dirs) {
+      let r: Review;
+      try {
+        r = this.store.load(d);
+      } catch {
+        continue;
+      }
+      if (Date.parse(r.created_at) < since) break;
+      const p = r.request.artifact?.path;
+      if (!p || !FOLLOWABLE.includes(r.state) || path.basename(p) !== name) continue;
+      return `${r.id} reviewed a file of the same name (${name}) on ${r.created_at.slice(0, 10)}; pass follows: "${r.id}" to carry its decisions.`;
+    }
+    return null;
   }
 
   /** A person approves a review that awaits sign-off or was escalated. */
@@ -916,9 +1088,9 @@ export class Engine {
     const images = screenshotFiles(snap).map((f) => path.join(reviewDir, f));
     const previous = review.rounds.find((r) => r.n === n - 1) ?? null;
     const related = (snap.related ?? []).map((r) => ({ name: path.basename(r.source_path), text: readFileSync(path.join(reviewDir, r.markdown_file), "utf8") }));
-    // Rounds before the previous one: their rejected and deferred findings stay decided.
-    const earlier = review.rounds.filter((r) => r.n < n - 1);
-    const prompt = buildPrompt(review.request, rubric, snap, text, snap.markdown_file ? path.basename(snap.markdown_file) : "", previous, related, earlier);
+    // Older rounds' decisions and those carried from a followed review stay decided (v0.4).
+    const history = historyFor(review.rounds, n, review.request.inherited ?? [], review.request.inherited_left_out ?? 0);
+    const prompt = buildPrompt(review.request, rubric, snap, text, snap.markdown_file ? path.basename(snap.markdown_file) : "", previous, related, history);
     writeFileSync(path.join(roundDir, "prompt.md"), prompt);
 
     // A cancel can come from another process (rb cancel, another session): watch the stored state.
@@ -930,7 +1102,7 @@ export class Engine {
       }
     }, 1000);
     try {
-      await this.finishRound(id, n, review, round, prompt, images, roundDir, signal, current, rubric.meta);
+      await this.finishRound(id, n, review, round, prompt, images, roundDir, signal, current, rubric.meta, earlierSections(previous, history));
     } finally {
       clearInterval(watcher);
     }
@@ -947,6 +1119,7 @@ export class Engine {
     signal: AbortSignal,
     current: Config | Error,
     rubricMeta: Record<string, unknown>,
+    earlier = "",
   ): Promise<void> {
     // Last check before anything leaves the machine: approvals and reviewer definitions as they
     // are on disk right now, from the same read (a reviewer repointed to another provider runs as
@@ -959,12 +1132,13 @@ export class Engine {
       const meta = { ...review.rubric_meta, confidential: review.rubric_meta.confidential === true || rubricMeta.confidential === true };
       const allowed = this.allowedReviewers(review.request.rubric, meta, current);
       adapterFor = (name) => current.adapters[name];
-      dispatchError = (name) =>
-        !current.adapters[name]
-          ? "no longer configured; nothing was sent"
-          : allowed && !allowed.includes(name)
-            ? `no longer approved for ${review.request.rubric}; nothing was sent`
-            : null;
+      dispatchError = (name) => {
+        if (!current.adapters[name]) return "no longer configured; nothing was sent";
+        if (allowed && !allowed.includes(name)) return `no longer approved for ${review.request.rubric}; nothing was sent`;
+        // Decisions carried from a followed review: their rubrics' approvals, from the same read.
+        const carried = this.unapprovedFor(carriedSources(review), [name], current);
+        return carried ? `${carried}; nothing was sent` : null;
+      };
     } catch (err) {
       const message = (err as Error).message;
       dispatchError = () => message;
@@ -988,6 +1162,7 @@ export class Engine {
             const res = await runAdapter(adapterFor(run.name)!, {
               reviewerName: run.name,
               prompt,
+              earlier,
               cwd: roundDir,
               outDir: roundDir,
               images,
@@ -1074,12 +1249,32 @@ export class Engine {
       also_raised_by: m.also_raised_by,
       response: null,
     }));
-    const blocking = computeBlocking(findings, policy);
+    // v0.4: a finding that repeats an earlier decision shown in this round's prompt blocks less.
+    // Reviewers mark repeats; a model checks the blocking candidates they did not mark.
+    const history = historyFor(review.rounds, n, review.request.inherited ?? [], review.request.inherited_left_out ?? 0);
+    const targets = repeatTargets(review.rounds, n, history, review.request.inherited ?? []);
+    // Shown but not settled (accepted, or never answered): the ordinary rule, no note. Never shown: a note.
+    const shown = new Set([...(review.rounds.find((r) => r.n === n - 1)?.findings ?? []).map((f) => f.finding_id), ...history.items.map((d) => d.ref)]);
+    const badRefs: string[] = [];
+    for (const f of findings) {
+      if (!f.repeats) continue;
+      const d = targets.get(f.repeats);
+      if (d) f.repeat = { of: d.ref, by: "reviewer", status: d.status, reason: d.reason };
+      else if (!shown.has(f.repeats)) badRefs.push(`${f.finding_id} (${f.repeats})`);
+    }
+    const asPolicy = (f: Finding) => ({ ...f, is_repeat: Boolean(f.repeat) });
+    // Only findings no reviewer marked go to the model: a mark it cannot overrule (a disagreement
+    // between reviewers, or an id that was not shown) keeps the ordinary rule.
+    const candidates = findings.filter((f, i) => merged[i].unmarked && wouldBlock(asPolicy(f), policy));
+    const shownAll = shownDecisions(review.rounds, n, history);
+    const repeatCheck = targets.size && candidates.length ? await this.repeatCheck(candidates, targets, shownAll, review, roundDir, signal) : null;
+    for (const [f, d] of repeatCheck?.matches ?? []) f.repeat = { of: d.ref, by: "model", status: d.status, reason: d.reason };
+    const blocking = computeBlocking(findings.map(asPolicy), policy);
     findings.forEach((f, i) => {
       f.blocking = blocking[i];
       // Would block on its own, but the round's limit kept only the riskiest: say so, so it is not
       // read as a minor point.
-      if (!f.blocking && wouldBlock(f, policy)) f.over_limit = true;
+      if (!f.blocking && wouldBlock(asPolicy(f), policy)) f.over_limit = true;
     });
 
     // Apply the results to the latest stored state, under the lock.
@@ -1088,12 +1283,17 @@ export class Engine {
       if (!freshRound || freshRound.finished_at) return;
       freshRound.findings = findings;
       freshRound.merge = merge;
+      if (repeatCheck) freshRound.repeat_check = repeatCheck.record;
       freshRound.finished_at = now();
       freshRound.finalizing = null;
       // Canceled meanwhile, or a newer round started (after a restart marked this one failed):
       // keep this round's results but leave the review state alone.
       if (fresh.state !== "in_review" || fresh.rounds.at(-1)!.n !== n) return;
       fresh.state = this.stateAfterRound(fresh, freshRound);
+      if (badRefs.length) {
+        fresh.notes.push(`Round ${n}: ${badRefs.join(", ")} named as repeated an earlier finding the reviewers were not shown; the ordinary rule applied.`);
+      }
+      if (repeatCheck?.record.error) fresh.notes.push(`Round ${n}: the repeat check did not run (${repeatCheck.record.error}); the ordinary rule applied.`);
       const failed = freshRound.reviewers.filter((r) => r.status === "failed").map((r) => r.label);
       if (failed.length && fresh.state !== "failed") {
         fresh.notes.push(`Round ${n}: reviewer(s) ${failed.join(", ")} failed; their review is missing from this round.`);
@@ -1200,6 +1400,8 @@ export class Engine {
       // Confidential if it was when submitted or is now (a rubric marked confidential later).
       const allowed = this.allowedReviewers(r.request.rubric, { ...r.rubric_meta, confidential: r.rubric_meta.confidential === true || rubricNow.meta.confidential === true }, current);
       if (allowed && !allowed.includes(reviewer)) throw new Error(`Reviewer "${reviewer}" is no longer approved for ${r.request.rubric}. Nothing was sent.`);
+      const carriedBlock = this.unapprovedFor(carriedSources(r), [reviewer]);
+      if (carriedBlock) throw new Error(`${carriedBlock}. Nothing was sent.`);
       run.status = "running";
       run.started_at = now();
       claimedAt = now();
@@ -1432,6 +1634,57 @@ export class Engine {
   }
 
   /**
+   * v0.4: one call to the merge model (merge_with) finds blocking candidates that repeat an earlier
+   * decision shown in the prompt, which the reviewers did not mark. Without a usable model, or if the
+   * call fails, nothing is matched and the record says why.
+   */
+  private async repeatCheck(
+    candidates: Finding[],
+    targets: Map<string, Decision>,
+    shown: Decision[],
+    review: Review,
+    roundDir: string,
+    signal: AbortSignal,
+  ): Promise<{ matches: [Finding, Decision][]; record: NonNullable<Round["repeat_check"]> }> {
+    const none = (error: string | null, by: string | null = null) => ({ matches: [] as [Finding, Decision][], record: { by, found: 0, error } });
+    let current: Config;
+    let allowed: string[] | null;
+    try {
+      current = this.currentConfig();
+      allowed = this.allowedReviewers(review.request.rubric, this.metaNow(review, current), current);
+    } catch (err) {
+      return none((err as Error).message);
+    }
+    const mw = current.merge_with;
+    if (!mw || !current.adapters[mw.adapter]) return none("no merge_with model is configured");
+    if (allowed && !allowed.includes(mw.adapter)) return none(`${mw.adapter} is not approved for ${review.request.rubric}`);
+    // The model sees carried decisions too: it must be approved for the rubrics they come from.
+    // Shown decisions, and every carried one: a finding may quote a decision the budget no longer shows.
+    const blocked = this.unapprovedFor([...shown, ...carriedSources(review)], [mw.adapter], current);
+    if (blocked) return none(blocked);
+    const label = reviewerLabel(mw.adapter, mw.model, mw.effort);
+    const decisions = shown;
+    try {
+      const res = await runStructured(current.adapters[mw.adapter], {
+        reviewerName: "repeats",
+        prompt: repeatPrompt(candidates, decisions),
+        cwd: roundDir,
+        outDir: internalDir(roundDir),
+        model: mw.model,
+        effort: mw.effort,
+        signal,
+        schema: REPEAT_SCHEMA as unknown as Record<string, unknown>,
+        tools: "none",
+      });
+      const matches = applyRepeatMatches(candidates, targets, (res.json as { matches?: unknown } | null)?.matches);
+      const by = reviewerLabel(mw.adapter, res.reportedModel ?? mw.model, res.reportedEffort ?? mw.effort);
+      return { matches, record: { by, found: matches.length, error: null } };
+    } catch (err) {
+      return none(`the call failed: ${(err as Error).message}`, label);
+    }
+  }
+
+  /**
    * Merges duplicates across reviewers: with the configured model when there is one (and it may see
    * this rubric's content), else with conservative word-based rules.
    */
@@ -1462,13 +1715,16 @@ export class Engine {
     if (!mw || !current.adapters[mw.adapter] || (allowed && !allowed.includes(mw.adapter))) {
       return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: mw ? `${mw.adapter} is not approved for ${rubricName}` : null } };
     }
+    // Findings may quote carried decisions: the merge model must be approved for their rubrics too.
+    const carriedBlock = review ? this.unapprovedFor(carriedSources(review), [mw.adapter]) : null;
+    if (carriedBlock) return { merged: mergeFindings(raised, canBlock), merge: { method: "rules", by: null, error: carriedBlock } };
     const label = reviewerLabel(mw.adapter, mw.model, mw.effort);
     try {
       const res = await runStructured(current.adapters[mw.adapter], {
         reviewerName: "merge",
         prompt: mergePrompt(raised),
         cwd: roundDir,
-        outDir: roundDir,
+        outDir: internalDir(roundDir),
         model: mw.model,
         effort: mw.effort,
         signal,

@@ -1,3 +1,4 @@
+import { historyFor } from "./prompt.js";
 import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -262,6 +263,7 @@ function findingLine(f: Finding): string {
     f.suggested_fix ? `  - Suggested fix: ${f.suggested_fix}` : null,
     `  - Reviewer: ${f.reviewer}, confidence ${f.confidence}`,
     f.agreement > 1 ? `  - Also raised by: ${(f.also_raised_by ?? []).map((r) => `${r.reviewer} [${r.impact}/${r.likelihood}]`).join(", ")} (agreement ${f.agreement})` : null,
+    f.repeat ? `  - ${repeatText(f.repeat)}` : null,
     f.response ? `  - Response: ${f.response.status}${f.response.note ? `, ${f.response.note}` : ""}` : null,
   ];
   return "- " + parts.filter(Boolean).join("\n");
@@ -270,7 +272,13 @@ function findingLine(f: Finding): string {
 /** An advisory finding on one line, for tool results: the full text is in report.md and in review_result with full. */
 function shortLine(f: Finding): string {
   const loc = f.location.section ?? (f.location.line_start != null ? `line ${f.location.line_start}` : null);
-  return `- **${f.finding_id}** [${f.impact}/${f.likelihood}]${loc ? ` (${loc})` : ""} ${f.claim}${f.response ? ` Response: ${f.response.status}.` : ""}`;
+  return `- **${f.finding_id}** [${f.impact}/${f.likelihood}]${loc ? ` (${loc})` : ""} ${f.claim}${f.repeat ? ` (repeats ${f.repeat.of})` : ""}${f.response ? ` Response: ${f.response.status}.` : ""}`;
+}
+
+/** v0.4: why a finding blocks less: the earlier decision it repeats. */
+function repeatText(r: NonNullable<Finding["repeat"]>): string {
+  const what = r.status === "signed_off" ? "settled at sign-off" : r.status;
+  return `Repeats ${r.of} (${what}${r.reason ? `: ${r.reason}` : ""}), ${r.by === "model" ? "found by the repeat check" : "marked by the reviewer"}; a repeat blocks only if critical, or high and certain`;
 }
 
 /** includeAdvisory: list advisory findings too; full (default): each in full, else one line each. */
@@ -305,6 +313,21 @@ export function renderSummary(review: Review, includeAdvisory = true, full = tru
     for (const w of snap.warnings ?? []) lines.push(`- Warning: ${w}`);
     if (round.merge && round.merge.method !== "none") {
       lines.push(`- Duplicates across reviewers merged by ${round.merge.method === "model" ? `model (${round.merge.by})` : "word-based rules"}${round.merge.error ? `; ${round.merge.error}` : ""}`);
+    }
+    if (review.request.follows) {
+      lines.push(`- Follows ${review.request.follows}: ${review.request.inherited?.length ?? 0} earlier decision(s) carried${review.request.inherited_left_out ? `, ${review.request.inherited_left_out} left out` : ""}`);
+    }
+    // What this round's reviewers were actually shown under "Decided earlier" (the prompt's budget).
+    const shownHistory = historyFor(review.rounds, round.n, review.request.inherited ?? [], review.request.inherited_left_out ?? 0);
+    if (shownHistory.items.length || shownHistory.left_out) {
+      lines.push(`- Decided earlier: ${shownHistory.items.length} decision(s) shown to round ${round.n}'s reviewers${shownHistory.left_out ? `, ${shownHistory.left_out} older one(s) left out` : ""}`);
+    }
+    const marked = round.findings.filter((f) => f.repeat?.by === "reviewer").length;
+    const found = round.findings.filter((f) => f.repeat?.by === "model").length;
+    const answered = round.findings.filter((f) => f.response?.repeat_of).length;
+    if (marked || found || answered || round.repeat_check) {
+      const check = round.repeat_check ? (round.repeat_check.error ? `repeat check did not run` : `${found} found by the repeat check (${round.repeat_check.by})`) : null;
+      lines.push(`- Repeats of earlier decisions: ${[`${marked} marked by reviewers`, check, `${answered} answered as repeat by the author`].filter(Boolean).join(", ")}`);
     }
     const blocking = round.findings.filter((f) => f.blocking);
     const overLimit = round.findings.filter((f) => !f.blocking && f.over_limit);

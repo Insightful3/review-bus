@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-- Later rounds see every earlier round's decisions, not only the previous round's: findings rejected or deferred in round 1 are still in round 3's prompt, under "Decided in earlier rounds" (newest first, at most 40 items and 12,000 characters). A deferred finding may come back only as a reminder that does not block.
+- Decisions that stay decided (v0.4). `review_submit` takes `follows`, an earlier closed review of the same work (`rb submit --follows`): its rejected, deferred and accepted findings, and blocking findings a person signed off without answering, go to the reviewers under "Decided earlier". A file with the same name as a recent closed review gets a hint to pass it.
+- Reviewers mark a finding that repeats an earlier decision (`repeats`, a new field in the reviewer output). A repeat of a rejected, deferred or settled finding blocks only if it is critical, or high and certain; a repeat of an accepted one is not softened.
+- With `merge_with`, its model also checks each round's blocking findings for repeats the reviewers did not mark (one call per round, only when there is something to compare).
+- `review_respond` takes status `repeat` with `repeat_of` (CLI `r2.f1=repeat:r1.f3`): it counts as rejected, with the earlier reason. With another status, `repeat_of` names the earlier finding the answer supersedes.
+- `follows` keeps reviewer approvals: carried decisions remember their rubric, and a reviewer or repeat-check model not approved for it never sees them. The newest decision on a point counts (an accepted recurrence is not hidden behind an older rejection). The web inbox form and Codex's native review can mark repeats too.
+- Later rounds see every earlier round's decisions, not only the previous round's: findings rejected, deferred or accepted in round 1 are still in round 3's prompt, under "Decided earlier" (newest first, at most 40 items and 12,000 characters). A deferred finding may come back only as a reminder that does not block.
 - After a resubmit with `changes`, the result's notes say the new version was kept as text and that the author's file (named when it was given as a path) does not have the edits.
 - `linkedin-post` rubric: a post is not documentation. A detail left out (a default, an exception, an option) is low at most, as long as what the post says stays true.
 

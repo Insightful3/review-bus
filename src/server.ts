@@ -360,6 +360,12 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           ),
         author_vendor: Vendor.optional().describe("Your vendor (anthropic, openai, google, other). Detected from the MCP client when omitted; Antigravity agents pass google."),
         stage: z.enum(["draft", "pre-merge", "release"]).default("pre-merge"),
+        follows: z
+          .string()
+          .optional()
+          .describe(
+            "The id of an earlier, closed review of the same work (approved, awaiting sign-off or escalated). Its decisions (rejected, deferred, accepted, settled at sign-off) go to the reviewers, so settled points do not come back as new.",
+          ),
         wait_seconds: z.number().int().min(0).max(3600).default(0).describe("Seconds to wait for the result; the server caps it (see the tool description)"),
       },
     },
@@ -382,6 +388,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           criteria: args.criteria,
           reviewers: args.reviewers.map((r) => (typeof r === "string" ? { name: r } : r)),
           stage: args.stage,
+          ...(args.follows ? { follows: args.follows } : {}),
         },
         detectAuthor(args.author_vendor),
         0,
@@ -391,13 +398,14 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
       await ctx.wait(submitted.id, args.wait_seconds);
       const review = engine.get(submitted.id);
       if (!isActive(review.state)) return { now: reply(review, false) };
-      if (onlyPullLeft(review)) return { now: jsonReply({ ...status(review), review_id: review.id }) };
+      // Notes (a same-name hint, a follows summary) matter before the round ends: return them now.
+      if (onlyPullLeft(review)) return { now: jsonReply({ ...status(review), review_id: review.id, ...(review.notes.length ? { notes: review.notes } : {}) }) };
       const next =
         review.state === "submitted"
           ? "The snapshot (page screenshots) is being taken. Call review_wait with this review_id until state is neither submitted nor in_review, then review_result."
           : "Reviewers are working. Call review_wait with this review_id until state is not in_review, then review_result.";
       return {
-        now: { content: [{ type: "text" as const, text: JSON.stringify({ review_id: review.id, state: review.state, next }) }] },
+        now: { content: [{ type: "text" as const, text: JSON.stringify({ review_id: review.id, state: review.state, next, ...(review.notes.length ? { notes: review.notes } : {}) }) }] },
         later: () => untilDone(review.id).then((r) => reply(r, false)),
       };
     },
@@ -463,6 +471,7 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
     {
       description:
         "Answer findings of the latest round: accepted, rejected (reason required) or deferred. Every blocking finding needs an answer. " +
+        "A finding that raises again an earlier rejected, deferred or settled one (listed in its round's prompt) can be answered repeat, with repeat_of naming it (r1.f3, or rv_.../r1.f3): it counts as rejected with the earlier reason. " +
         "With resubmit=true, starts the next round on a fresh snapshot of the document (or of artifact, if given). " +
         "With resubmit=false and every blocking finding answered, closes the review (approved, or awaiting_signoff when the rubric requires a person; the person then signs off with rb signoff). " +
         "Called as an MCP task with resubmit=true, the task completes with the next round's result.",
@@ -472,8 +481,14 @@ export function createServer(engine: Engine): { server: McpServer; trackTaskRequ
           .array(
             z.object({
               finding_id: z.string(),
-              status: z.enum(["accepted", "rejected", "deferred"]),
+              status: z.enum(["accepted", "rejected", "deferred", "repeat"]),
               note: z.string().default(""),
+              repeat_of: z
+                .string()
+                .optional()
+                .describe(
+                  "With status repeat: the earlier finding this one repeats, for example r1.f3 or rv_.../r1.f3. With another status: the earlier finding on the same point, which this answer supersedes (accept a point you rejected before, and the old rejection no longer softens it).",
+                ),
             }),
           )
           .default([]),

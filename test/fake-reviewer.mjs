@@ -3,7 +3,15 @@
 // FAKE_REVIEWER_MODE: issues (default) | clean | bad-json | fail
 // A finding goes away once its quoted text is no longer in the document (the author fixed it).
 function withFixes(doc, out) {
-  const findings = out.findings.filter((f) => doc.includes(f.location.quote));
+  let findings = out.findings.filter((f) => doc.includes(f.location.quote));
+  // v0.4: --auto-repeat marks a finding as a repeat of an earlier one the prompt lists with the same
+  // claim (previous round or Decided earlier); --repeat-ref=<id> marks every finding with that id.
+  const forced = process.argv.find((a) => a.startsWith("--repeat-ref="))?.split("=")[1];
+  if (process.argv.includes("--auto-repeat") || forced) {
+    const listed = new Map();
+    for (const m of input.matchAll(/^- (\S+)(?: \(.*?\))? \[[^\]]*\] (.+)$/gm)) if (!listed.has(m[2])) listed.set(m[2], m[1]);
+    findings = findings.map((f) => ({ ...f, repeats: forced ?? listed.get(f.claim) ?? null }));
+  }
   const serious = findings.some((f) => f.impact === "critical" || f.impact === "high");
   return { ...out, findings, verdict: serious ? "changes_requested" : findings.length ? "comment" : "approve" };
 }

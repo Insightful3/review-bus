@@ -46,6 +46,8 @@ export interface PolicyInput {
   failure_scenario: string | null;
   assumption_challenge: boolean;
   confidence: number;
+  /** v0.4: repeats an earlier rejected, deferred or settled decision. */
+  is_repeat?: boolean;
 }
 
 export interface PolicyOptions {
@@ -74,6 +76,9 @@ export function wouldBlock(f: PolicyInput, opts: PolicyOptions): boolean {
 }
 
 function blocksByMatrix(f: PolicyInput, opts: PolicyOptions): boolean {
+  // A repeat of an earlier decision blocks only if it is critical, or high and certain (v0.4),
+  // and only where the ordinary rule would block it too.
+  if (f.is_repeat && !(f.impact === "critical" || (f.impact === "high" && f.likelihood === "certain"))) return false;
   if (!f.failure_scenario || !f.failure_scenario.trim()) return false;
   // Challenges to the author's assumptions block only when high or critical (then the matrix
   // decides as for any finding); medium and low ones stay advisory.

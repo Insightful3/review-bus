@@ -41,6 +41,35 @@ export interface ReviewRequest {
   criteria: string[];
   reviewers: ReviewerSpec[];
   stage: Stage;
+  /** v0.4: the earlier review this one follows (review_submit follows). */
+  follows?: string | null;
+  /** Decisions copied from the followed review at submit, newest first, within the history budget. */
+  inherited?: Decision[];
+  /** How many of the followed review's decisions did not fit the budget. */
+  inherited_left_out?: number;
+  /** Every rubric the followed chain's decisions came from, also of those left out: their approvals still apply. */
+  inherited_rubrics?: { rubric: string; confidential: boolean }[];
+}
+
+/**
+ * A decision on an earlier finding, as reviewers see it: rejected or deferred by the author, accepted
+ * (fixed then; check it did not come back), or settled by a person's sign-off while unanswered.
+ */
+export interface Decision {
+  /** "r1.f3" within this review; "rv_.../r1.f3" when carried from an earlier review (always its original). */
+  ref: string;
+  claim: string;
+  impact: string;
+  likelihood: string;
+  place: string | null;
+  status: "rejected" | "deferred" | "accepted" | "signed_off";
+  reason: string;
+  /** The rubric of the review the decision was made in: its reviewer approvals still apply to it. */
+  rubric?: string;
+  /** That review's rubric was confidential when it was submitted (a later change to the rubric does not lift it). */
+  confidential?: boolean;
+  /** The earlier decision this one was marked as repeating: a newer acceptance supersedes it. */
+  supersedes?: string;
 }
 
 export interface AuthorInfo {
@@ -99,6 +128,10 @@ export interface FindingResponse {
   status: "accepted" | "rejected" | "deferred";
   note: string;
   at: string;
+  /** The author answered "repeat": the earlier decision this finding repeats (stored as rejected, its reason copied). */
+  repeat_of?: string;
+  /** Another answer that names the earlier decision on the same point (repeat_of with accepted, rejected or deferred): this answer supersedes it. */
+  supersedes?: string;
 }
 
 export interface Finding extends ReviewerFinding {
@@ -114,6 +147,8 @@ export interface Finding extends ReviewerFinding {
   response: FindingResponse | null;
   /** Would block on its own, but the round already has max_blocking blocking findings. */
   over_limit?: boolean;
+  /** v0.4: a repeat of an earlier decision (rejected, deferred or signed off), marked by the reviewers or found by the model check. */
+  repeat?: { of: string; by: "reviewer" | "model"; status: Decision["status"]; reason: string } | null;
 }
 
 export interface Round {
@@ -131,6 +166,8 @@ export interface Round {
   finalizing?: { pid: number; host: string; started_at: string } | null;
   /** How duplicates across reviewers were merged. */
   merge?: { method: "none" | "rules" | "model"; by: string | null; error: string | null };
+  /** v0.4: the model check for repeats the reviewers did not mark. */
+  repeat_check?: { by: string | null; found: number; error: string | null };
 }
 
 export interface HistoryEntry {

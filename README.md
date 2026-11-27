@@ -106,7 +106,7 @@ The config is the file named in `REVIEW_BUS_CONFIG`, else `~/.review-bus/config.
 | `storage.documents` | Where reviews are stored (default `~/.review-bus/reviews`) |
 | `author_vendors` | Maps MCP client names to vendors (`anthropic`, `openai`, `google`, `other`). `claude-code`, `codex-mcp-client`, `local-agent-mode-*` (the Claude desktop app) and `antigravity-client` (Antigravity CLI) are built in; a key ending in `*` matches names that start with the rest |
 | `browser` | Headless browser for page review: `channel` (default `chrome`), `executable_path`, `max_height` (default 16000 px), `args` (extra Chrome flags) |
-| `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`. Without it, only near-identical findings are merged |
+| `merge_with` | Optional. A cheap model that merges the same finding from several reviewers, for example `{"adapter": "claude", "model": "haiku", "effort": "low"}`, and checks whether new findings repeat earlier decisions. Without it, only near-identical findings are merged and there is no repeat check |
 | `max_wait_seconds` | Longest a tool call waits before returning (default 50, under the usual 60 second client timeout) |
 | `max_wait_with_progress_seconds` | Longest a call waits when the client shows progress, like Claude Code (default 900) |
 | `long_wait_clients` | MCP clients (names, or prefixes ending in `*`) that may wait as long as `max_wait_with_progress_seconds` without showing progress. Empty by default; add a client only once you know it does not time out a long tool call |
@@ -189,11 +189,11 @@ The loop the agent runs:
 
 | Tool | What it does |
 | --- | --- |
-| `review_submit` | Submit a document, a git change and/or pages. Takes `rubric`, `intent`, `assumptions`, `criteria`, `reviewers`, `stage` (`draft`, `pre-merge`, `release`) and `wait_seconds` |
+| `review_submit` | Submit a document, a git change and/or pages. Takes `rubric`, `intent`, `assumptions`, `criteria`, `reviewers`, `stage` (`draft`, `pre-merge`, `release`), `wait_seconds` and `follows` (an earlier review of the same work, see Decisions that stay decided) |
 | `review_status` | State, round, reviewers done and pending, counts of findings |
 | `review_wait` | Wait until the round finishes or time runs out, then return the status |
 | `review_result` | Verdicts and findings for the latest round, as Markdown plus JSON. Blocking findings come in full, advisory ones (with `include_advisory`) one line each; `full: true` gives everything, as in `report.md` |
-| `review_respond` | Answer findings; close, or resubmit for the next round (with a new `artifact`, or `changes` to the last version) |
+| `review_respond` | Answer findings (`accepted`, `rejected`, `deferred`, or `repeat` with `repeat_of`); close, or resubmit for the next round (with a new `artifact`, or `changes` to the last version) |
 | `review_list` | Recent reviews, optionally filtered by state |
 | `review_cancel` | Cancel a review and stop its reviewers |
 | `review_rubrics` | The rubrics you can name, with their purpose, including rubric packs |
@@ -322,6 +322,7 @@ pbpaste | rb submit - --name post.md --rubric linkedin-post --intent "Publish on
 rb list
 rb show <review_id>
 rb respond <review_id> r1.f1=accepted r1.f2=rejected:"Intentional, agreed with the client" --resubmit
+rb submit contract.docx --rubric contract-b2b --intent "Sign the agreement." --follows <earlier review_id>
 rb signoff <review_id> --by "Your Name"
 ```
 
@@ -407,6 +408,18 @@ Reviewers rate each finding by impact (`critical`, `high`, `medium`, `low`) and 
 A finding without a failure scenario is advisory. A finding that challenges one of the author's stated assumptions blocks only if it is high or critical.
 
 From round 2 on, only critical findings, and high ones that are certain or likely, block; the rest are advisory, and a rubric's `high_blocks_always` applies to round 1 only. Later rounds mostly react to the previous round's fixes and find smaller things each time, and this keeps a review from going round after round on them. Set `policy.later_rounds` to `same` to use the table above in every round. A round keeps the rule it started with, so changing the setting does not affect a round already running. At most 5 findings block per round, highest risk first; a rubric can set its own limit with `max_blocking` in its front matter (`contract-b2b` uses 12). Findings that would block but are over the limit are marked "over the limit" and get their own section in the report, so they are not mistaken for minor points. At `stage: draft` only critical findings block.
+
+### Decisions that stay decided
+
+When you reject or defer a finding, the point should not come back as new in the next round or the next review.
+
+- Every round sees your answers to the findings of all earlier rounds, with your reasons, under "Decided earlier", not only the previous round's: rejected and deferred ones, and accepted ones as fixed then. A deferred finding may come back only as a reminder that does not block.
+- A new review of the same work can name an earlier, closed review (approved, awaiting sign-off or escalated) in `follows` (`rb submit --follows <review_id>`). Its decisions are copied into the new review once, at submit: rejected and deferred findings with your reasons, accepted ones (to check they did not come back), and blocking findings a person signed off without answering, as settled by that person. A review following another also carries what that one carried. Approvals still apply: if a carried decision comes from a rubric with `allowed_reviewers` (or one that was confidential when that review ran), every reviewer of the new review must be on that list, or `follows` is refused; this is checked again at every round and claim, and the merge model is held to it too. When you submit a file with the same name as a recent closed review without `follows`, the result suggests it.
+- Reviewers mark a finding that repeats an earlier rejected, deferred or settled one (`repeats`). A repeat blocks only if it is critical, or high and certain. A repeat of an accepted finding is not softened: the fix did not hold. When the same point was decided more than once, the newest decision counts. People reviewing in the web inbox have a field for the earlier finding's id.
+- With `merge_with` set, its model also checks the round's blocking findings that no reviewer marked against the earlier decisions, and marks the repeats the reviewers missed. It runs only if it is approved for every rubric the decisions come from. If the check fails, the round goes on under the ordinary rule, with a note.
+- If a repeat still gets through, answer it `repeat` with `repeat_of` naming the earlier finding (`rb respond <id> r2.f1=repeat:r1.f3`): it counts as rejected, with the earlier reason. With another answer, `repeat_of` names the earlier finding on the same point, which your answer supersedes: accept a point you rejected before, and the old rejection no longer softens it.
+
+The history shown to reviewers is at most 40 decisions and 12,000 characters, newest first, with long fields cut; the result says how many were left out.
 
 ## Where results go
 

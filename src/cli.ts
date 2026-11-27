@@ -25,6 +25,7 @@ Usage:
   rb show <review_id>
   rb list [--state <state>] [--limit <n>]
   rb respond <review_id> <finding_id>=<accepted|rejected|deferred>[:note] ... [--resubmit] [--artifact <file>]
+                                       (or <finding_id>=repeat:<earlier id>, for a point decided before)
   rb signoff <review_id> --by <your name> [--note <text>]
   rb cancel <review_id>
   rb pending [--reviewer <name>]
@@ -42,6 +43,7 @@ Submit options:
   --assumption <text>                  repeatable
   --criterion <text>                   repeatable
   --stage draft|pre-merge|release      default pre-merge
+  --follows <review_id>                an earlier, closed review of the same work: its decisions go to the reviewers
 
 submit and respond --resubmit wait until the reviewers finish (Ctrl-C cancels the review), or
 until only pull reviewers are left (then check back with rb status).
@@ -188,6 +190,7 @@ async function main() {
       port: { type: "string" },
       host: { type: "string" },
       name: { type: "string" },
+      follows: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -248,6 +251,7 @@ async function main() {
           criteria: v.criterion ?? [],
           reviewers: (v.reviewer ?? []).map(parseReviewer),
           stage,
+          ...(v.follows ? { follows: v.follows } : {}),
         },
         PERSON,
       );
@@ -280,8 +284,10 @@ async function main() {
     case "respond": {
       const reviewId = id();
       const responses = pos.slice(1).map((p) => {
+        const rep = p.match(/^(r\d+\.f\d+)=repeat:(\S+)$/);
+        if (rep) return { finding_id: rep[1], status: "repeat" as const, repeat_of: rep[2] };
         const m = p.match(/^(r\d+\.f\d+)=(accepted|rejected|deferred)(?::([\s\S]*))?$/);
-        if (!m) fail(`bad answer "${p}"; use <finding_id>=<accepted|rejected|deferred>[:note], for example r1.f2=rejected:"Intentional"`);
+        if (!m) fail(`bad answer "${p}"; use <finding_id>=<accepted|rejected|deferred>[:note], for example r1.f2=rejected:"Intentional", or <finding_id>=repeat:<earlier id>`);
         return { finding_id: m[1], status: m[2] as "accepted" | "rejected" | "deferred", note: m[3] ?? "" };
       });
       const { review, unanswered } = await engine.respond(reviewId, responses, { resubmit: Boolean(v.resubmit), artifact: v.artifact ? path.resolve(v.artifact) : undefined });

@@ -178,6 +178,7 @@ function findingFields(): string {
 <label>Evidence: why you think so<textarea name="f_evidence" aria-label="Evidence"></textarea></label>
 <div class="row"><label>Section or file<input type="text" name="f_section" aria-label="Section or file"></label><label>Exact quote (optional)<input type="text" name="f_quote" aria-label="Exact quote"></label></div>
 <label>Suggested fix (optional)<textarea name="f_fix" aria-label="Suggested fix"></textarea></label>
+<label>Repeats an earlier finding (its id from the previous round or Decided earlier, optional)<input type="text" name="f_repeats" aria-label="Repeats an earlier finding"></label>
 <label>Challenges an assumption the author stated<select name="f_challenge" aria-label="Challenges an assumption"><option value="no">no</option><option value="yes">yes</option></select></label></fieldset>`;
 }
 
@@ -237,6 +238,7 @@ export function answerFromForm(form: URLSearchParams): unknown {
       suggested_fix: pick("f_fix", i) || null,
       assumption_challenge: pick("f_challenge", i) === "yes",
       confidence: 0.8,
+      repeats: pick("f_repeats", i) || null,
     }));
   return { verdict: form.get("verdict") ?? "comment", summary: (form.get("summary") ?? "").trim(), findings };
 }
