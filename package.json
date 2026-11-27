@@ -1,6 +1,6 @@
 {
   "name": "review-bus",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Cross-agent review: an agent submits work (documents, code changes, web pages), other agents or people review it, and the author must answer every blocking finding. MCP server, rb CLI and web inbox.",
   "keywords": [
     "mcp",

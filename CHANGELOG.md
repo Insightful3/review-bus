@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-11-27)
 
 - The Antigravity CLI is recognised as a Google author: it connects as `antigravity-client`, now in the built-in `author_vendors`. The README shows the allow rule headless `agy -p` needs to call review-bus.
 
